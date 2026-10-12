@@ -11,6 +11,7 @@ observation pipeline offline.
     python -m native_runner.live_diagnose start     # lift the offline block, restart the game, forward the port
     python -m native_runner.live_diagnose run       # then start a friendly / Training Camp battle
     python -m native_runner.live_diagnose offline   # put the network block back when done
+    python -m native_runner.live_diagnose replay runs/live-diagnose/<time>   # model decisions on saved captures
 
 Send the folder printed at the end (runs/live-diagnose/<time>/).
 """
@@ -174,6 +175,60 @@ def run(samples: int, interval: float, wait: float) -> Path:
     return output
 
 
+def replay(directory: Path, checkpoint: str, owner: int) -> list[dict[str, Any]]:
+    """Feed saved live captures through BattleEnvV1, the tensorizer and a checkpoint."""
+
+    from .battle_env import BattleEnvV1
+    from .live_match import RecordedLiveNative, match_config_from_capture
+    from .rich_telemetry_adapter import RuntimeEffectCatalog
+    from .training.v4.expert import POLICY_DECISION_TICKS
+    from .training.v4.factory import production_semantic_bundle
+    from .training.v4.policy_session import build_policy_session_v4, load_policy_v4
+
+    captures = [json.load(gzip.open(path, "rt", encoding="utf-8")) for path in sorted(directory.glob("sample-*.json.gz"))]
+    native = RecordedLiveNative(captures)
+    bundle = production_semantic_bundle()
+    env = BattleEnvV1(
+        native=native,
+        card_catalog=bundle.native_card_catalog,
+        semantic_subset_contract=bundle.semantic_subset_contract,
+        effect_catalog=RuntimeEffectCatalog.from_catalog(bundle.native_effect_catalog),
+    )
+    env.ruleset_manifest = None  # a live run attests the real probe; saved captures have no endpoint
+    match = match_config_from_capture(native.observe_atomic())
+    observations, _info = env.reset(
+        match_config=match,
+        options={
+            "render_mode": "native-render",
+            "allow_initial_remaining_runtime_rejections": True,
+            "decision_ticks": POLICY_DECISION_TICKS,
+            "event_driven_decisions": False,
+        },
+    )
+    loaded = load_policy_v4(checkpoint, device="cpu")
+    session = build_policy_session_v4(env, loaded.model, actor_owner=owner, device="cpu", sample=False)
+    elixir = {o: next(p.elixir_exact for p in obs.players if p.owner == o) for o, obs in observations.items()}
+    session.start_episode(observations[owner], initial_elixir=elixir)
+    decisions = []
+    try:
+        while True:
+            started = time.monotonic()
+            decision = session.decide(observations[owner])
+            actions = [action.to_dict() for action in decision.decoded.actions]
+            decisions.append({"tick": observations[owner].tick, "ms": round((time.monotonic() - started) * 1000),
+                              "actions": actions})
+            print(f"tick {observations[owner].tick}: {[(a['kind'], a.get('card_id'), a.get('target_grid')) for a in actions]}")
+            if not native.advance():
+                break
+            env._raw, prefetched = env._atomic_observation_pair()
+            env._invalidate_rich_cache()
+            env._prime_rich_cache(env._raw, prefetched)
+            observations = env.observe_all()
+    finally:
+        session.end_episode()
+    return decisions
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -183,11 +238,17 @@ def main(argv: Iterable[str] | None = None) -> int:
     run_parser.add_argument("--interval", type=float, default=3.0, help="seconds between samples")
     run_parser.add_argument("--wait", type=float, default=600.0, help="seconds to wait for a battle to start")
     sub.add_parser("offline", help="restore the instance's network block")
+    replay_parser = sub.add_parser("replay", help="run a checkpoint on saved live captures (offline check)")
+    replay_parser.add_argument("directory", type=Path)
+    replay_parser.add_argument("--checkpoint", default="checkpoints/General/checkpoint-step-00000460.pt")
+    replay_parser.add_argument("--owner", type=int, choices=(0, 1), default=1)
     args = parser.parse_args(None if argv is None else list(argv))
     if args.command == "start":
         start_online()
     elif args.command == "offline":
         set_network(False)
+    elif args.command == "replay":
+        replay(args.directory, args.checkpoint, args.owner)
     else:
         run(args.samples, args.interval, args.wait)
     return 0

@@ -6464,7 +6464,9 @@ void live_controller_updated(void *controller) {
   if (manager != g_live_manager.load(std::memory_order_acquire) || tick < g_live_tick) {
     ++g_live_generation;  // a new battle (a reused address restarts its tick)
     g_live_manager.store(manager, std::memory_order_release);
-    begin_combat_event_epoch(manager, g_live_generation, g_live_generation);
+    // Every runtime telemetry ring (phase, movement, character state, tower troop, combat)
+    // must be bound to this battle, or its envelope reports itself incomplete.
+    begin_runtime_telemetry_epoch(manager, g_live_generation, g_live_generation);
     LOGI("live attach controller=%p manager=%p tick=%d", controller, manager, tick);
   }
   bind_combat_event_object_manager(manager);
