@@ -152,3 +152,24 @@ def test_discovery_returns_the_first_root_serving_this_exact_fingerprint() -> No
 
     assert root == "https://cdn.example.net/content"
     assert "https://old.example.com/c0ffee/fingerprint.json" in requested
+
+
+def test_discovery_probes_candidates_concurrently() -> None:
+    import time
+
+    from native_runner.update_assets import discover_content_root
+
+    good = json.dumps({"sha": "c0ffee", "files": []}).encode()
+
+    def get(url: str) -> bytes:
+        if url.startswith("https://good.example.com/"):
+            return good
+        time.sleep(0.4)  # an unreachable host that only fails on timeout
+        raise OSError("timed out")
+
+    urls = [f"https://slow{index}.example.com/x.txt" for index in range(6)] + ["https://good.example.com/x.txt"]
+    started = time.monotonic()
+    root = discover_content_root("c0ffee", (("all", lambda: urls),), get=get, log=lambda _message: None)
+
+    assert root == "https://good.example.com"
+    assert time.monotonic() - started < 1.5  # sequential probing would take 2.4 s
