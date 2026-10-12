@@ -62,6 +62,11 @@ DEPLOY_MAX_X = 17_500
 DEPLOY_MIN_Y = 500
 DEPLOY_MAX_Y = 31_500
 SPEED_CHOICES = (0.25, 0.5, 1.0, 2.0, 4.0)
+# The stock spectator HUD never draws a Champion/Hero ability button, so the
+# overlay draws its own where the live game puts it: right of the bottom hand,
+# and for the top owner just below the arena clock.  Source pixels.
+ABILITY_BUTTON_CENTERS = {0: (958, 352), 1: (895, 1745)}
+ABILITY_BUTTON_RADII = {0: 62, 1: 78}
 
 
 def native_speed(payload: Any) -> float | None:
@@ -156,6 +161,31 @@ class AbilityControl:
     @property
     def actionable(self) -> bool:
         return self.ready or self.fallback
+
+
+def ability_button_hit(source_x: float, source_y: float) -> int | None:
+    """Return the owner whose in-picture ability button contains the point."""
+
+    for owner, (center_x, center_y) in ABILITY_BUTTON_CENTERS.items():
+        radius = ABILITY_BUTTON_RADII[owner]
+        if (source_x - center_x) ** 2 + (source_y - center_y) ** 2 <= radius**2:
+            return owner
+    return None
+
+
+def ability_button_label(control: "AbilityControl") -> str | None:
+    """Short in-picture label, or ``None`` while the owner has no carrier."""
+
+    if control.actionable:
+        return "技能"
+    if control.ability_name is None:
+        return None
+    text = control.text.split("：", 1)[-1]
+    if text.startswith("冷却"):
+        return text.removeprefix("冷却").strip()
+    if "NotEnoughElixir" in text:
+        return "圣水不足"
+    return "等待"
 
 
 def largest_portrait_viewport(container: Rect) -> Rect:
@@ -992,6 +1022,11 @@ class NativeOverlayApp:
             self._set_message("当前不是 native-render 模式", error=True)
             return
         source_x, source_y = viewport_to_source(viewport, event.x, event.y)
+        button_owner = ability_button_hit(source_x, source_y)
+        if button_owner is not None and self._ability_button_label(button_owner) is not None:
+            self.request_ability(button_owner)
+            self._draw_feedback()
+            return
         hit = hit_card_source(source_x, source_y)
         if hit is not None:
             if self._select_card(hit):
@@ -1205,11 +1240,37 @@ class NativeOverlayApp:
             self._set_message(f"{side} {name} 技能已提交；下一原生 tick 生效")
         self.last_poll = 0.0
 
+    def _ability_button_label(self, owner: int) -> str | None:
+        if self.owner is not None and owner != self.owner:
+            return None
+        return ability_button_label(ability_control(self.latest_rich_observation, owner))
+
+    def _draw_ability_buttons(self, viewport: Rect) -> None:
+        for owner, (center_x, center_y) in ABILITY_BUTTON_CENTERS.items():
+            label = self._ability_button_label(owner)
+            if label is None:
+                continue
+            x, y = source_to_viewport(viewport, center_x, center_y)
+            radius, _ = source_to_viewport(viewport, ABILITY_BUTTON_RADII[owner], 0)
+            ready = label == "技能"
+            self.canvas.create_oval(
+                x - radius, y - radius, x + radius, y + radius,
+                fill="#7c3aed" if ready else "#3f3f46",
+                outline="#ffe066" if ready else "#a1a1aa",
+                width=3,
+                tags="feedback",
+            )
+            font_size = max(8, int(radius / 3.2))
+            self.canvas.create_text(
+                x, y, text=label, fill="white", font=("Microsoft YaHei UI", font_size, "bold"), tags="feedback"
+            )
+
     def _draw_feedback(self) -> None:
         viewport = self.viewport
         if viewport is None:
             return
         self.canvas.delete("feedback")
+        self._draw_ability_buttons(viewport)
         # Thin permanent hit boxes make the native cards visibly clickable.
         for hit in CARD_HITS:
             rect = source_rect_to_viewport(viewport, hit.source_rect)
