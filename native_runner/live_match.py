@@ -4,12 +4,16 @@
 BattleEnvV1 / tensorizer / policy stack reads a battle the game runs itself:
 creating, pausing or speeding a match are no-ops (the game owns the battle) and
 every observation is one game-thread capture from ``live observe-atomic``.
-``RecordedLiveNative`` serves saved captures the same way, for offline checks.
+``live_play.RecordedTapNative`` plays saved captures back the same way, for offline checks.
+
+Event rings travel as deltas: each capture asks the probe only for the events
+after the cursors BattleEnvV1 has already consumed (``event_floors``), so a
+capture stays small however long the battle runs.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import json
 from typing import Any
 
@@ -60,6 +64,41 @@ def match_config_from_capture(capture: Mapping[str, Any]) -> MatchConfig:
     )
 
 
+# The rings sent as deltas, in the order of the probe's "live observe-atomic" cursors.
+EVENT_RINGS = ("combatEvents", "phaseRuntime", "visibilityRuntime", "remainingRuntime")
+
+EventFloors = Callable[[], Sequence[int]]
+
+
+def event_floors(env: Any) -> tuple[int, int, int, int]:
+    """The next unseen sequence of each ring BattleEnvV1 has consumed (0: send everything)."""
+
+    combat = [value for value in (env._combat_next_sequence, env._public_card_play_next_sequence) if value is not None]
+    return (
+        min(combat) if combat else 0,
+        env._phase_next_sequence or 0,
+        env._visibility_next_sequence or 0,
+        env._remaining_next_sequence or 0,
+    )
+
+
+def trim_event_rings(capture: Mapping[str, Any], floors: Sequence[int]) -> dict[str, Any]:
+    """What the probe sends for ``floors``: each ring from max(oldest retained, min(floor, next))."""
+
+    trimmed = json.loads(json.dumps(capture))
+    rich = trimmed.get("rich") or {}
+    for name, floor in zip(EVENT_RINGS, floors):
+        ring = rich.get(name)
+        if not isinstance(ring, dict) or not isinstance(ring.get("events"), list):
+            continue
+        sent_from = int(ring.get("transmitFromSequence", ring["oldestRetainedSequence"]))
+        start = max(int(ring["oldestRetainedSequence"]), min(int(floor), int(ring["nextSequence"])))
+        if start > sent_from:
+            ring["events"] = ring["events"][start - sent_from :]
+            ring["transmitFromSequence"] = start
+    return trimmed
+
+
 class _LiveNativeBase(NativeClashEnv):
     """Match lifecycle calls are no-ops: the stock game owns a live battle."""
 
@@ -85,29 +124,55 @@ class _LiveNativeBase(NativeClashEnv):
 class LiveCaptureNative(_LiveNativeBase):
     """Reads the live battle through the probe's game-thread capture."""
 
-    def observe_atomic(self) -> dict[str, Any]:
-        return self._validate_atomic_result(self._request("live observe-atomic"))
-
-
-class RecordedLiveNative(_LiveNativeBase):
-    """Serves saved live captures in order; ``advance()`` moves to the next one."""
-
-    def __init__(self, captures: Sequence[Mapping[str, Any]]) -> None:
-        super().__init__()
-        if not captures:
-            raise ValueError("no recorded live captures")
-        self.captures = [json.loads(json.dumps(capture)) for capture in captures]
-        self.index = 0
-        self.public_card_play_events_from_combat_ring = True
-
-    def _request(self, command: str, **_: Any) -> dict[str, Any]:
-        raise RunnerError(f"recorded live captures cannot answer {command!r}")
-
-    def advance(self) -> bool:
-        if self.index + 1 >= len(self.captures):
-            return False
-        self.index += 1
-        return True
+    floors: EventFloors | None = None
 
     def observe_atomic(self) -> dict[str, Any]:
-        return self._validate_atomic_result(json.loads(json.dumps(self.captures[self.index])))
+        command = "live observe-atomic"
+        if self.floors is not None:
+            command += " " + " ".join(str(int(value)) for value in self.floors())
+        return self._validate_atomic_result(self._request(command))
+
+
+class LiveEpisode:
+    """BattleEnvV1 + a V4 policy session for one seat of a battle read through a live native."""
+
+    def __init__(self, native: _LiveNativeBase, model: Any, owner: int, *, device: str = "cpu") -> None:
+        from .battle_env import BattleEnvV1
+        from .rich_telemetry_adapter import RuntimeEffectCatalog
+        from .training.v4.expert import POLICY_DECISION_TICKS
+        from .training.v4.factory import production_semantic_bundle
+        from .training.v4.policy_session import build_policy_session_v4
+
+        bundle = production_semantic_bundle()
+        self.native = native
+        self.owner = owner
+        self.env = BattleEnvV1(
+            native=native,
+            card_catalog=bundle.native_card_catalog,
+            semantic_subset_contract=bundle.semantic_subset_contract,
+            effect_catalog=RuntimeEffectCatalog.from_catalog(bundle.native_effect_catalog),
+        )
+        # The stock game owns a live battle: there is no offline ruleset endpoint to attest.
+        self.env.ruleset_manifest = None
+        match = match_config_from_capture(native.observe_atomic())
+        observations, _info = self.env.reset(
+            match_config=match,
+            options={
+                "render_mode": "native-render",
+                "allow_initial_remaining_runtime_rejections": True,
+                "decision_ticks": POLICY_DECISION_TICKS,
+                "event_driven_decisions": False,
+            },
+        )
+        native.floors = lambda: event_floors(self.env)
+        self.session = build_policy_session_v4(self.env, model, actor_owner=owner, device=device, sample=False)
+        elixir = {o: next(p.elixir_exact for p in obs.players if p.owner == o) for o, obs in observations.items()}
+        self.session.start_episode(observations[owner], initial_elixir=elixir)
+        self.observation = observations[owner]
+
+    @property
+    def raw(self) -> Mapping[str, Any]:
+        return self.env._raw
+
+    def close(self) -> None:
+        self.session.end_episode()

@@ -176,57 +176,11 @@ def run(samples: int, interval: float, wait: float) -> Path:
 
 
 def replay(directory: Path, checkpoint: str, owner: int) -> list[dict[str, Any]]:
-    """Feed saved live captures through BattleEnvV1, the tensorizer and a checkpoint."""
+    """Play saved captures back as a battle through ``live_play`` (no taps): the model's decisions."""
 
-    from .battle_env import BattleEnvV1
-    from .live_match import RecordedLiveNative, match_config_from_capture
-    from .rich_telemetry_adapter import RuntimeEffectCatalog
-    from .training.v4.expert import POLICY_DECISION_TICKS
-    from .training.v4.factory import production_semantic_bundle
-    from .training.v4.policy_session import build_policy_session_v4, load_policy_v4
+    from .live_play import replay as replay_captures
 
-    captures = [json.load(gzip.open(path, "rt", encoding="utf-8")) for path in sorted(directory.glob("sample-*.json.gz"))]
-    native = RecordedLiveNative(captures)
-    bundle = production_semantic_bundle()
-    env = BattleEnvV1(
-        native=native,
-        card_catalog=bundle.native_card_catalog,
-        semantic_subset_contract=bundle.semantic_subset_contract,
-        effect_catalog=RuntimeEffectCatalog.from_catalog(bundle.native_effect_catalog),
-    )
-    env.ruleset_manifest = None  # a live run attests the real probe; saved captures have no endpoint
-    match = match_config_from_capture(native.observe_atomic())
-    observations, _info = env.reset(
-        match_config=match,
-        options={
-            "render_mode": "native-render",
-            "allow_initial_remaining_runtime_rejections": True,
-            "decision_ticks": POLICY_DECISION_TICKS,
-            "event_driven_decisions": False,
-        },
-    )
-    loaded = load_policy_v4(checkpoint, device="cpu")
-    session = build_policy_session_v4(env, loaded.model, actor_owner=owner, device="cpu", sample=False)
-    elixir = {o: next(p.elixir_exact for p in obs.players if p.owner == o) for o, obs in observations.items()}
-    session.start_episode(observations[owner], initial_elixir=elixir)
-    decisions = []
-    try:
-        while True:
-            started = time.monotonic()
-            decision = session.decide(observations[owner])
-            actions = [action.to_dict() for action in decision.decoded.actions]
-            decisions.append({"tick": observations[owner].tick, "ms": round((time.monotonic() - started) * 1000),
-                              "actions": actions})
-            print(f"tick {observations[owner].tick}: {[(a['kind'], a.get('card_id'), a.get('target_grid')) for a in actions]}")
-            if not native.advance():
-                break
-            env._raw, prefetched = env._atomic_observation_pair()
-            env._invalidate_rich_cache()
-            env._prime_rich_cache(env._raw, prefetched)
-            observations = env.observe_all()
-    finally:
-        session.end_episode()
-    return decisions
+    return replay_captures(directory, checkpoint, owner)
 
 
 def main(argv: Iterable[str] | None = None) -> int:

@@ -10,6 +10,7 @@
 #include "combat_impact_capture.h"
 #include "probe_hook.h"
 #include "probe_json.h"
+#include "event_transmit_floor.h"
 
 constexpr const char *kCombatEventSchema = "native-combat-events.v1";
 constexpr const char *kCombatExpectedLibgSha256 = "110aa2b5cac391c498645e072b0d88729428c2c2845e7e2737ca8ee979059783";
@@ -1588,7 +1589,7 @@ bool append_combat_events_json(void *manager, std::uint64_t generation, std::uin
       identity_matches ? g_combat_epoch_first_sequence.load(std::memory_order_acquire) : next_sequence;
   const std::uint64_t retained_oldest =
       next_sequence > epoch_first + kCombatEventRingCapacity ? next_sequence - kCombatEventRingCapacity : epoch_first;
-  const std::uint64_t transmit_from = retained_oldest;
+  const std::uint64_t transmit_from = event_transmit_from(kTransmitCombat, retained_oldest, next_sequence);
   const std::uint64_t overflow = identity_matches ? g_combat_overflow_count.load(std::memory_order_acquire) : 0;
   const std::uint64_t rejected = identity_matches ? g_combat_rejected_capture_count.load(std::memory_order_acquire) : 0;
   JsonWriter json(response, response_size, used);
