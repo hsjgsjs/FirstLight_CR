@@ -15,14 +15,22 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 import json
+import re
 from typing import Any
 
-from .cr_native_env import NativeClashEnv, RunnerError
+from .cr_native_env import NativeClashEnv, RunnerError, decode_native_card_parameter
 from .match_factory import MatchConfig
+from .normal_form_evidence import NORMAL_MODE_HERO_FORM_TO_BASE_CARD
 
-# A ladder-style deck evolves only in its first two slots (the wild slot is
-# not readable from a live capture yet, so it is treated as a base card).
+# Without a readable slot flag, a card that can evolve is taken as an evolution only in
+# the first two deck slots.  Forms the battle itself shows always win over this guess.
 LIVE_EVOLUTION_SLOTS = 2
+EVOLUTION_FORM, HERO_FORM = 1, 2
+
+# BattleEnvV1's complaint about a form the episode deck contract left out.
+_CONTRACT_MISS = re.compile(r"deck contract: owner=(\d+), card=(\d+), (?:form=(\d+), )?enabled=")
+
+FormsSeen = dict[int, dict[int, int]]  # owner -> deck slot -> form (1 evolution, 2 hero)
 
 
 def _player(capture: Mapping[str, Any], owner: int) -> Mapping[str, Any]:
@@ -41,26 +49,77 @@ def deck_of(capture: Mapping[str, Any], owner: int) -> tuple[int, ...]:
     return deck
 
 
-def form_availability_of(capture: Mapping[str, Any], owner: int) -> tuple[int, ...]:
-    masks = [0] * 8
+def observe_forms(capture: Mapping[str, Any], seen: FormsSeen) -> None:
+    """Record the evolution / hero forms the capture's packed card selections carry."""
+
+    for player in (capture.get("ordinary") or {}).get("players", ()):
+        owner = int(player.get("owner", -1))
+        for card in (*(player.get("deck") or ()), *(player.get("hand") or ())):
+            try:
+                form = decode_native_card_parameter(int(card["cardParameter"])).form_code
+            except (KeyError, TypeError, ValueError):
+                continue
+            if int(card.get("commandCardId", card.get("cardId", 0))) in NORMAL_MODE_HERO_FORM_TO_BASE_CARD:
+                form = HERO_FORM
+            if form in (EVOLUTION_FORM, HERO_FORM):
+                seen.setdefault(owner, {})[int(card["deckSlot"])] = form
+
+
+def is_contract_miss(message: str) -> bool:
+    return _CONTRACT_MISS.search(message) is not None
+
+
+def learn_contract_miss(message: str, capture: Mapping[str, Any], seen: FormsSeen) -> bool:
+    """Add the form a BattleEnvV1 contract error names to ``seen``; False if it names none."""
+
+    match = _CONTRACT_MISS.search(message)
+    if match is None:
+        return False
+    owner, card_id = int(match.group(1)), int(match.group(2))
+    form = int(match.group(3) or HERO_FORM)
+    slots = [slot for slot, deck_card in enumerate(deck_of(capture, owner)) if deck_card == card_id]
+    if len(slots) != 1 or form not in (EVOLUTION_FORM, HERO_FORM) or seen.get(owner, {}).get(slots[0]) == form:
+        return False
+    seen.setdefault(owner, {})[slots[0]] = form
+    return True
+
+
+def form_availability_of(capture: Mapping[str, Any], owner: int, seen: FormsSeen | None = None) -> tuple[int, ...]:
+    """Per deck slot: 2 hero, 1 evolution, 0 base, within the V4 contract (<=2 each, <=3 in all)."""
+
+    known = dict((seen or {}).get(owner, {}))
+    masks = [known.get(slot, 0) for slot in range(8)]
+    guessed = []
     for player in (capture.get("rich") or {}).get("players", ()):
         if int(player.get("owner", -1)) != owner:
             continue
         for slot in player.get("evolutionRuntime") or ():
             deck_slot = int(slot.get("deckSlot", -1))
-            if slot.get("evolvable") and 0 <= deck_slot < LIVE_EVOLUTION_SLOTS:
-                masks[deck_slot] |= 1
+            if slot.get("evolvable") and 0 <= deck_slot < LIVE_EVOLUTION_SLOTS and deck_slot not in known:
+                masks[deck_slot] = EVOLUTION_FORM
+                guessed.append(deck_slot)
+
+    def over() -> bool:
+        evolutions, heroes = masks.count(EVOLUTION_FORM), masks.count(HERO_FORM)
+        return evolutions > 2 or heroes > 2 or evolutions + heroes > 3
+
+    while over() and guessed:  # a seen form outranks a guess
+        masks[guessed.pop()] = 0
+    if over():
+        raise RunnerError(f"owner {owner} shows more evolution/hero forms than the V4 contract allows: {masks}")
     return tuple(masks)
 
 
-def match_config_from_capture(capture: Mapping[str, Any]) -> MatchConfig:
-    """The MatchConfig BattleEnvV1 needs, read from one live capture."""
+def match_config_from_capture(capture: Mapping[str, Any], seen: FormsSeen | None = None) -> MatchConfig:
+    """The MatchConfig BattleEnvV1 needs, read from one live capture (plus forms seen earlier)."""
 
+    seen = {owner: dict(slots) for owner, slots in (seen or {}).items()}
+    observe_forms(capture, seen)
     return MatchConfig(
         deck0=deck_of(capture, 0),
         deck1=deck_of(capture, 1),
-        deck0_form_availability=form_availability_of(capture, 0),
-        deck1_form_availability=form_availability_of(capture, 1),
+        deck0_form_availability=form_availability_of(capture, 0, seen),
+        deck1_form_availability=form_availability_of(capture, 1, seen),
     )
 
 
@@ -136,7 +195,15 @@ class LiveCaptureNative(_LiveNativeBase):
 class LiveEpisode:
     """BattleEnvV1 + a V4 policy session for one seat of a battle read through a live native."""
 
-    def __init__(self, native: _LiveNativeBase, model: Any, owner: int, *, device: str = "cpu") -> None:
+    def __init__(
+        self,
+        native: _LiveNativeBase,
+        model: Any,
+        owner: int,
+        *,
+        device: str = "cpu",
+        forms_seen: FormsSeen | None = None,
+    ) -> None:
         from .battle_env import BattleEnvV1
         from .rich_telemetry_adapter import RuntimeEffectCatalog
         from .training.v4.expert import POLICY_DECISION_TICKS
@@ -154,7 +221,8 @@ class LiveEpisode:
         )
         # The stock game owns a live battle: there is no offline ruleset endpoint to attest.
         self.env.ruleset_manifest = None
-        match = match_config_from_capture(native.observe_atomic())
+        native.floors = None  # a fresh env has consumed nothing yet
+        self.match = match = match_config_from_capture(native.observe_atomic(), forms_seen)
         observations, _info = self.env.reset(
             match_config=match,
             options={
