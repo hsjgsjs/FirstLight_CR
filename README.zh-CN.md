@@ -115,6 +115,7 @@ Copy-Item .env.example .env
 | 指南 | 内容 |
 | --- | --- |
 | [安装指南](docs/getting_started.md) | 依赖、`.env`、原版游戏更新与离线安装 |
+| [手机游玩与英雄问题](docs/mobile_zh.md) | 用真机显示与操作（PC 跑模型）、触摸校准、英雄技能与渲染排查 |
 | [训练历程](docs/training_history.md) | 五个核心模型、实验转折、评测结果与打法取舍 |
 | [训练指南](docs/training.md) | 回放缓存、IL、批量模拟、Linux guest 与 PPO |
 | [系统架构](docs/architecture.md) | 环境、策略、训练与回放的源码导览 |

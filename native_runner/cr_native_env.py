@@ -53,6 +53,10 @@ RICH_TELEMETRY_STATUS_ENUM = ("authoritative", "derived", "pending", "unavailabl
 MAX_OBSERVATION_OBJECTS = 256
 MAX_RICH_OBJECTS = MAX_OBSERVATION_OBJECTS
 NATIVE_OBJECT_ID_ENTITY_KEY_TAG = -2
+# ``activate-ability OWNER -3 0`` selects the owner's newest queueable
+# Champion/Hero carrier inside the probe (human controls only).
+UNIQUE_READY_ABILITY_ENTITY_KEY_TAG = -3
+TOUCH_LAYOUT_FIELDS = 18
 MAX_RUNNER_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_NATIVE_OBJECT_SLOTS = 100_000
 MAX_NATIVE_COMPONENT_SLOTS = 64
@@ -2815,6 +2819,41 @@ class NativeClashEnv:
 
         return self._request("touch status")
 
+    def set_touch_layout(self, values: Iterable[int] | None) -> dict[str, Any]:
+        """Replace the on-device touch geometry, or restore the MuMu default.
+
+        ``values`` uses the probe's 18-integer order: screen W/H, arena
+        L/T/R/B, world-projection L/T/R/B, top/bottom hand Y, hand half
+        width/height and four hand center X values (see native_touch_layout.h).
+        """
+
+        if values is None:
+            return self._request("touch layout default")
+        layout = tuple(values)
+        if len(layout) != TOUCH_LAYOUT_FIELDS or any(
+            isinstance(value, bool) or not isinstance(value, int) for value in layout
+        ):
+            raise ValueError(f"touch layout needs {TOUCH_LAYOUT_FIELDS} integers")
+        return self._request("touch layout " + " ".join(str(value) for value in layout))
+
+    def set_touch_owner(self, owner: int | None) -> dict[str, Any]:
+        """Limit direct screen touches to one owner (``None`` allows both)."""
+
+        value = -1 if owner is None else int(owner)
+        if value not in (-1, 0, 1):
+            raise ValueError("touch owner must be None, 0 or 1")
+        return self._request(f"touch owner {value}")
+
+    def set_touch_ability_tap(self, enabled: bool) -> dict[str, Any]:
+        """Enable tapping a ready Champion/Hero on the arena to cast its ability."""
+
+        return self._request(f"touch ability {'on' if enabled else 'off'}")
+
+    def set_touch_calibrating(self, enabled: bool) -> dict[str, Any]:
+        """Record and swallow every screen touch while measuring a layout."""
+
+        return self._request(f"touch calibrate {'on' if enabled else 'off'}")
+
     def pause(self) -> dict[str, Any]:
         """Pause native-render logical advancement for synchronized capture."""
 
@@ -2983,7 +3022,8 @@ class NativeClashEnv:
             action.object_index == NATIVE_OBJECT_ID_ENTITY_KEY_TAG and 1 <= action.secondary_index <= 0xFFFFFFFF
         )
         legacy_raw_tuple = action.object_index >= 0 and action.secondary_index >= 0
-        if not tagged_native_id and not legacy_raw_tuple:
+        unique_ready = action.object_index == UNIQUE_READY_ABILITY_ENTITY_KEY_TAG and action.secondary_index == 0
+        if not tagged_native_id and not legacy_raw_tuple and not unique_ready:
             raise ValueError("ability source identity is not a valid entity key")
         if not 1 <= execute_in_ticks <= 0xFFFF:
             raise ValueError("ability execute offset must be in 1..65535")
@@ -3089,6 +3129,18 @@ class NativeClashEnv:
         """Public alias for exact Champion activation."""
 
         return self.queue_ability_action_at(action)
+
+    def activate_owner_ready_ability(self, owner: int, *, execute_in_ticks: int = 1) -> dict[str, Any]:
+        """Activate the owner's newest ready Champion/Hero ability.
+
+        The probe resolves the carrier from its live controllers, so this
+        works even when the rich telemetry envelope fails validation.  It is
+        meant for human controls; policies keep using exact source keys.
+        """
+
+        return self.queue_ability_action_at(
+            AbilityAction(owner, UNIQUE_READY_ABILITY_ENTITY_KEY_TAG, 0), execute_in_ticks=execute_in_ticks
+        )
 
     def deploy(self, action: DeployAction, delay_ticks: int = 1) -> dict[str, Any]:
         """Queue one already-encoded native command without advancing time."""

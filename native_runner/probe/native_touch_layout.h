@@ -32,6 +32,44 @@ inline constexpr Layout kNativeRender1080x1920 = {
     1080, 1920, 54, 282, 1026, 1666, 111, 436, 967, 1666, 171, 1749, 67, 86, {211, 354, 497, 640},
 };
 
+// Phone surfaces differ from the 1080x1920 MuMu surface, so the host can
+// replace the layout at runtime ("touch layout ...").  Reject geometry that
+// would make hit testing or the pixel-to-world inverse meaningless.
+constexpr bool layout_is_valid(const Layout &layout) {
+  if (layout.screen_width <= 0 || layout.screen_height <= 0 || layout.screen_width > 16384 ||
+      layout.screen_height > 16384) {
+    return false;
+  }
+  const auto inside_x = [&](std::int32_t x) constexpr { return x >= 0 && x < layout.screen_width; };
+  const auto inside_y = [&](std::int32_t y) constexpr { return y >= 0 && y < layout.screen_height; };
+  if (!inside_x(layout.arena_left) || !inside_x(layout.arena_right) || !inside_y(layout.arena_top) ||
+      !inside_y(layout.arena_bottom) || layout.arena_right <= layout.arena_left ||
+      layout.arena_bottom <= layout.arena_top) {
+    return false;
+  }
+  // The world projection may extend past the visible catchment but must be
+  // a non-degenerate rectangle on screen.
+  if (!inside_x(layout.world_left) || !inside_x(layout.world_right) || !inside_y(layout.world_top) ||
+      !inside_y(layout.world_bottom) || layout.world_right - layout.world_left < 18 ||
+      layout.world_bottom - layout.world_top < 32) {
+    return false;
+  }
+  if (!inside_y(layout.top_hand_y) || !inside_y(layout.bottom_hand_y) || layout.top_hand_y >= layout.bottom_hand_y ||
+      layout.hand_half_width <= 0 || layout.hand_half_height <= 0 ||
+      2 * layout.hand_half_height > layout.bottom_hand_y - layout.top_hand_y) {
+    return false;
+  }
+  for (std::int32_t index = 0; index < 4; ++index) {
+    if (!inside_x(layout.hand_centers_x[index]) ||
+        (index > 0 && layout.hand_centers_x[index] - layout.hand_centers_x[index - 1] < 2 * layout.hand_half_width)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static_assert(layout_is_valid(kNativeRender1080x1920));
+
 struct HandHit {
   bool hit = false;
   std::int32_t owner = -1;

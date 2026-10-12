@@ -457,6 +457,13 @@ def _endpoint_is_cold_ready() -> bool:
 
 
 def ensure_offline_runner(progress: Callable[[str], None], *, force_restart: bool = False) -> None:
+    from .phone_touch import phone_mode_enabled, start_phone_runner
+
+    if phone_mode_enabled():
+        # CR_DEVICE_MODE=phone: the offline game runs on a real phone reached
+        # through adb; there is no MuMu VM to manage.
+        start_phone_runner(progress, force_restart=force_restart)
+        return
     if not force_restart and _endpoint_is_cold_ready():
         progress("离线 native runner 已冷就绪，直接复用。")
         return
@@ -1882,6 +1889,20 @@ class CRHarnessInterface:
         return process, log_handle
 
     def _launch_overlay(self, *, owner: int | None = None) -> None:
+        from .phone_touch import apply_touch_settings, phone_mode_enabled
+
+        if phone_mode_enabled():
+            # The phone's own touch screen is the controller.  Lock it to the
+            # human side and load the calibrated layout instead of a Windows
+            # overlay.
+            from .cr_native_env import NativeClashEnv
+
+            try:
+                apply_touch_settings(NativeClashEnv(CONTROL_HOST, CONTROL_PORT, timeout=15.0), owner=owner)
+            except Exception as error:
+                LOGGER.warning("phone touch settings failed: %s", error)
+                self._post(self._append_log, f"手机触控设置失败：{error}")
+            return
         if self.overlay_process is None or self.overlay_process.poll() is not None:
             self.overlay_process, self.overlay_log = self._launch_python(
                 "native_runner.native_overlay",
@@ -1895,7 +1916,12 @@ class CRHarnessInterface:
     def _match_ready(self) -> None:
         self.owns_native_session = True
         self._set_busy(False)
-        self._append_log("对局已启动；请切到 MuMu，点击上方或下方手牌后再点击场地。")
+        from .phone_touch import phone_mode_enabled
+
+        if phone_mode_enabled():
+            self._append_log("对局已在手机上启动：拖动或点选手牌到场地出牌；点自己场上的英雄/冠军释放技能。")
+        else:
+            self._append_log("对局已启动；请切到 MuMu，点击上方或下方手牌后再点击场地。")
 
     def refresh_replay_runs(self) -> None:
         runs = discover_replay_runs()
