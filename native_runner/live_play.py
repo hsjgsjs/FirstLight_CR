@@ -43,6 +43,7 @@ FIRST_TOUCH_TICK = 94
 LAND_TICKS = 26  # tile touch -> execution, with margin (issue +0..4, then +21)
 DEAL_GUARD_TICKS = 3
 LOST_TAP_TICKS = 60  # a tapped card still in its slot this long after the tap was never taken
+MAX_CONTRACT_REBUILDS = 4  # deck-contract corrections within one battle
 
 
 @dataclass(frozen=True)
@@ -336,7 +337,7 @@ def play_battle(
 ) -> dict[str, Any]:
     from .battle_env import BattleEnvError
     from .contracts import ActionKind, ActionV1
-    from .live_match import LiveEpisode
+    from .live_match import LiveEpisode, is_contract_miss, learn_contract_miss, observe_forms
     from .training.v4.expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 
     recorded = log_dir is not None
@@ -358,10 +359,10 @@ def play_battle(
     log({"event": "start", "tick": first["tick"], "seat": seat, "players": players_of(first),
          "checkpoint": args.checkpoint, "layout": asdict(layout)})
     print(f"对局开始（tick {first['tick']}），模型操作 owner {seat}；日志 {path}")
-    episode = LiveEpisode(native, model, seat, device=args.device)
-    env, observation = episode.env, episode.observation
-    summary: dict[str, Any] = {"log": str(path), "decisions": 0, "taps": 0}
-    try:
+    summary: dict[str, Any] = {"log": str(path), "decisions": 0, "taps": 0, "rebuilds": 0}
+
+    def play(episode: LiveEpisode) -> None:
+        env, observation = episode.env, episode.observation
         while True:
             commands = {o: (ActionV1.wait(o, ticks=POLICY_DECISION_TICKS),) for o in (0, 1)}
             if observation.tick >= FIRST_POLICY_DECISION_TICK:
@@ -381,6 +382,8 @@ def play_battle(
             try:
                 observations, _rewards, terms, truncs, _info = env.step(commands, record_trace=False)
             except BattleEnvError as error:
+                if is_contract_miss(str(error)):
+                    raise
                 # Validated before anything is sent: skip this decision and let the interval pass.
                 log({"event": "step_rejected", "tick": observation.tick, "error": str(error)})
                 waits = {o: (ActionV1.wait(o, ticks=POLICY_DECISION_TICKS),) for o in (0, 1)}
@@ -388,11 +391,39 @@ def play_battle(
             observation = observations[seat]
             if all(terms.values()) or all(truncs.values()):
                 summary["result"] = "terminated"
+                return
+
+    # The deck contract is read from the battle; a form it missed (a hero or an evolution the
+    # capture did not show yet) is learned from BattleEnvV1's refusal and the episode rebuilt.
+    forms_seen: dict[int, dict[int, int]] = {}
+    episode: LiveEpisode | None = None
+    try:
+        while True:
+            try:
+                episode = LiveEpisode(native, model, seat, device=args.device, forms_seen=forms_seen)
+                observe_forms({"ordinary": native.ordinary}, forms_seen)
+                log({"event": "contract", "tick": episode.observation.tick,
+                     "forms": [list(episode.match.deck0_form_availability),
+                               list(episode.match.deck1_form_availability)]})
+                play(episode)
                 break
+            except BattleEnvError as error:
+                learned = summary["rebuilds"] < MAX_CONTRACT_REBUILDS and learn_contract_miss(
+                    str(error), {"ordinary": native.ordinary}, forms_seen
+                )
+                if not learned:
+                    raise
+                summary["rebuilds"] += 1
+                log({"event": "contract_rebuild", "error": str(error), "forms_seen": forms_seen})
+                print(f"  牌组形态补充后重建：{error}")
+                if episode is not None:
+                    episode.close()
+                episode = None
     except RunnerError as error:
         summary["result"] = f"battle over or lost: {error}"
     finally:
-        episode.close()
+        if episode is not None:
+            episode.close()
         log({"event": "end", **summary})
         stream.close()
     print(f"对局结束：{summary}")

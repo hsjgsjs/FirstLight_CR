@@ -120,3 +120,41 @@ def test_recorded_captures_play_back_as_a_battle() -> None:
     with pytest.raises(RunnerError):
         native._request("live status")
     assert native.pause() == {"ok": True}
+
+
+def _deck_capture(forms: dict[int, int]) -> dict:
+    # Real packed words: form in bits 0..3, deck slot + 1 in bits 22..27, cost in 28..31.
+    deck = [{"deckSlot": slot, "cardId": 26000000 + slot, "cardParameter": (3 << 28) | ((slot + 1) << 22) | forms.get(slot, 0)}
+            for slot in range(8)]
+    evolvable = [{"deckSlot": slot, "evolvable": True} for slot in range(4)]
+    return {"ordinary": {"players": [{"owner": 1, "deck": deck, "hand": []}]},
+            "rich": {"players": [{"owner": 1, "evolutionRuntime": evolvable}]}}
+
+
+def test_forms_the_battle_shows_outrank_the_slot_guess() -> None:
+    from native_runner.live_match import form_availability_of, observe_forms
+
+    guessed = _deck_capture({})
+    assert form_availability_of(guessed, 1) == (1, 1, 0, 0, 0, 0, 0, 0)
+    hero = _deck_capture({1: 2})  # a hero in the wild slot is no evolution
+    seen: dict = {}
+    observe_forms(hero, seen)
+    assert seen == {1: {1: 2}}
+    assert form_availability_of(hero, 1, seen) == (1, 2, 0, 0, 0, 0, 0, 0)
+    # Two seen evolutions push the guessed ones out (<= 2 evolutions, <= 3 forms in all).
+    assert form_availability_of(guessed, 1, {1: {2: 1, 3: 1}}) == (0, 0, 1, 1, 0, 0, 0, 0)
+    with pytest.raises(Exception):
+        form_availability_of(guessed, 1, {1: {2: 2, 3: 2, 4: 2}})
+
+
+def test_contract_refusals_name_the_missing_form() -> None:
+    from native_runner.live_match import is_contract_miss, learn_contract_miss
+
+    capture = _deck_capture({})
+    seen: dict = {}
+    play = "native policy form is not enabled by the episode deck contract: owner=1, card=26000005, form=1, enabled=0"
+    ability = "native explicit-Hero ability is not enabled by the episode deck contract: owner=1, card=26000006, enabled=0"
+    assert is_contract_miss(play) and is_contract_miss(ability) and not is_contract_miss("compound decision overspends elixir")
+    assert learn_contract_miss(play, capture, seen) and learn_contract_miss(ability, capture, seen)
+    assert seen == {1: {5: 1, 6: 2}}
+    assert not learn_contract_miss(play, capture, seen)  # already known: no endless rebuilds
