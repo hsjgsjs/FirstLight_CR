@@ -98,3 +98,57 @@ def test_bundled_apk_assets_are_not_missing(tmp_path) -> None:
 def test_summarize_groups_by_directory() -> None:
     names = ["sc3d/characters/hero/a", "sc3d/characters/hero/b", "sc3d/effects/x/y", "sc3d/top.png"]
     assert summarize(names) == [("sc3d/characters/hero", 2), ("sc3d/effects/x", 1), ("sc3d/top.png", 1)]
+
+
+def test_urls_and_candidate_roots_from_binary_data() -> None:
+    from native_runner.update_assets import candidate_roots, urls_in
+
+    blob = (
+        b"\x00junk https://cdn.example.net/content/0123456789abcdef0123456789abcdef01234567/csv_logic/a.csv\x00"
+        b"<a href=\"http://schemas.android.com/apk/res/android\"> "
+        b"https://assets.example.org/game/files/logo.png, https://cdn.example.net/content/"
+    )
+    urls = urls_in(blob)
+    roots = candidate_roots(urls)
+
+    assert "http://schemas.android.com/apk/res/android" in urls
+    assert roots[0] == "https://cdn.example.net/content"
+    assert "https://assets.example.org/game/files" in roots
+    assert "https://assets.example.org" in roots
+    assert not any("schemas.android.com" in root for root in roots)
+    assert len(roots) == len(set(roots))
+
+
+def test_discovery_returns_the_first_root_serving_this_exact_fingerprint() -> None:
+    from native_runner.update_assets import discover_content_root
+
+    good = json.dumps({"sha": "c0ffee", "files": []}).encode()
+    stale = json.dumps({"sha": "deadbeef", "files": []}).encode()
+    served = {
+        "https://old.example.com/c0ffee/fingerprint.json": stale,
+        "https://cdn.example.net/content/c0ffee/fingerprint.json": good,
+    }
+    requested = []
+
+    def get(url: str) -> bytes:
+        requested.append(url)
+        if url not in served:
+            raise OSError("404")
+        return served[url]
+
+    def broken() -> list[str]:
+        raise RuntimeError("device offline")
+
+    root = discover_content_root(
+        "c0ffee",
+        (
+            ("broken", broken),
+            ("first", lambda: ["https://old.example.com/x.txt"]),
+            ("second", lambda: ["https://cdn.example.net/content/" + "a" * 40 + "/sc/ui.sc"]),
+        ),
+        get=get,
+        log=lambda _message: None,
+    )
+
+    assert root == "https://cdn.example.net/content"
+    assert "https://old.example.com/c0ffee/fingerprint.json" in requested
