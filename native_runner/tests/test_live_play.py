@@ -27,12 +27,30 @@ def test_world_points_put_the_seat_at_the_bottom() -> None:
 
 def test_layout_round_trip_and_screen_check(tmp_path: Path) -> None:
     path = tmp_path / "layout.json"
-    default = ScreenLayout.default(1440, 2560)
-    assert ScreenLayout.load(path, 1440, 2560) == default
+    default = ScreenLayout.default(1080, 1920)
+    assert ScreenLayout.load(path, 1080, 1920) == default and not default.calibrated
     default.save(path)
-    assert ScreenLayout.load(path, 1440, 2560) == default
+    assert ScreenLayout.load(path, 1080, 1920) == default
     with pytest.raises(SystemExit):
-        ScreenLayout.load(path, 1080, 1920)
+        ScreenLayout.load(path, 1440, 2560)
+
+
+def test_the_measured_mumu_layout_replaces_an_uncalibrated_guess(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from native_runner.live_play import MEASURED_LAYOUTS
+
+    measured = MEASURED_LAYOUTS[1440, 2560]
+    assert measured.calibrated and ScreenLayout.default(1440, 2560) == measured
+    path = tmp_path / "layout.json"
+    guess = replace(measured, arena=(21.3, 261.6, 1404.0, 1860.1), calibrated=False)
+    guess.save(path)
+    assert ScreenLayout.load(path, 1440, 2560) == measured
+    own = replace(measured, ability=(1300, 1950))  # a layout calibrated by hand wins
+    own.save(path)
+    assert ScreenLayout.load(path, 1440, 2560) == own
+    # Owner 1 (MuMu) sees its princess towers (world y 25500) above its king tower (29000).
+    assert measured.world_point(3500, 25500, 1)[1] < measured.world_point(9000, 29000, 1)[1]
 
 
 def test_event_rings_are_trimmed_like_the_probe() -> None:
