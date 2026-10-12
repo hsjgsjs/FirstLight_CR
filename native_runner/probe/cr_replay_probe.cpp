@@ -37,6 +37,10 @@ namespace {
 
 constexpr const char *kLogTag = "CRNativeProbe";
 constexpr std::uint16_t kControlPort = 26789;
+// Byte the controller update checks before opening the "Rate this app" dialog (libg+0xc88fb0).
+// That dialog calls a Java store-review class the patched APK lacks: a JNI abort after online
+// battles.  Ported from Jason-XII/clash-royale-battle-engine (same libg build).
+constexpr std::uintptr_t kRateAppPendingOffset = 0x019bc929;
 constexpr std::size_t kEngineInstanceMaxCount = 24;
 constexpr std::size_t kEngineInstanceSlots = 8;
 constexpr const char *kAttestationVersion = "runner-attestation.v1";
@@ -347,6 +351,20 @@ enum class RunnerMode : std::int32_t {
   NativeRender = 1,
 };
 std::atomic<std::int32_t> g_runner_mode{static_cast<std::int32_t>(RunnerMode::Headless)};
+// Live mode: read-only observation of a battle the stock game runs itself (a friendly or
+// Training Camp battle of the user's own account).  The battle controller's update hook
+// attaches to that battle's manager; full observations are encoded on the game thread right
+// after an update, the only point where the stock world is consistent.  Nothing is injected.
+// Approach and controller offsets follow Jason-XII/clash-royale-battle-engine's live mode.
+std::atomic<bool> g_live_enabled{false};
+std::atomic<void *> g_live_manager{nullptr};
+std::int32_t g_live_tick = -1;                 // the rest is guarded by g_control_mutex
+std::uint64_t g_live_generation = 1ULL << 48;  // far from headless and native-render generations
+bool g_live_capture_requested = false;
+std::uint64_t g_live_capture_sequence = 0;
+char *g_live_capture_buffer = nullptr;
+pthread_mutex_t g_live_request_mutex = PTHREAD_MUTEX_INITIALIZER;
+void live_controller_updated(void *controller);
 char g_pending_native_render_json[kMaxReplayConfigBytes] = {};
 std::uint64_t g_native_render_request_sequence = 0;
 std::uint64_t g_native_render_processed_sequence = 0;
@@ -1905,7 +1923,9 @@ bool process_range_is_readable(const void *address, std::size_t size) {
   if (address == nullptr || size == 0) {
     return false;
   }
-  const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(address);
+  // Android ARM64 heap pointers may carry a top-byte tag; /proc/self/maps
+  // contains untagged addresses. Normalize only the range-check address.
+  const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(address) & 0x00ffffffffffffffULL;
   if (begin > UINTPTR_MAX - size) {
     return false;
   }
@@ -5331,7 +5351,11 @@ struct ObservationCaptureIdentity {
 ObservationCaptureIdentity observation_capture_identity_locked() {
   ObservationCaptureIdentity identity;
   identity.mode = static_cast<RunnerMode>(g_runner_mode.load(std::memory_order_acquire));
-  if (identity.mode == RunnerMode::NativeRender) {
+  if (g_live_enabled.load(std::memory_order_acquire)) {
+    identity.manager = g_live_manager.load(std::memory_order_acquire);
+    identity.generation = g_live_generation;
+    identity.state_epoch = g_live_generation;
+  } else if (identity.mode == RunnerMode::NativeRender) {
     identity.manager = g_native_render_manager.load(std::memory_order_acquire);
     identity.generation = g_native_render_request_sequence;
     identity.state_epoch = g_native_render_state_epoch;
@@ -6423,8 +6447,120 @@ bool handle_replay_schedule_command(int socket_fd, const char *command) {
 #include "resident_multimatch.inc"
 #include "engine_instance.inc"
 
+// After a stock battle controller update (game thread): attach to its battle and, when the
+// control thread asked for one, encode a full atomic observation of that exact state.
+void live_controller_updated(void *controller) {
+  constexpr std::int32_t kControllerInBattle = 8;  // controller+0x30 while a battle runs
+  if (!process_range_is_readable(controller, 0x98) ||
+      read_object_field<std::int32_t>(controller, 0x30) != kControllerInBattle || g_game_state_tick == nullptr) {
+    return;
+  }
+  void *const manager = read_object_field<void *>(controller, 0x90);
+  if (!process_range_is_readable(manager, 0xb0)) {
+    return;
+  }
+  const std::int32_t tick = g_game_state_tick(manager);
+  pthread_mutex_lock(&g_control_mutex);
+  if (manager != g_live_manager.load(std::memory_order_acquire) || tick < g_live_tick) {
+    ++g_live_generation;  // a new battle (a reused address restarts its tick)
+    g_live_manager.store(manager, std::memory_order_release);
+    begin_combat_event_epoch(manager, g_live_generation, g_live_generation);
+    LOGI("live attach controller=%p manager=%p tick=%d", controller, manager, tick);
+  }
+  bind_combat_event_object_manager(manager);
+  g_live_tick = tick;
+  if (g_live_capture_requested && g_live_capture_buffer != nullptr) {
+    g_live_capture_requested = false;
+    build_atomic_observation_json_locked(g_live_capture_buffer, kFullObservationResponseBytes);
+    ++g_live_capture_sequence;
+    pthread_cond_broadcast(&g_control_cond);
+  }
+  pthread_mutex_unlock(&g_control_mutex);
+}
+
+// "live on|off|status" and "live observe-atomic".  Returns false for any other command.
+bool handle_live_command(int socket_fd, const char *command) {
+  if (std::strncmp(command, "live ", 5) != 0) {
+    return false;
+  }
+  const char *const argument = command + 5;
+  if (std::strcmp(argument, "observe-atomic") == 0) {
+    if (!g_live_enabled.load(std::memory_order_acquire)) {
+      send_control_error(socket_fd, "live mode is off (send 'live on' first)");
+      return true;
+    }
+    pthread_mutex_lock(&g_live_request_mutex);  // one capture at a time owns the buffer
+    pthread_mutex_lock(&g_control_mutex);
+    if (g_live_capture_buffer == nullptr) {
+      g_live_capture_buffer = new (std::nothrow) char[kFullObservationResponseBytes]();
+    }
+    bool captured = false;
+    if (g_live_capture_buffer != nullptr && g_live_manager.load(std::memory_order_acquire) != nullptr) {
+      const std::uint64_t sequence = g_live_capture_sequence;
+      g_live_capture_buffer[0] = '\0';
+      g_live_capture_requested = true;
+      timespec deadline{};
+      clock_gettime(CLOCK_REALTIME, &deadline);
+      deadline.tv_sec += 5;
+      while (g_live_capture_sequence == sequence) {
+        if (pthread_cond_timedwait(&g_control_cond, &g_control_mutex, &deadline) == ETIMEDOUT) {
+          break;
+        }
+      }
+      captured = g_live_capture_sequence != sequence;
+      g_live_capture_requested = false;
+    }
+    const bool attached = g_live_manager.load(std::memory_order_acquire) != nullptr;
+    pthread_mutex_unlock(&g_control_mutex);
+    if (!captured && attached) {
+      send_control_error(socket_fd, "live battle did not update within 5 s (paused or ended?)");
+    } else if (!captured) {
+      send_control_error(socket_fd, "no live battle attached yet (start a battle)");
+    } else if (g_live_capture_buffer[0] == '\0') {
+      send_control_error(socket_fd, "failed to encode live atomic observation");
+    } else {
+      // An encoding failure is itself a {"ok":false,...} envelope with the probe's reason.
+      send_control_response(socket_fd, g_live_capture_buffer);
+    }
+    pthread_mutex_unlock(&g_live_request_mutex);
+    return true;
+  }
+  pthread_mutex_lock(&g_control_mutex);
+  if (std::strcmp(argument, "on") == 0) {
+    g_live_enabled.store(true, std::memory_order_release);
+  } else if (std::strcmp(argument, "off") == 0) {
+    g_live_enabled.store(false, std::memory_order_release);
+    end_combat_event_epoch(g_live_manager.exchange(nullptr, std::memory_order_acq_rel));
+    g_live_tick = -1;
+  } else if (std::strcmp(argument, "status") != 0) {
+    pthread_mutex_unlock(&g_control_mutex);
+    send_control_error(socket_fd, "live expects on|off|status|observe-atomic");
+    return true;
+  }
+  char response[256];
+  std::snprintf(response, sizeof(response),
+                "{\"ok\":true,\"live\":%s,\"attached\":%s,\"generation\":%llu,\"tick\":%d,\"captures\":%llu}",
+                g_live_enabled.load() ? "true" : "false", g_live_manager.load() ? "true" : "false",
+                static_cast<unsigned long long>(g_live_generation), g_live_tick,
+                static_cast<unsigned long long>(g_live_capture_sequence));
+  pthread_mutex_unlock(&g_control_mutex);
+  send_control_response(socket_fd, response);
+  return true;
+}
+
 void handle_control_command(int socket_fd, const char *command) {
   char response[kControlResponseBytes] = {};
+  if (handle_live_command(socket_fd, command)) {
+    return;
+  }
+  if (g_live_enabled.load(std::memory_order_acquire) &&
+      (std::strcmp(command, "observe") == 0 || std::strcmp(command, "observe-rich") == 0 ||
+       std::strcmp(command, "observe-atomic") == 0)) {
+    // The stock game advances a live battle on its own thread; only the game-thread capture
+    // is consistent.
+    send_control_error(socket_fd, "live mode is on: use 'live observe-atomic'");
+    return;
+  }
   if (handle_engine_instance_command(socket_fd, command)) {
     return;
   }
@@ -7605,7 +7741,13 @@ void replay_battle_controller_full_update_hook(void *controller, float delta_sec
   }
   std::uint64_t generation = 0;
   if (!is_current_native_controller(controller, &generation)) {
+    if (g_libg_base != 0) {
+      *reinterpret_cast<volatile std::uint8_t *>(g_libg_base + kRateAppPendingOffset) = 0;  // never ask to rate
+    }
     original(controller, delta_seconds);
+    if (g_live_enabled.load(std::memory_order_acquire)) {
+      live_controller_updated(controller);
+    }
     return;
   }
 
