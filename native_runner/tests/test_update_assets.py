@@ -5,7 +5,16 @@ import json
 
 import pytest
 
-from native_runner.update_assets import fetch_verified, hash_convention, missing_files, parse_fingerprint
+import zipfile
+
+from native_runner.update_assets import (
+    apk_hashes,
+    fetch_verified,
+    hash_convention,
+    missing_files,
+    parse_fingerprint,
+    summarize,
+)
 
 
 def _sha(data: bytes) -> str:
@@ -62,3 +71,30 @@ def test_fetch_keeps_only_exact_sha1_matches(tmp_path) -> None:
 def test_fingerprint_rejects_unsafe_paths(name: str) -> None:
     with pytest.raises(ValueError):
         parse_fingerprint(json.dumps({"files": [{"file": name, "sha": "0" * 40}]}))
+
+
+def test_bundled_apk_assets_are_not_missing(tmp_path) -> None:
+    _, fingerprint = parse_fingerprint(FINGERPRINT)
+    apk = tmp_path / "game.apk"
+    with zipfile.ZipFile(apk, "w") as archive:
+        archive.writestr("assets/sc3d/characters/hero/hero_knight/asm_hero_knight_battle.json", b"asm")
+        archive.writestr("assets/sc3d/characters/hero/hero_valkyrie/a.json", b"stale")
+        archive.writestr("assets/sc/ui.sc", b"ui")
+        archive.writestr("lib/arm64-v8a/libg.so", b"x")
+
+    bundled = apk_hashes(apk, "sc3d/")
+    wanted = missing_files(fingerprint, {}, "sc3d/", bundled)
+
+    assert set(bundled) == {
+        "sc3d/characters/hero/hero_knight/asm_hero_knight_battle.json",
+        "sc3d/characters/hero/hero_valkyrie/a.json",
+    }
+    assert list(wanted) == [
+        "sc3d/characters/hero/hero_knight/hero_prefab_knight_battle.json",
+        "sc3d/characters/hero/hero_valkyrie/a.json",
+    ]
+
+
+def test_summarize_groups_by_directory() -> None:
+    names = ["sc3d/characters/hero/a", "sc3d/characters/hero/b", "sc3d/effects/x/y", "sc3d/top.png"]
+    assert summarize(names) == [("sc3d/characters/hero", 2), ("sc3d/effects/x", 1), ("sc3d/top.png", 1)]

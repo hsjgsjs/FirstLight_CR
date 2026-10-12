@@ -36,14 +36,16 @@ import sys
 from typing import Callable, Iterable, Mapping
 import urllib.request
 import uuid
+import zipfile
 
 from .local_config import setting
 from .offline_install import APP, DATA, Device
-from .paths import WORKSPACE_ROOT
+from .paths import REPOSITORY_ROOT, WORKSPACE_ROOT
 
 UPDATE = f"{DATA}/update"
 DEFAULT_PREFIX = "sc3d/"
 STAGING_ROOT = WORKSPACE_ROOT / "runs" / "asset-sync"
+DEFAULT_APK = REPOSITORY_ROOT / "user-provided" / "nulls-royale.apk"
 
 
 def _relative(name: str) -> str:
@@ -94,11 +96,53 @@ def device_hashes(device: Device, prefix: str) -> dict[str, str]:
     return hashes
 
 
-def missing_files(fingerprint: Mapping[str, str], present: Mapping[str, str], prefix: str) -> dict[str, str]:
-    """Fingerprint entries under ``prefix`` that are absent or differ on the device."""
+def apk_hashes(apk: Path, prefix: str) -> dict[str, str]:
+    """SHA-1 of the APK's bundled ``assets/<prefix>`` files, keyed like update/.
+
+    The client falls back to these when update/ has no copy, so an identical
+    bundled file is not missing.
+    """
 
     prefix = prefix.lstrip("/")
-    return {name: sha for name, sha in sorted(fingerprint.items()) if name.startswith(prefix) and present.get(name) != sha}
+    hashes: dict[str, str] = {}
+    with zipfile.ZipFile(apk) as archive:
+        for item in archive.infolist():
+            name = item.filename.removeprefix("assets/")
+            if item.is_dir() or not item.filename.startswith("assets/") or not name.startswith(prefix):
+                continue
+            digest = hashlib.sha1()
+            with archive.open(item) as stream:
+                for chunk in iter(lambda: stream.read(1 << 20), b""):
+                    digest.update(chunk)
+            hashes[name] = digest.hexdigest()
+    return hashes
+
+
+def missing_files(
+    fingerprint: Mapping[str, str],
+    present: Mapping[str, str],
+    prefix: str,
+    bundled: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Fingerprint entries under ``prefix`` neither on the device nor bundled identically."""
+
+    prefix = prefix.lstrip("/")
+    bundled = bundled or {}
+    return {
+        name: sha
+        for name, sha in sorted(fingerprint.items())
+        if name.startswith(prefix) and present.get(name) != sha and bundled.get(name) != sha
+    }
+
+
+def summarize(names: Iterable[str], depth: int = 3) -> list[tuple[str, int]]:
+    """Count names per leading ``depth`` path components, largest first."""
+
+    counts: dict[str, int] = {}
+    for name in names:
+        key = "/".join(name.split("/")[:depth])
+        counts[key] = counts.get(key, 0) + 1
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
 
 
 def hash_convention(fingerprint: Mapping[str, str], present: Mapping[str, str]) -> tuple[int, int]:
@@ -181,6 +225,12 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
     parser.add_argument("--adb", default=setting("CR_ADB", "adb") or "adb")
     parser.add_argument("--serial", default=setting("CR_ADB_SERIAL"), help="offline instance (default: CR_ADB_SERIAL)")
     parser.add_argument("--prefix", default=DEFAULT_PREFIX, help="update/ subtree to check (default: sc3d/)")
+    parser.add_argument(
+        "--apk",
+        default=setting("CR_INPUT_APK") or str(DEFAULT_APK),
+        help="original APK; identical bundled assets are not counted as missing",
+    )
+    parser.add_argument("--all", action="store_true", help="status: list every missing file, not only a summary")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", help="list fingerprint files missing on the offline instance")
     sync = sub.add_parser("sync", help="fetch, verify and install the missing files")
@@ -200,12 +250,25 @@ def main(argv: Iterable[str] | None = None) -> int:
     content_sha, fingerprint = device_fingerprint(device)
     present = device_hashes(device, args.prefix)
     matching, differing = hash_convention(fingerprint, present)
-    wanted = missing_files(fingerprint, present, args.prefix)
+    apk = Path(args.apk)
+    if apk.is_file():
+        bundled = apk_hashes(apk, args.prefix)
+        bundled_matching = sum(bundled.get(name) == sha for name, sha in fingerprint.items() if name in bundled)
+        apk_note = f"APK 内置且一致 {bundled_matching} 个"
+    else:
+        bundled = {}
+        apk_note = f"未找到原版 APK（{apk}），APK 内置文件也会被算作缺失；用 --apk 指定"
+    wanted = missing_files(fingerprint, present, args.prefix, bundled)
     print(f"fingerprint 中 {args.prefix} 下共 {sum(n.startswith(args.prefix) for n in fingerprint)} 个文件；"
-          f"设备已有且校验一致 {matching} 个，不一致 {differing} 个；缺失或不一致 {len(wanted)} 个。")
+          f"设备已有且一致 {matching} 个，不一致 {differing} 个；{apk_note}；真正缺失 {len(wanted)} 个。")
     if args.command == "status":
-        for name in wanted:
-            print(f"  {name}")
+        if args.all:
+            for name in wanted:
+                print(f"  {name}")
+        else:
+            print("按目录统计（--all 列出全部）：")
+            for directory, count in summarize(wanted)[:40]:
+                print(f"  {count:5d}  {directory}/")
         return 0 if not wanted else 1
     if not wanted:
         print("没有需要补齐的文件。")

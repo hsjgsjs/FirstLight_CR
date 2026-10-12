@@ -186,7 +186,7 @@ PrefabAsset = "sc3d/characters/hero/hero_knight/hero_prefab_knight_battle"
 - **`--from-dir`**：已经有一份完整的 `update` 目录拷贝时使用，目录结构要和 `update/` 一致。
 - **`--content-url`**：知道游戏的内容 CDN 地址时，会按 Supercell 惯用的 `<根地址>/<fingerprint sha>/<路径>` 直接下载。CDN 地址可以在原版游戏联网更新时，用 `adb logcat` 找下载请求的 URL。
 
-补齐后重启离线游戏再开局。如果 `status` 显示的已有文件里有大量 SHA-1 不一致，先别 sync，把输出发给我。
+`status` 会自动读取原版 APK（默认 `user-provided/nulls-royale.apk`，或 `.env` 里的 `CR_INPUT_APK`），游戏能从 APK 里直接读取的文件不算缺失；默认按目录汇总显示，加 `--all` 才逐个列出。补齐后重启离线游戏再开局。如果 `status` 显示的已有文件里有大量 SHA-1 不一致，先别 sync，把输出发给我。
 
 ## 3. 新增的控制命令（probe 控制端口）
 
