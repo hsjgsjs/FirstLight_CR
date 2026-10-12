@@ -56,5 +56,25 @@ int main() {
     constexpr WorldPoint beyond = arena_pixel_to_world(layout, 2000, 3000);
     static_assert(beyond.x == 17500 && beyond.y == 31500);
 
+    // Runtime layouts (phones) must be validated before they replace the
+    // MuMu default.
+    static_assert(layout_is_valid(layout));
+    Layout phone = layout;
+    phone.screen_width = 1440;
+    phone.screen_height = 3200;
+    assert(layout_is_valid(phone));
+    Layout broken = layout;
+    broken.arena_right = broken.arena_left;
+    assert(!layout_is_valid(broken));
+    broken = layout;
+    broken.screen_width = 1000;  // arena_right 1026 would be off screen
+    assert(!layout_is_valid(broken));
+    broken = layout;
+    broken.hand_centers_x[1] = broken.hand_centers_x[0] + 10;  // overlapping cards
+    assert(!layout_is_valid(broken));
+    broken = layout;
+    broken.top_hand_y = broken.bottom_hand_y;
+    assert(!layout_is_valid(broken));
+
     return 0;
 }

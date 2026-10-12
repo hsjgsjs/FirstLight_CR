@@ -144,10 +144,18 @@ class AbilityControl:
     text: str
     ability_name: str | None = None
     source_entity_key: tuple[int, int, int] | None = None
+    # The exact source is unknown (telemetry failed validation or several
+    # carriers are ready), but the probe can still pick the owner's newest
+    # queueable carrier itself.
+    fallback: bool = False
 
     @property
     def ready(self) -> bool:
         return self.source_entity_key is not None
+
+    @property
+    def actionable(self) -> bool:
+        return self.ready or self.fallback
 
 
 def largest_portrait_viewport(container: Rect) -> Rect:
@@ -558,11 +566,14 @@ def ability_control(rich_observation: dict[str, Any] | None, owner: int) -> Abil
 
     side = "上方" if owner == 0 else "下方"
     if rich_observation is None:
-        return AbilityControl(owner, f"{side}技能：遥测不可用")
+        return AbilityControl(owner, f"{side}技能：遥测异常，可尝试释放", fallback=True)
     try:
         runtime = _player(rich_observation, owner).get("abilityRuntime")
     except RunnerError:
-        return AbilityControl(owner, f"{side}技能：遥测不可用")
+        return AbilityControl(owner, f"{side}技能：遥测异常，可尝试释放", fallback=True)
+    if runtime is None:
+        # The probe withholds a controller list it cannot fully validate.
+        return AbilityControl(owner, f"{side}技能：状态未知，可尝试释放", fallback=True)
     if not isinstance(runtime, list) or not runtime:
         return AbilityControl(owner, f"{side}技能：未上场")
 
@@ -587,7 +598,7 @@ def ability_control(rich_observation: dict[str, Any] | None, owner: int) -> Abil
         name = str(item.get("actionDataName") or "主动技能")
         return AbilityControl(owner, f"{side}技能：可用", name, key)
     if len(ready) > 1:
-        return AbilityControl(owner, f"{side}技能：来源不唯一")
+        return AbilityControl(owner, f"{side}技能：可用（多个来源）", fallback=True)
 
     item = runtime[0] if isinstance(runtime[0], dict) else {}
     name = str(item.get("actionDataName") or "主动技能")
@@ -954,8 +965,8 @@ class NativeOverlayApp:
             hidden = self.owner is not None and owner != self.owner and self.mask_model_hud_var.get()
             button.configure(
                 text=f"{'上方' if owner == 0 else '下方'}技能：已隐藏" if hidden else control.text,
-                state="normal" if allowed and control.ready and (self.owner is None or owner == self.owner) else "disabled",
-                bg="#7c3aed" if control.ready and not hidden else "#3f3f46",
+                state="normal" if allowed and control.actionable and (self.owner is None or owner == self.owner) else "disabled",
+                bg="#7c3aed" if control.actionable and not hidden else "#3f3f46",
             )
 
     def _validate_selection(self) -> None:
@@ -1124,7 +1135,7 @@ class NativeOverlayApp:
         if (self.owner is not None and owner != self.owner) or owner not in (0, 1) or self.action_future is not None:
             return
         control = ability_control(self.latest_rich_observation, owner)
-        if not control.ready:
+        if not control.actionable:
             detail = self.latest_ability_error or control.text
             self._set_message(detail, error=True)
             return
@@ -1135,13 +1146,20 @@ class NativeOverlayApp:
     def _run_ability(self, owner: int) -> dict[str, Any]:
         # Resolve the exact live entity key at click time rather than trusting
         # the last UI poll.
-        control = ability_control(self.env.observe_rich(), owner)
-        if not control.ready or control.source_entity_key is None:
-            raise RunnerError(control.text)
         if self.owner is not None and owner != self.owner:
             raise RunnerError("这一方由模型控制")
-        action = AbilityAction(*control.source_entity_key)
-        result = self.env.activate_ability(action)
+        try:
+            rich = self.env.observe_rich()
+        except RunnerError:
+            rich = None
+        control = ability_control(rich, owner)
+        if control.ready and control.source_entity_key is not None:
+            action = AbilityAction(*control.source_entity_key)
+            result = self.env.activate_ability(action)
+        elif control.fallback:
+            result = self.env.activate_owner_ready_ability(owner)
+        else:
+            raise RunnerError(control.text)
         return {**result, "owner": owner, "abilityName": control.ability_name}
 
     def _consume_action(self) -> None:
@@ -1183,7 +1201,8 @@ class NativeOverlayApp:
         elif kind is not None and kind.startswith("ability:"):
             owner = int(result["owner"])
             side = "上方" if owner == 0 else "下方"
-            self._set_message(f"{side}勇者骑士技能已提交；下一原生 tick 生效")
+            name = result.get("abilityName") or "英雄"
+            self._set_message(f"{side} {name} 技能已提交；下一原生 tick 生效")
         self.last_poll = 0.0
 
     def _draw_feedback(self) -> None:

@@ -380,8 +380,19 @@ class NativeOverlayGeometryTests(unittest.TestCase):
 
         self.assertFalse(cooldown_control.ready)
         self.assertIn("12.4s", cooldown_control.text)
+        self.assertFalse(cooldown_control.actionable)
         self.assertFalse(ambiguous_control.ready)
-        self.assertIn("来源不唯一", ambiguous_control.text)
+        # Several ready carriers: the probe picks the newest one itself.
+        self.assertTrue(ambiguous_control.actionable)
+        self.assertIn("多个来源", ambiguous_control.text)
+
+    def test_ability_control_falls_back_when_runtime_is_unknown(self) -> None:
+        for rich in (None, {"players": [{"owner": 0, "abilityRuntime": None}]}, {"players": []}):
+            control = ability_control(rich, 0)
+            self.assertFalse(control.ready)
+            self.assertTrue(control.actionable)
+        absent = ability_control({"players": [{"owner": 0, "abilityRuntime": []}]}, 0)
+        self.assertFalse(absent.actionable)
 
     def test_limited_availability_resolves_exact_native_entity_key(self) -> None:
         rich = {
@@ -445,6 +456,35 @@ class NativeOverlayGeometryTests(unittest.TestCase):
             (0, -2, 5_000_028),
         )
         self.assertEqual(result["abilityName"], "Knight_hero_Ability")
+
+    def test_run_ability_uses_owner_ready_fallback_without_valid_telemetry(self) -> None:
+        from native_runner.cr_native_env import RunnerError
+
+        class StubEnv:
+            def __init__(self) -> None:
+                self.owners = []
+
+            def observe_rich(self):
+                raise RunnerError("rich telemetry failed validation")
+
+            def activate_ability(self, action):
+                raise AssertionError("exact path must not be used without a source key")
+
+            def activate_owner_ready_ability(self, owner):
+                self.owners.append(owner)
+                return {"ok": True, "tick": 42}
+
+        env = StubEnv()
+        app = object.__new__(NativeOverlayApp)
+        app.env = env
+        app.owner = 1
+
+        result = app._run_ability(1)
+
+        self.assertEqual(env.owners, [1])
+        self.assertEqual(result["owner"], 1)
+        with self.assertRaises(RunnerError):
+            app._run_ability(0)
 
 
 if __name__ == "__main__":

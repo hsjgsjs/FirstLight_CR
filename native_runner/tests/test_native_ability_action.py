@@ -54,11 +54,31 @@ def test_host_ability_api_accepts_tagged_native_object_identity() -> None:
     assert result["sourceEntityKey"] == [0, -2, 5_000_006]
 
 
+def test_host_owner_ready_ability_uses_probe_side_selection() -> None:
+    env = _StubNativeClashEnv()
+
+    result = env.activate_owner_ready_ability(1)
+
+    assert env.commands == ["activate-ability 1 -3 0 1"]
+    assert result["sourceEntityKey"] == [1, -3, 0]
+
+
+def test_probe_accepts_only_the_exact_unique_ready_request() -> None:
+    source = (PACKAGE_ROOT / "probe" / "cr_replay_probe.cpp").read_text(encoding="utf-8")
+    handler = source.split('if (std::strncmp(command, "activate-ability ", 17) == 0)', maxsplit=1)[1].split(
+        'if (std::strncmp(command, "inject ", 7) == 0)', maxsplit=1
+    )[0]
+
+    assert "object_index == kUniqueReadyAbilityEntityKeyTag && secondary_index == 0" in handler
+    assert "(object_index < -2 && !unique_ready_request)" in handler
+
+
 @pytest.mark.parametrize(
     ("action", "ticks", "message"),
     (
         (AbilityAction(2, 17, 3), 1, "owner"),
         (AbilityAction(0, -1, 3), 1, "identity"),
+        (AbilityAction(0, -3, 7), 1, "identity"),
         (AbilityAction(0, 17, -1), 1, "identity"),
         (AbilityAction(0, 17, 3), 0, "1..65535"),
         (AbilityAction(0, 17, 3), 65_536, "1..65535"),

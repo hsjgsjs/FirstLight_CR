@@ -729,6 +729,7 @@ bool install_inline_hook(std::uintptr_t libg_base, std::uintptr_t offset, const 
 bool process_pending_native_command(void *manager);
 void process_scheduled_replay_actions(void *manager);
 bool format_probe_native_touch_status(char *response, std::size_t response_size);
+bool handle_probe_native_touch_command(const char *command, char *response, std::size_t response_size);
 void run_control_server(std::uint16_t port);
 
 const char *native_render_speed_json(std::uint32_t speed_quarters) {
@@ -3952,9 +3953,13 @@ bool champion_controller_is_exact_absent(const void *owner_root, const void *con
     return false;
   }
 
+  // Hero-form character data is a derived EXT record whose +0x40 global ID
+  // is 0 (see read_champion_controller).  An absent Hero carrier is still an
+  // exact ChampionAbsent controller, so only reject negative identities here;
+  // the vtable, name, cooldown and charge checks below stay authoritative.
   const void *const selected_character = read_object_field<const void *>(controller, 0x90);
   if (!process_range_is_readable(selected_character, 0x718) ||
-      read_object_field<std::int32_t>(selected_character, 0x40) == 0) {
+      read_object_field<std::int32_t>(selected_character, 0x40) < 0) {
     return false;
   }
   const void *const ability_data = read_object_field<const void *>(selected_character, 0x710);
@@ -4107,6 +4112,14 @@ bool read_native_player_runtime(void *world, void *object_manager, void *const *
     }
     NativeChampionControllerView &ability = result->abilities[result->ability_count];
     if (!read_champion_controller(owner_root, owner, index + 1, controller, objects, object_count, &ability)) {
+      // A Hero-form controller whose carrier is not on the arena cannot be
+      // bound to a live member, so read_champion_controller rejects it.  It is
+      // still an exact ChampionAbsent controller: omit it instead of hiding
+      // the other (possibly ready) controller's runtime from every consumer.
+      if (champion_controller_is_exact_absent(owner_root, controller)) {
+        ability = {};
+        continue;
+      }
       result->ability_runtime_valid = false;
       result->ability_count = 0;
       break;
@@ -6579,6 +6592,10 @@ void handle_control_command(int socket_fd, const char *command) {
     send_control_response(socket_fd, response);
     return;
   }
+  if (handle_probe_native_touch_command(command, response, sizeof(response))) {
+    send_control_response(socket_fd, response);
+    return;
+  }
   if (std::strcmp(command, "attest") == 0) {
     if (!format_runner_attestation(response, sizeof(response))) {
       send_control_error(socket_fd, "could not collect runner attestation");
@@ -7071,8 +7088,12 @@ void handle_control_command(int socket_fd, const char *command) {
       fields = std::sscanf(command + 17, "%d %d %d%n", &owner, &object_index, &secondary_index, &consumed);
       delay = 1;
     }
+    // OBJECT_INDEX -3 with SECONDARY_INDEX 0 asks for the owner's newest
+    // queueable carrier (the same selection collected replays use).  Human
+    // controls use it so a tap does not depend on the rich telemetry poll.
+    const bool unique_ready_request = object_index == kUniqueReadyAbilityEntityKeyTag && secondary_index == 0;
     if ((fields != 3 && fields != 4) || consumed <= 0 || delay < 1 || delay > 65535 || owner < 0 ||
-        owner >= kPlayerCount || object_index < -2 || secondary_index < 0) {
+        owner >= kPlayerCount || (object_index < -2 && !unique_ready_request) || secondary_index < 0) {
       send_control_error(socket_fd, "activate-ability expects OWNER OBJECT_INDEX SECONDARY_INDEX [DELAY]");
       return;
     }
