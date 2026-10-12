@@ -31,6 +31,7 @@ Sources:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -254,7 +255,17 @@ def _http_get(url: str, timeout: float = 60.0) -> bytes:
         return response.read()
 
 
-def root_serves(root: str, content_sha: str, get: Callable[[str], bytes] = _http_get) -> bool:
+# Candidate probes must fail fast: an unreachable host otherwise blocks for
+# the full download timeout and the search looks frozen.
+PROBE_TIMEOUT_SECONDS = 5.0
+PROBE_WORKERS = 8
+
+
+def _probe_get(url: str) -> bytes:
+    return _http_get(url, timeout=PROBE_TIMEOUT_SECONDS)
+
+
+def root_serves(root: str, content_sha: str, get: Callable[[str], bytes] = _probe_get) -> bool:
     """True when ``root`` serves this exact content version's fingerprint."""
 
     try:
@@ -295,12 +306,12 @@ def device_urls(device: Device) -> list[str]:
 def discover_content_root(
     content_sha: str,
     sources: Iterable[tuple[str, Callable[[], list[str]]]],
-    get: Callable[[str], bytes] = _http_get,
+    get: Callable[[str], bytes] = _probe_get,
     log: Callable[[str], None] = print,
     limit: int = 200,
 ) -> str | None:
-    """Try candidate roots from each source in order; return the first that
-    serves this exact fingerprint."""
+    """Try candidate roots from each source; return one that serves this exact
+    fingerprint.  Candidates of a source are probed concurrently."""
 
     tried: set[str] = set()
     for label, collect in sources:
@@ -309,14 +320,23 @@ def discover_content_root(
         except Exception as error:  # noqa: BLE001 - a missing source just contributes nothing
             log(f"  {label}：读取失败（{error}）")
             continue
-        roots = [root for root in candidate_roots(urls) if root not in tried]
+        roots = [root for root in candidate_roots(urls) if root not in tried][: max(0, limit - len(tried))]
         log(f"  {label}：{len(urls)} 个网址，{len(roots)} 个候选根地址")
-        for root in roots:
-            if len(tried) >= limit:
-                return None
-            tried.add(root)
-            if root_serves(root, content_sha, get):
-                return root
+        for url in urls:
+            log(f"      网址 {url}")
+        tried.update(roots)
+        if not roots:
+            continue
+        with ThreadPoolExecutor(max_workers=PROBE_WORKERS) as pool:
+            futures = {pool.submit(root_serves, root, content_sha, get): root for root in roots}
+            for future in as_completed(futures):
+                root = futures[future]
+                if future.result():
+                    log(f"    ✓ {root}")
+                    for other in futures:
+                        other.cancel()
+                    return root
+                log(f"    ✗ {root}")
     return None
 
 
