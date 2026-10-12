@@ -12,7 +12,7 @@
 - **“手机显示和操作，PC 跑模型”可以做，这次已经在代码里实现。** 手机通过 USB 或无线调试连到 PC 后，整局都在手机上操作：拖牌、点牌出牌，点自己场上的英雄或冠军放技能。PC 只负责开局和运行 AI。
 - **“完全不要 PC”目前做不到。** 原因见第 1.3 节。
 - **英雄技能放不出来**：找到并修复了两个代码层面的原因（第 2.1 节）。另外，原来直接在游戏画面上点击的方式本来就没有技能操作，这次补上了“点英雄放技能”。
-- **英雄渲染异常**：没有设备和截图，无法确定根因。第 2.3 节列出了怀疑点，并提供了一个诊断脚本，需要你在出问题的对局里跑一下。
+- **英雄模型不显示**：原因已经确认。英雄本体用的 3D prefab 和动画状态机 `.json` 文件，原版游戏只在需要时联网下载，离线引擎拿不到。现在可以用 `update_assets.py` 把这些文件补进离线实例（第 2.3 节）。
 
 > 以下改动都只通过了主机侧的编译检查和单元测试（第 4 节），**还没有在真机上验证过**。第 1.2 节列出的风险需要你在手机上实际测一遍。
 
@@ -142,24 +142,51 @@ PC（Windows）                                  MuMu（Android 12, root）
 - 双方技能控制器的原始状态；
 - 富遥测校验是否通过，不通过时的原因。
 
-### 2.3 渲染异常：现有怀疑点（需要你的截图和诊断输出）
+### 2.3 英雄模型不显示：原因已确认，以及修复方法
 
-1. **英雄形态没有真正生效。**
-   - `MatchConfig` 写进 `deckN.sp[i].el` 的掩码只声明“这张牌有英雄形态”，并不强制按英雄形态出牌（见 `match_factory.py` 的注释）。
-   - 实际是否生效，取决于引擎在发牌时给出的 form code。如果 `hero_diagnose` 显示该卡是 `BasicForm`，说明英雄没有生效；这时场上出现的是普通兵，但界面上可能留着英雄的元素。
-2. **牌组槽位规则没有实现。**
-   - `ruleset.py` 把 `hero_limit`、`evolution_slots`、`wild_slots` 都列为 missing_rules，控制台允许把英雄放在任意槽位。
-   - 正式游戏里进化、英雄、万能槽的位置是固定的。如果引擎按槽位决定外观，把英雄放在后面的槽位上，就可能出现“半英雄”的显示。
-   - 可以先试一下：只把英雄放在第 1 到第 3 槽，看问题还在不在。
-3. **观战 HUD 本身。** 回放渲染器的英雄血条、技能图标等 UI 是给观战用的，本来就不显示技能按钮，有一部分显示可能就是原版观战的样子。
+**原因**：英雄形态的本体是 3D 模型。以骑士英雄为例，`knight_hero.toml` 里写的是：
 
-请把以下信息发回来，就能继续定位：
+```
+PrefabAsset = "sc3d/characters/hero/hero_knight/hero_prefab_knight_battle"
+```
 
-- 异常画面的截图，说明是兵种模型、手牌图标还是血条/技能 UI 不对；
-- 使用的牌组和每张牌的形态；
-- 对应时刻的 `hero-state.json`。
+它对应两类描述文件：一个 prefab 文件 `hero_prefab_*.json`，以及动画状态机文件 `asm_*.json`。这些文件在 `update/fingerprint.json` 里都有记录，但两边都拿不到：
 
----
+- 原版 APK 只打包了模型和动画本体（`*.glb`），没有打包这些 `.json`；
+- 原版游戏只在需要时才在线下载它们，第一次进大厅的那轮更新并不会下载；
+- 离线引擎被断网，永远下载不到。
+
+文件缺失时，3D 引擎组装不出这个模型，所以英雄本体看不见。英雄的逻辑、技能、投射物都是 2D 资源或纯逻辑，所以仍然正常。
+已经实测确认：设备上的 `update/sc3d` 里只有少量特效、`hero_berserker` 和 `hero_valkyrie`，找不到任何 `hero_knight` 文件。
+
+**修复**：用 `native_runner/update_assets.py` 把缺失的文件补进离线实例。它会：
+
+1. 对照设备自己的 `fingerprint.json`，列出 `sc3d/` 下缺失或内容不一致的文件；
+2. 从你指定的来源取回这些文件；
+3. 逐个用 fingerprint 里的 SHA-1 校验，不一致的直接丢弃；
+4. 推送到 `update/` 目录，并恢复游戏应用的文件属主和 SELinux 标签。
+
+```powershell
+# 1) 先看缺多少文件。它还会统计设备上已有文件的 SHA-1 是否和 fingerprint 一致，借此确认校验方式没问题
+.\.venv\Scripts\python.exe -m native_runner.update_assets status
+
+# 2) 选一个来源补齐（三选一）
+.\.venv\Scripts\python.exe -m native_runner.update_assets sync --from-serial 127.0.0.1:<另一实例端口>
+.\.venv\Scripts\python.exe -m native_runner.update_assets sync --from-dir D:\some\update-copy
+.\.venv\Scripts\python.exe -m native_runner.update_assets sync --content-url https://<内容CDN根地址>
+```
+
+三种来源的说明：
+
+- **`--from-serial`（推荐）**
+  1. 另开一个 MuMu 实例，开启 root，装上**原版** Null's Royale，并保持联网。
+  2. 进入大厅，在卡牌收藏里逐个打开英雄的 3D 预览；也可以用英雄联网打一局，让游戏把这些资源缓存下来。
+  3. 对离线实例执行 sync，参数填这个实例的 adb 地址。
+  4. 不要直接在离线实例上解除断网：离线 APK 跳过了在线加载流程，联网也不会去下载这些文件。
+- **`--from-dir`**：已经有一份完整的 `update` 目录拷贝时使用，目录结构要和 `update/` 一致。
+- **`--content-url`**：知道游戏的内容 CDN 地址时，会按 Supercell 惯用的 `<根地址>/<fingerprint sha>/<路径>` 直接下载。CDN 地址可以在原版游戏联网更新时，用 `adb logcat` 找下载请求的 URL。
+
+补齐后重启离线游戏再开局。如果 `status` 显示的已有文件里有大量 SHA-1 不一致，先别 sync，把输出发给我。
 
 ## 3. 新增的控制命令（probe 控制端口）
 

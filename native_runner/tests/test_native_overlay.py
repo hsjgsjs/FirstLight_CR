@@ -10,12 +10,17 @@ from native_runner.arena import OccupiedFootprintV1, card_placement_legal_world
 from native_runner.battle_env import TOWER_LAYOUT
 from native_runner.card_specs import build_card_catalog
 from native_runner.native_overlay import (
+    ABILITY_BUTTON_CENTERS,
+    ABILITY_BUTTON_RADII,
     ARENA_RECT,
+    AbilityControl,
     NativeOverlayApp,
     PlayResult,
     Rect,
     Selection,
     WORLD_PROJECTION_RECT,
+    ability_button_hit,
+    ability_button_label,
     ability_control,
     all_card_hits,
     arena_source_to_world,
@@ -238,6 +243,8 @@ class NativeOverlayGeometryTests(unittest.TestCase):
         app.owner = 1
         app.selection = None
         app.last_crosshair = None
+        # No Hero/Champion on the arena, so no in-picture ability button.
+        app.latest_rich_observation = {"players": [{"owner": 1, "abilityRuntime": []}]}
         app._mask_items = []
         app._mask_viewport_size = None
         drawn: dict[int, tuple[int, int, int, int]] = {}
@@ -485,6 +492,43 @@ class NativeOverlayGeometryTests(unittest.TestCase):
         self.assertEqual(result["owner"], 1)
         with self.assertRaises(RunnerError):
             app._run_ability(0)
+
+    def test_in_picture_ability_buttons_do_not_cover_cards(self) -> None:
+        for owner, (x, y) in ABILITY_BUTTON_CENTERS.items():
+            radius = ABILITY_BUTTON_RADII[owner]
+            self.assertEqual(ability_button_hit(x, y), owner)
+            self.assertIsNone(ability_button_hit(x + radius + 1, y))
+            for dx, dy in ((-radius, 0), (radius, 0), (0, -radius), (0, radius)):
+                self.assertIsNone(hit_card_source(x + dx, y + dy))
+        bottom_x, bottom_y = ABILITY_BUTTON_CENTERS[1]
+        self.assertFalse(ARENA_RECT.contains(bottom_x, bottom_y))
+
+    def test_in_picture_ability_button_labels(self) -> None:
+        self.assertEqual(ability_button_label(AbilityControl(1, "下方技能：可用", "Knight_hero", (1, -2, 7))), "技能")
+        self.assertEqual(ability_button_label(AbilityControl(1, "下方技能：遥测异常，可尝试释放", fallback=True)), "技能")
+        self.assertEqual(ability_button_label(AbilityControl(1, "下方技能：冷却 3.5s", "Knight_hero")), "3.5s")
+        self.assertEqual(ability_button_label(AbilityControl(1, "下方技能：NotEnoughElixir", "Knight_hero")), "圣水不足")
+        self.assertIsNone(ability_button_label(AbilityControl(1, "下方技能：未上场")))
+
+    def test_clicking_the_in_picture_button_requests_the_ability(self) -> None:
+        app = object.__new__(NativeOverlayApp)
+        app.owner = 1
+        app.viewport = Rect(0, 0, 1080, 1920)
+        app.latest_observation = {"players": []}
+        app.latest_status = {"mode": "native-render"}
+        app.latest_rich_observation = None  # telemetry failed: fallback stays available
+        requested = []
+        app.request_ability = requested.append
+        app._draw_feedback = lambda: None
+        x, y = ABILITY_BUTTON_CENTERS[1]
+        app._on_viewport_click(SimpleNamespace(x=x, y=y))
+        self.assertEqual(requested, [1])
+        # The model's side never gets a button.
+        x, y = ABILITY_BUTTON_CENTERS[0]
+        app.selection = None
+        app._set_message = lambda *args, **kwargs: None
+        app._on_viewport_click(SimpleNamespace(x=x, y=y))
+        self.assertEqual(requested, [1])
 
 
 if __name__ == "__main__":
