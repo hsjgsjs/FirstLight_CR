@@ -14,6 +14,7 @@
 #include "phase_runtime_layout.h"
 #include "probe_json.h"
 #include "probe_hook.h"
+#include "event_transmit_floor.h"
 
 constexpr std::size_t kPhaseRuntimeRingCapacity = 4096;
 constexpr std::size_t kPhaseRuntimeCacheCapacity = 512;
@@ -965,7 +966,7 @@ bool append_phase_runtime_events_json(std::uint64_t generation, std::uint64_t st
       identity ? g_phase_runtime_epoch_first_sequence.load(std::memory_order_acquire) : next;
   const std::uint64_t retained_oldest =
       next > epoch_first + kPhaseRuntimeRingCapacity ? next - kPhaseRuntimeRingCapacity : epoch_first;
-  const std::uint64_t transmit_from = retained_oldest;
+  const std::uint64_t transmit_from = event_transmit_from(kTransmitPhase, retained_oldest, next);
   const std::uint64_t overflow = identity ? g_phase_runtime_overflow_count.load(std::memory_order_acquire) : 0;
   const std::uint64_t rejected = identity ? g_phase_runtime_rejected_count.load(std::memory_order_acquire) : 0;
   const bool complete = installed && identity && rejected == 0;

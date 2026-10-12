@@ -65,6 +65,7 @@ def test_native_telemetry_wire_contract(tmp_path: Path) -> None:
 #include <cassert>
 #include "phase_runtime_layout.h"
 #include "probe_json.h"
+#include "event_transmit_floor.h"
 #define LOGE(...) ((void)0)
 constexpr std::int32_t kNativeObjectIdEntityKeyTag = -2;
 constexpr int kPlayerCount = 2;

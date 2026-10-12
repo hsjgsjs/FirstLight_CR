@@ -364,6 +364,7 @@ bool g_live_capture_requested = false;
 std::uint64_t g_live_capture_sequence = 0;
 char *g_live_capture_buffer = nullptr;
 pthread_mutex_t g_live_request_mutex = PTHREAD_MUTEX_INITIALIZER;
+long long g_live_capture_micros = -1;  // game-thread time of the last capture
 void live_controller_updated(void *controller);
 char g_pending_native_render_json[kMaxReplayConfigBytes] = {};
 std::uint64_t g_native_render_request_sequence = 0;
@@ -6473,7 +6474,11 @@ void live_controller_updated(void *controller) {
   g_live_tick = tick;
   if (g_live_capture_requested && g_live_capture_buffer != nullptr) {
     g_live_capture_requested = false;
+    timespec started{}, finished{};
+    clock_gettime(CLOCK_MONOTONIC, &started);
     build_atomic_observation_json_locked(g_live_capture_buffer, kFullObservationResponseBytes);
+    clock_gettime(CLOCK_MONOTONIC, &finished);
+    g_live_capture_micros = (finished.tv_sec - started.tv_sec) * 1000000LL + (finished.tv_nsec - started.tv_nsec) / 1000;
     ++g_live_capture_sequence;
     pthread_cond_broadcast(&g_control_cond);
   }
@@ -6486,7 +6491,13 @@ bool handle_live_command(int socket_fd, const char *command) {
     return false;
   }
   const char *const argument = command + 5;
-  if (std::strcmp(argument, "observe-atomic") == 0) {
+  // "observe-atomic [combat phase visibility remaining]": optional event cursors (the
+  // caller's next unseen sequence per ring) keep every capture to the new events only.
+  unsigned long long floors[kTransmitRings] = {};
+  const bool plain = std::strcmp(argument, "observe-atomic") == 0;
+  if (plain || (std::strncmp(argument, "observe-atomic ", 15) == 0 &&
+                std::sscanf(argument + 15, "%llu %llu %llu %llu", &floors[0], &floors[1], &floors[2], &floors[3]) ==
+                    kTransmitRings)) {
     if (!g_live_enabled.load(std::memory_order_acquire)) {
       send_control_error(socket_fd, "live mode is off (send 'live on' first)");
       return true;
@@ -6499,6 +6510,9 @@ bool handle_live_command(int socket_fd, const char *command) {
     bool captured = false;
     if (g_live_capture_buffer != nullptr && g_live_manager.load(std::memory_order_acquire) != nullptr) {
       const std::uint64_t sequence = g_live_capture_sequence;
+      for (int ring = 0; ring < kTransmitRings; ++ring) {
+        g_event_transmit_floor[ring] = floors[ring];
+      }
       g_live_capture_buffer[0] = '\0';
       g_live_capture_requested = true;
       timespec deadline{};
@@ -6511,6 +6525,7 @@ bool handle_live_command(int socket_fd, const char *command) {
       }
       captured = g_live_capture_sequence != sequence;
       g_live_capture_requested = false;
+      std::memset(g_event_transmit_floor, 0, sizeof(g_event_transmit_floor));
     }
     const bool attached = g_live_manager.load(std::memory_order_acquire) != nullptr;
     pthread_mutex_unlock(&g_control_mutex);
@@ -6536,15 +6551,16 @@ bool handle_live_command(int socket_fd, const char *command) {
     g_live_tick = -1;
   } else if (std::strcmp(argument, "status") != 0) {
     pthread_mutex_unlock(&g_control_mutex);
-    send_control_error(socket_fd, "live expects on|off|status|observe-atomic");
+    send_control_error(socket_fd, "live expects on|off|status|observe-atomic [4 event cursors]");
     return true;
   }
   char response[256];
   std::snprintf(response, sizeof(response),
-                "{\"ok\":true,\"live\":%s,\"attached\":%s,\"generation\":%llu,\"tick\":%d,\"captures\":%llu}",
+                "{\"ok\":true,\"live\":%s,\"attached\":%s,\"generation\":%llu,\"tick\":%d,\"captures\":%llu,"
+                "\"captureMicros\":%lld}",
                 g_live_enabled.load() ? "true" : "false", g_live_manager.load() ? "true" : "false",
                 static_cast<unsigned long long>(g_live_generation), g_live_tick,
-                static_cast<unsigned long long>(g_live_capture_sequence));
+                static_cast<unsigned long long>(g_live_capture_sequence), g_live_capture_micros);
   pthread_mutex_unlock(&g_control_mutex);
   send_control_response(socket_fd, response);
   return true;

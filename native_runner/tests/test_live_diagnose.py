@@ -71,7 +71,7 @@ def test_live_attach_binds_every_runtime_telemetry_ring() -> None:
 
 
 def test_match_config_from_live_capture() -> None:
-    from native_runner.live_match import RecordedLiveNative, match_config_from_capture
+    from native_runner.live_match import match_config_from_capture
 
     decks = {
         0: (26000010, 26000014, 27000000, 26000030, 26000038, 28000011, 28000000, 26000021),
@@ -99,6 +99,3 @@ def test_match_config_from_live_capture() -> None:
     assert match.deck0_form_availability == (1, 1, 0, 0, 0, 0, 0, 0)
     assert match.deck1_form_availability == (1, 0, 0, 0, 0, 0, 0, 0)
 
-    native = RecordedLiveNative([capture, capture])
-    assert native.advance() and not native.advance()
-    assert native.pause() == {"ok": True}

@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include "visibility_runtime_layout.h"
+#include "event_transmit_floor.h"
 
 enum class VisibilityMutationKind : std::uint8_t {
   Apply = 1,
@@ -376,7 +377,7 @@ bool append_visibility_runtime_events_json(std::uint64_t generation, std::uint64
       identity ? g_visibility_runtime_epoch_first_sequence.load(std::memory_order_acquire) : next;
   const std::uint64_t retained_oldest =
       next > epoch_first + kVisibilityRuntimeRingCapacity ? next - kVisibilityRuntimeRingCapacity : epoch_first;
-  const std::uint64_t transmit_from = retained_oldest;
+  const std::uint64_t transmit_from = event_transmit_from(kTransmitVisibility, retained_oldest, next);
   const std::uint64_t overflow = identity ? g_visibility_runtime_overflow_count.load(std::memory_order_acquire) : 0;
   const std::uint64_t rejected = identity ? g_visibility_runtime_rejected_count.load(std::memory_order_acquire) : 0;
   const bool complete = transition_installed && identity && rejected == 0;
