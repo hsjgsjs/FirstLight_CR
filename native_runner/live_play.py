@@ -59,8 +59,10 @@ class ScreenLayout:
 
     @classmethod
     def default(cls, width: int, height: int) -> "ScreenLayout":
-        """Jason's Pixel 9 measurement (1080x2424) scaled to this screen: a starting point only."""
+        """A layout measured on this resolution, else Jason's Pixel 9 one (1080x2424) scaled: a guess."""
 
+        if (width, height) in MEASURED_LAYOUTS:
+            return MEASURED_LAYOUTS[width, height]
         sx, sy = width / 1080, height / 2424
         tile_h = (1714 - 295) / 30
         return cls(
@@ -73,6 +75,8 @@ class ScreenLayout:
 
     @classmethod
     def load(cls, path: Path, width: int, height: int) -> "ScreenLayout":
+        """``path`` when it is calibrated; otherwise the default (a measured one where there is one)."""
+
         if not path.is_file():
             return cls.default(width, height)
         data = json.loads(path.read_text("utf-8"))
@@ -86,6 +90,8 @@ class ScreenLayout:
         )
         if (layout.width, layout.height) != (width, height):
             raise SystemExit(f"{path} is for {layout.width}x{layout.height}, the screen is {width}x{height}")
+        if not layout.calibrated and (width, height) in MEASURED_LAYOUTS:
+            return MEASURED_LAYOUTS[width, height]  # an uncalibrated file is only the old guess
         return layout
 
     def save(self, path: Path) -> None:
@@ -98,6 +104,21 @@ class ScreenLayout:
         cells_x, cells_y = (18 - x / 1000, y / 1000) if seat == 0 else (x / 1000, 32 - y / 1000)
         left, top, right, bottom = self.arena
         return round(left + (right - left) * cells_x / 18), round(bottom - (bottom - top) * cells_y / 32)
+
+
+# Measured from MuMu battle screenshots (2026-10-12): the arena edges fitted to the grass
+# checkerboard's tile boundaries (68.3 x 55.35 px tiles, 1-2 px residuals, river rows 15-16 at
+# y 1026-1137), the hand card centres and the hero ability button.
+MEASURED_LAYOUTS = {
+    (1440, 2560): ScreenLayout(
+        width=1440,
+        height=2560,
+        arena=(101.2, 195.7, 1330.1, 1966.9),
+        hand=((446, 2270), (720, 2270), (990, 2270), (1260, 2270)),
+        ability=(1295, 1940),
+        calibrated=True,
+    ),
+}
 
 
 def screen_size() -> tuple[int, int]:
@@ -513,16 +534,19 @@ def run(args: argparse.Namespace) -> None:
 
 
 def shot(args: argparse.Namespace) -> Path:
-    """Screenshot with the tap layout (and, in a battle, the towers where it puts them) drawn on it."""
+    """Screenshot with the tap layout (and, in a battle, towers and units where it puts them) drawn on it."""
 
+    import gzip
     from io import BytesIO
 
     from PIL import Image, ImageDraw
 
     width, height = screen_size()
     layout = ScreenLayout.load(Path(args.layout), width, height)
-    if not Path(args.layout).is_file():
-        layout.save(Path(args.layout))
+    if not Path(args.layout).is_file() or (
+        layout.calibrated and not json.loads(Path(args.layout).read_text("utf-8")).get("calibrated")
+    ):
+        layout.save(Path(args.layout))  # never overwrites a layout calibrated by hand
     raw = subprocess.run(
         [*_adb_prefix(), "exec-out", "screencap", "-p"], capture_output=True, check=True, timeout=30
     ).stdout
@@ -551,10 +575,22 @@ def shot(args: argparse.Namespace) -> Path:
         control._request("live on")
         capture = control._request("live observe-atomic")
         seat = choose_seat(capture, args.owner, args.account_id)
+        with gzip.open(LIVE_ROOT / f"shot-{stamp}.json.gz", "wt", encoding="utf-8") as stream:
+            json.dump(capture, stream)
+        font = _font(max(16, width // 40))
+        # Towers (orange) carry their hp: it must match the hp bar drawn next to the same tower,
+        # or the layout mirrors the arena.  Units: blue ours, red theirs.
         for item in capture["ordinary"]["objects"]:
-            if int(item.get("cardId", 0)) == -1:  # towers
-                tx, ty = layout.world_point(item["x"], item["y"], seat)
+            tx, ty = layout.world_point(item["x"], item["y"], seat)
+            if int(item.get("cardId", 0)) == -1:
                 draw.ellipse([tx - radius, ty - radius, tx + radius, ty + radius], outline=(255, 64, 0), width=5)
+                if item.get("hp") is not None:
+                    draw.text((tx + radius + 4, ty - radius), str(item["hp"]), fill=(255, 64, 0), font=font,
+                              stroke_width=3, stroke_fill=(0, 0, 0))
+            else:
+                color = (0, 120, 255) if int(item.get("owner", -1)) == seat else (255, 0, 0)
+                draw.ellipse([tx - radius // 2, ty - radius // 2, tx + radius // 2, ty + radius // 2],
+                             outline=color, width=4)
     except (RunnerError, OSError, SystemExit) as error:
         print(f"没有画塔的位置（{error}）")
     finally:
@@ -567,6 +603,15 @@ def shot(args: argparse.Namespace) -> Path:
     image.save(out)
     print(f"截图：{LIVE_ROOT / f'shot-{stamp}.png'}\n叠加布局：{out}\n布局文件：{args.layout}")
     return out
+
+
+def _font(size: int) -> Any:
+    from PIL import ImageFont
+
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:  # Pillow < 10.1
+        return ImageFont.load_default()
 
 
 def _adb_prefix() -> list[str]:
