@@ -63,3 +63,42 @@ def test_summary_and_validation_report_instead_of_raising() -> None:
     assert [player["hand"] for player in summary["players"]] == [0, 4]
     assert report["atomic"].startswith("RunnerError")
     assert "rich" in report and report["rich"] != "ok"
+
+
+def test_live_attach_binds_every_runtime_telemetry_ring() -> None:
+    updated = cpp_function(PROBE.read_text(encoding="utf-8"), "live_controller_updated")
+    assert "begin_runtime_telemetry_epoch(manager, g_live_generation, g_live_generation)" in updated
+
+
+def test_match_config_from_live_capture() -> None:
+    from native_runner.live_match import RecordedLiveNative, match_config_from_capture
+
+    decks = {
+        0: (26000010, 26000014, 27000000, 26000030, 26000038, 28000011, 28000000, 26000021),
+        1: (26000000, 26000014, 26000005, 28000001, 26000084, 26000030, 26000001, 26000018),
+    }
+    capture = {
+        "ordinary": {
+            "players": [
+                {"owner": owner, "deck": [{"deckSlot": slot, "cardId": card} for slot, card in reversed(list(enumerate(deck)))]}
+                for owner, deck in decks.items()
+            ]
+        },
+        "rich": {
+            "players": [
+                {"owner": 0, "evolutionRuntime": [{"deckSlot": slot, "evolvable": True} for slot in range(4)]},
+                {"owner": 1, "evolutionRuntime": [{"deckSlot": 0, "evolvable": True}, {"deckSlot": 5, "evolvable": True}]},
+            ]
+        },
+    }
+
+    match = match_config_from_capture(capture)
+
+    assert match.deck0 == decks[0] and match.deck1 == decks[1]
+    # Only the first two slots are evolution slots, whatever the cards could do.
+    assert match.deck0_form_availability == (1, 1, 0, 0, 0, 0, 0, 0)
+    assert match.deck1_form_availability == (1, 0, 0, 0, 0, 0, 0, 0)
+
+    native = RecordedLiveNative([capture, capture])
+    assert native.advance() and not native.advance()
+    assert native.pause() == {"ok": True}

@@ -40,3 +40,13 @@
 | `live observe-atomic` | 在游戏线程上，于对局刚更新完的那一刻采集一次完整观测（普通观测 + rich 观测） |
 
 实战模式开启时，普通的 `observe`、`observe-rich`、`observe-atomic` 命令会被拒绝，因为在控制线程上读一个正在运行的对局，读到的状态前后不一致。
+
+## 第 1 轮结果（2026-10-12）
+
+- 5 个样本全部通过 FirstLight 的 atomic/rich 校验；双方牌组、手牌、循环、圣水都能读到；游戏线程上每次采集 31～47ms。
+- 发现并修复：挂上实战局时只登记了战斗事件，相位、移动、角色状态、塔兵这几类遥测没有登记，所以一直报“不完整”。现在挂接时统一登记全部遥测。
+- 用保存的样本离线跑通了 `BattleEnvV1` → 张量化 → General 模型，模型能正常给出决策：
+  ```powershell
+  .\.venv\Scripts\python.exe -m native_runner.live_diagnose replay runs\live-diagnose\<时间>
+  ```
+- 已知差异：实战采集里没有牌组的进化/英雄槽位标记。现在按天梯规则处理：只有前两个槽位算进化槽，万能槽和英雄槽暂时不识别。
