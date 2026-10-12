@@ -1,5 +1,9 @@
 """Fill in on-demand game content that the offline engine can never download.
 
+Note: invisible Hero bodies on MuMu are a renderer problem, not missing
+files; switch the MuMu instance's graphics renderer to Vulkan.  This tool
+only compares update/ with its fingerprint and fills real gaps.
+
 Hero forms render with 3D prefabs (``sc3d/characters/hero/...``).  The stock
 client only downloads those prefab/ASM ``.json`` files on demand, so after the
 initial lobby update most of them are listed in ``update/fingerprint.json``

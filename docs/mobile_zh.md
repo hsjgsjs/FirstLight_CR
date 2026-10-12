@@ -12,7 +12,7 @@
 - **“手机显示和操作，PC 跑模型”可以做，这次已经在代码里实现。** 手机通过 USB 或无线调试连到 PC 后，整局都在手机上操作：拖牌、点牌出牌，点自己场上的英雄或冠军放技能。PC 只负责开局和运行 AI。
 - **“完全不要 PC”目前做不到。** 原因见第 1.3 节。
 - **英雄技能放不出来**：找到并修复了两个代码层面的原因（第 2.1 节）。另外，原来直接在游戏画面上点击的方式本来就没有技能操作，这次补上了“点英雄放技能”。
-- **英雄模型不显示**：原因已经确认。英雄本体用的 3D prefab 和动画状态机 `.json` 文件，原版游戏只在需要时联网下载，离线引擎拿不到。现在可以用 `update_assets.py` 把这些文件补进离线实例（第 2.3 节）。
+- **英雄模型不显示**：是 MuMu 的渲染问题。英雄本体是 3D 模型，MuMu 默认的渲染模式画不出来，**把 MuMu 渲染模式改成 Vulkan 就正常了**（第 2.3 节，已实测）。
 
 > 以下改动都只通过了主机侧的编译检查和单元测试（第 4 节），**还没有在真机上验证过**。第 1.2 节列出的风险需要你在手机上实际测一遍。
 
@@ -142,59 +142,13 @@ PC（Windows）                                  MuMu（Android 12, root）
 - 双方技能控制器的原始状态；
 - 富遥测校验是否通过，不通过时的原因。
 
-### 2.3 英雄模型不显示：原因已确认，以及修复方法
+### 2.3 英雄模型不显示：MuMu 要用 Vulkan 渲染
 
-**原因**：英雄形态的本体是 3D 模型。以骑士英雄为例，`knight_hero.toml` 里写的是：
+**结论（已实测）**：在 MuMu 实例设置里把**显卡渲染模式改为 Vulkan**，然后重启实例，英雄模型就能正常显示。
 
-```
-PrefabAsset = "sc3d/characters/hero/hero_knight/hero_prefab_knight_battle"
-```
+**原因**：英雄形态的本体是 3D 模型（`PrefabAsset = "sc3d/characters/hero/..."`）。普通兵种、投射物和界面都是 2D 贴图。MuMu 默认的渲染模式能画 2D，但画不出这些 3D 英雄模型，所以看起来像“英雄本体隐形，但技能和箭矢正常”。联网的原版游戏在同一种渲染模式下也有同样的问题，说明它和离线改造无关。
 
-它对应两类描述文件：一个 prefab 文件 `hero_prefab_*.json`，以及动画状态机文件 `asm_*.json`。这些文件在 `update/fingerprint.json` 里都有记录，但两边都拿不到：
-
-- 原版 APK 只打包了模型和动画本体（`*.glb`），没有打包这些 `.json`；
-- 原版游戏只在需要时才在线下载它们，第一次进大厅的那轮更新并不会下载；
-- 离线引擎被断网，永远下载不到。
-
-文件缺失时，3D 引擎组装不出这个模型，所以英雄本体看不见。英雄的逻辑、技能、投射物都是 2D 资源或纯逻辑，所以仍然正常。
-已经实测确认：设备上的 `update/sc3d` 里只有少量特效、`hero_berserker` 和 `hero_valkyrie`，找不到任何 `hero_knight` 文件。
-
-**修复**：用 `native_runner/update_assets.py` 把缺失的文件补进离线实例。它会：
-
-1. 对照设备自己的 `fingerprint.json`，列出 `sc3d/` 下缺失或内容不一致的文件；
-2. 从你指定的来源取回这些文件；
-3. 逐个用 fingerprint 里的 SHA-1 校验，不一致的直接丢弃；
-4. 推送到 `update/` 目录，并恢复游戏应用的文件属主和 SELinux 标签。
-
-```powershell
-# 1) 先看缺多少文件。它还会统计设备上已有文件的 SHA-1 是否和 fingerprint 一致，借此确认校验方式没问题
-.\.venv\Scripts\python.exe -m native_runner.update_assets status
-
-# 2) 选一个来源补齐（三选一）
-.\.venv\Scripts\python.exe -m native_runner.update_assets sync --from-serial 127.0.0.1:<另一实例端口>
-.\.venv\Scripts\python.exe -m native_runner.update_assets sync --from-dir D:\some\update-copy
-.\.venv\Scripts\python.exe -m native_runner.update_assets sync --content-url https://<内容CDN根地址>
-```
-
-**最省事：全自动**（不需要第二个实例，也不用手动点任何东西）：
-
-```powershell
-.\.venv\Scripts\python.exe -m native_runner.update_assets sync --auto
-```
-
-工具会先去三个地方找游戏的资源下载地址（CDN）：设备上原版游戏留下的数据和日志、原版 APK 的程序文件、内置的已知地址。每个候选地址都要实际返回同一版本的 `fingerprint.json` 才会被采用。地址找到后，再直接下载全部缺失文件，逐个校验后装进去。找到的地址会被记住，下次直接复用。只想查找地址、不下载，可以用 `update_assets discover`。
-
-另外三种来源的说明：
-
-- **`--from-serial`（推荐）**
-  1. 另开一个 MuMu 实例，开启 root，装上**原版** Null's Royale，并保持联网。
-  2. 进入大厅，在卡牌收藏里逐个打开英雄的 3D 预览；也可以用英雄联网打一局，让游戏把这些资源缓存下来。
-  3. 对离线实例执行 sync，参数填这个实例的 adb 地址。
-  4. 不要直接在离线实例上解除断网：离线 APK 跳过了在线加载流程，联网也不会去下载这些文件。
-- **`--from-dir`**：已经有一份完整的 `update` 目录拷贝时使用，目录结构要和 `update/` 一致。
-- **`--content-url`**：知道游戏的内容 CDN 地址时，会按 Supercell 惯用的 `<根地址>/<fingerprint sha>/<路径>` 直接下载。CDN 地址可以在原版游戏联网更新时，用 `adb logcat` 找下载请求的 URL。
-
-`status` 会自动读取原版 APK（默认 `user-provided/nulls-royale.apk`，或 `.env` 里的 `CR_INPUT_APK`），游戏能从 APK 里直接读取的文件不算缺失；默认按目录汇总显示，加 `--all` 才逐个列出。补齐后重启离线游戏再开局。如果 `status` 显示的已有文件里有大量 SHA-1 不一致，先别 sync，把输出发给我。
+**更正**：这一节之前把原因判断成“英雄的 3D 描述文件没下载”，并为此写了 `native_runner/update_assets.py`。换成 Vulkan 后模型就正常了，说明这个判断是错的，**解决这个问题不需要运行 `update_assets`**。这个工具还保留着，只用于对照 `fingerprint.json` 检查和补齐 `update/` 里的文件。
 
 ## 3. 新增的控制命令（probe 控制端口）
 

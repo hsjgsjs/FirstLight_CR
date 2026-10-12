@@ -70,7 +70,7 @@ flowchart LR
 
 新机器安装或交给 coding agent 配置时，请按[安装指南](docs/getting_started.md)操作。以下是摘要。
 
-**桌面环境：** Windows、含 Tkinter 的 Python 3.12，以及普通官网版 MuMu Player 中一个 **Android 12**、开启 root、支持 ARM64 应用的实例。模型支持 CPU 推理。从源码构建离线 APK 才需要 JDK 17、Android NDK 与 SDK build-tools；运行已经构建好的 APK 不需要这些工具。
+**桌面环境：** Windows、含 Tkinter 的 Python 3.12，以及普通官网版 MuMu Player 中一个 **Android 12**、开启 root、支持 ARM64 应用，并把显卡渲染模式设为 **Vulkan** 的实例（默认渲染模式下英雄形态的 3D 模型会不显示）。模型支持 CPU 推理。从源码构建离线 APK 才需要 JDK 17、Android NDK 与 SDK build-tools；运行已经构建好的 APK 不需要这些工具。
 
 在仓库根目录执行：
 

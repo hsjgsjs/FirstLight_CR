@@ -71,7 +71,7 @@ See the [architecture guide](docs/architecture.md) for source entry points and d
 
 For a fresh machine or coding-agent setup, follow the [installation guide](docs/getting_started.md). The steps below are a summary.
 
-**Desktop:** Windows, Python 3.12 with Tkinter, and an Android 12 instance of regular MuMu Player with root and ARM64 application support. CPU inference is supported. Building the offline APK from source requires JDK 17, Android NDK, and SDK build-tools; running an already built APK does not.
+**Desktop:** Windows, Python 3.12 with Tkinter, and an Android 12 instance of regular MuMu Player with root, ARM64 application support and the **Vulkan** graphics renderer (Hero-form 3D models are invisible with the default renderer). CPU inference is supported. Building the offline APK from source requires JDK 17, Android NDK, and SDK build-tools; running an already built APK does not.
 
 Run from the repository root:
 

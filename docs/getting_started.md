@@ -15,7 +15,7 @@ Install FirstLight CR using docs/getting_started.md. Use an Android 12 MuMu inst
 | Component | Requirement |
 | --- | --- |
 | Desktop | Windows and Python 3.12 with Tkinter |
-| MuMu | Android 12 instance with root and ARM64 application support |
+| MuMu | Android 12 instance with root and ARM64 application support; graphics renderer set to **Vulkan** (Hero-form 3D models are invisible with the default renderer) |
 | Game | Null's Royale APK 15.535.13, arm64-v8a; in-game content update 15.535.86 |
 | Build tools | JDK 17, Android NDK, and Android SDK build-tools; NDK 27.3 and build-tools 37.0 have been used |
 
@@ -33,7 +33,7 @@ Copy-Item .env.example .env
 
 ## 2. Select MuMu and fill `.env`
 
-The regular MuMu Player installer is sufficient. Create an Android 12 instance, or use an existing one if you are willing to replace its Null's Royale installation. Enable root and ARM64 support.
+The regular MuMu Player installer is sufficient. Create an Android 12 instance, or use an existing one if you are willing to replace its Null's Royale installation. Enable root and ARM64 support. In the instance's display settings, set the graphics renderer to Vulkan and restart the instance; otherwise Hero-form units render without their 3D body.
 
 Fill these values in the local `.env` file with paths and details from your machine:
 
