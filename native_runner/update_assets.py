@@ -14,6 +14,7 @@ against the fingerprint SHA-1, and installs them with the app's ownership.
     python -m native_runner.update_assets sync --from-serial 127.0.0.1:16416
     python -m native_runner.update_assets sync --from-dir D:\\cr-update
     python -m native_runner.update_assets sync --content-url https://<cdn-root>
+    python -m native_runner.update_assets sync --auto     # find the CDN itself
 
 Sources:
   --from-serial  another (rooted) MuMu instance or phone running the ORIGINAL
@@ -22,6 +23,9 @@ Sources:
   --from-dir     a local copy of an update directory (same relative paths).
   --content-url  the game's content CDN root; files are requested as
                  <root>/<fingerprint sha>/<path>, the usual Supercell layout.
+  --auto         discover that CDN root: URLs in the original APK's code, in
+                 the original game's saved data on the device and in logcat
+                 are tried until one serves this exact fingerprint.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+import re
 import shlex
 import subprocess
 import sys
@@ -46,6 +51,15 @@ UPDATE = f"{DATA}/update"
 DEFAULT_PREFIX = "sc3d/"
 STAGING_ROOT = WORKSPACE_ROOT / "runs" / "asset-sync"
 DEFAULT_APK = REPOSITORY_ROOT / "user-provided" / "nulls-royale.apk"
+CONTENT_URL_CACHE = STAGING_ROOT / "content_url.txt"
+USER_AGENT = "Mozilla/5.0 (Linux; Android 12) FirstLight-asset-sync"
+# Tried after every discovered candidate; harmless if it does not serve this
+# fingerprint because each root must return the exact fingerprint sha.
+KNOWN_CONTENT_ROOTS = ("https://game-assets.clashroyaleapp.com",)
+_URL = re.compile(rb"https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~%!$&'()*+,;=:@/-]*)?")
+_SHA_SEGMENT = re.compile(r"/[0-9a-fA-F]{40}(?=/|$)")
+_IGNORED_HOSTS = ("schemas.android.com", "www.w3.org", "ns.adobe.com", "xml.org", "apache.org", "google.com",
+                  "googleapis.com", "android.com", "apple.com", "facebook.com", "crashlytics.com")
 
 
 def _relative(name: str) -> str:
@@ -202,6 +216,139 @@ def install_staged(device: Device, staging: Path) -> None:
         device.run("shell", f"rm -rf {remote}", allow_failure=True)
 
 
+def urls_in(data: bytes) -> list[str]:
+    """Distinct http(s) URLs embedded in binary or text data, in order."""
+
+    seen: dict[str, None] = {}
+    for match in _URL.finditer(data):
+        seen.setdefault(match.group().decode("ascii", "ignore").rstrip(".,;:'\")"), None)
+    return list(seen)
+
+
+def candidate_roots(urls: Iterable[str]) -> list[str]:
+    """Possible content roots: the part before a 40-hex version segment, or
+    every path prefix of a URL that has none."""
+
+    roots: dict[str, None] = {}
+    for url in urls:
+        scheme, _, rest = url.partition("://")
+        host, _, path = rest.partition("/")
+        if not host or any(host == item or host.endswith("." + item) for item in _IGNORED_HOSTS):
+            continue
+        path = path.split("?", 1)[0].split("#", 1)[0]
+        versioned = _SHA_SEGMENT.search("/" + path)
+        if versioned:
+            roots.setdefault(f"{scheme}://{host}" + ("/" + path)[: versioned.start()].rstrip("/"), None)
+            continue
+        parts = [part for part in path.split("/") if part]
+        if parts and "." in parts[-1]:
+            parts = parts[:-1]  # drop a file name
+        for length in range(len(parts), -1, -1):
+            roots.setdefault(f"{scheme}://{host}" + "".join("/" + part for part in parts[:length]), None)
+    return list(roots)
+
+
+def _http_get(url: str, timeout: float = 60.0) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def root_serves(root: str, content_sha: str, get: Callable[[str], bytes] = _http_get) -> bool:
+    """True when ``root`` serves this exact content version's fingerprint."""
+
+    try:
+        served_sha, _ = parse_fingerprint(get(f"{root}/{content_sha}/fingerprint.json").decode("utf-8"))
+    except Exception:  # noqa: BLE001 - any network/format failure just rejects the candidate
+        return False
+    return served_sha == content_sha
+
+
+def apk_urls(apk: Path) -> list[str]:
+    """URLs compiled into the original APK's native library and dex code."""
+
+    found: list[str] = []
+    with zipfile.ZipFile(apk) as archive:
+        for item in archive.infolist():
+            name = item.filename
+            if name.endswith(".so") and name.startswith("lib/arm64-v8a/") or (
+                name.startswith("classes") and name.endswith(".dex")
+            ):
+                found.extend(urls_in(archive.read(item)))
+    return found
+
+
+def device_urls(device: Device) -> list[str]:
+    """URLs the original game left in its saved data (update/ excluded) and logcat."""
+
+    found: list[str] = []
+    for script in (
+        f"cd {shlex.quote(DATA)} && tar -cf - $(ls -A | grep -v '^update$') 2>/dev/null",
+        f"cd /data/user_de/0/{APP} 2>/dev/null && tar -cf - . 2>/dev/null",
+        "logcat -d 2>/dev/null",
+    ):
+        result = subprocess.run(device.command + ["exec-out", script], capture_output=True, timeout=300)
+        found.extend(urls_in(result.stdout))
+    return found
+
+
+def discover_content_root(
+    content_sha: str,
+    sources: Iterable[tuple[str, Callable[[], list[str]]]],
+    get: Callable[[str], bytes] = _http_get,
+    log: Callable[[str], None] = print,
+    limit: int = 200,
+) -> str | None:
+    """Try candidate roots from each source in order; return the first that
+    serves this exact fingerprint."""
+
+    tried: set[str] = set()
+    for label, collect in sources:
+        try:
+            urls = collect()
+        except Exception as error:  # noqa: BLE001 - a missing source just contributes nothing
+            log(f"  {label}：读取失败（{error}）")
+            continue
+        roots = [root for root in candidate_roots(urls) if root not in tried]
+        log(f"  {label}：{len(urls)} 个网址，{len(roots)} 个候选根地址")
+        for root in roots:
+            if len(tried) >= limit:
+                return None
+            tried.add(root)
+            if root_serves(root, content_sha, get):
+                return root
+    return None
+
+
+def _discover(args: argparse.Namespace, device: Device, content_sha: str) -> str:
+    if not content_sha:
+        raise ValueError("fingerprint.json has no top-level sha for the CDN path")
+    if CONTENT_URL_CACHE.is_file():
+        cached = CONTENT_URL_CACHE.read_text(encoding="utf-8").strip()
+        if cached and root_serves(cached, content_sha):
+            print(f"使用已找到的资源地址：{cached}")
+            return cached
+    apk = Path(args.apk)
+    print("正在寻找游戏资源下载地址（CDN）…")
+    root = discover_content_root(
+        content_sha,
+        (
+            ("设备上原版游戏的数据和日志", lambda: device_urls(device)),
+            ("原版 APK 的程序文件", lambda: apk_urls(apk) if apk.is_file() else []),
+            ("已知地址", lambda: list(KNOWN_CONTENT_ROOTS)),
+        ),
+    )
+    if root is None:
+        raise SystemExit(
+            "没有找到能提供这个资源版本的地址。可以让原版游戏联网更新一次后再试，"
+            "或改用 --from-serial / --from-dir。"
+        )
+    CONTENT_URL_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CONTENT_URL_CACHE.write_text(root + "\n", encoding="utf-8")
+    print(f"找到资源地址：{root}")
+    return root
+
+
 def _source(args: argparse.Namespace, content_sha: str) -> Fetcher:
     if args.from_serial:
         source = Device(args.adb, args.from_serial)
@@ -214,8 +361,7 @@ def _source(args: argparse.Namespace, content_sha: str) -> Fetcher:
         raise ValueError("fingerprint.json has no top-level sha for the CDN path")
 
     def download(name: str) -> bytes:
-        with urllib.request.urlopen(f"{base}/{content_sha}/{name}", timeout=60) as response:
-            return response.read()
+        return _http_get(f"{base}/{content_sha}/{name}")
 
     return download
 
@@ -233,11 +379,13 @@ def _parse_args(argv: Iterable[str] | None) -> argparse.Namespace:
     parser.add_argument("--all", action="store_true", help="status: list every missing file, not only a summary")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("status", help="list fingerprint files missing on the offline instance")
+    sub.add_parser("discover", help="find the content CDN root that serves this fingerprint")
     sync = sub.add_parser("sync", help="fetch, verify and install the missing files")
     source = sync.add_mutually_exclusive_group(required=True)
     source.add_argument("--from-serial", help="adb serial of a device whose original game cached the files")
     source.add_argument("--from-dir", help="local directory laid out like update/")
     source.add_argument("--content-url", help="content CDN root (files at <root>/<sha>/<path>)")
+    source.add_argument("--auto", action="store_true", help="discover the content CDN root, then download")
     sync.add_argument("--dry-run", action="store_true", help="fetch and verify only, do not install")
     return parser.parse_args(None if argv is None else list(argv))
 
@@ -248,6 +396,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise SystemExit("set CR_ADB_SERIAL or pass --serial for the offline instance")
     device = Device(args.adb, args.serial)
     content_sha, fingerprint = device_fingerprint(device)
+    if args.command == "discover":
+        _discover(args, device, content_sha)
+        return 0
     present = device_hashes(device, args.prefix)
     matching, differing = hash_convention(fingerprint, present)
     apk = Path(args.apk)
@@ -273,6 +424,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     if not wanted:
         print("没有需要补齐的文件。")
         return 0
+    if getattr(args, "auto", False):
+        args.content_url = _discover(args, device, content_sha)
     staging = STAGING_ROOT / (content_sha or "unknown")
     ok, failed = fetch_verified(wanted, _source(args, content_sha), staging)
     print(f"已取得并校验 {len(ok)} 个文件，失败 {len(failed)} 个。暂存目录：{staging}")

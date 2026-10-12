@@ -176,7 +176,15 @@ PrefabAsset = "sc3d/characters/hero/hero_knight/hero_prefab_knight_battle"
 .\.venv\Scripts\python.exe -m native_runner.update_assets sync --content-url https://<内容CDN根地址>
 ```
 
-三种来源的说明：
+**最省事：全自动**（不需要第二个实例，也不用手动点任何东西）：
+
+```powershell
+.\.venv\Scripts\python.exe -m native_runner.update_assets sync --auto
+```
+
+工具会先去三个地方找游戏的资源下载地址（CDN）：设备上原版游戏留下的数据和日志、原版 APK 的程序文件、内置的已知地址。每个候选地址都要实际返回同一版本的 `fingerprint.json` 才会被采用。地址找到后，再直接下载全部缺失文件，逐个校验后装进去。找到的地址会被记住，下次直接复用。只想查找地址、不下载，可以用 `update_assets discover`。
+
+另外三种来源的说明：
 
 - **`--from-serial`（推荐）**
   1. 另开一个 MuMu 实例，开启 root，装上**原版** Null's Royale，并保持联网。
