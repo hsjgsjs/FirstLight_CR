@@ -5,6 +5,7 @@
 #                                     writes metrics and checkpoints to a new runs/NAME/train-* per start)
 #   lab_ppo.sh resume NAME [UPDATES]  continue runs/NAME from its newest strict checkpoint
 #   lab_ppo.sh status [NAME]          processes, latest metrics, checkpoints and free disk
+#   lab_ppo.sh load [NAME]            live CPU (per core group) and GPU use, and where updates spend time
 #   lab_ppo.sh stop                   stop the run and clean up engines, workers and /dev/shm
 #
 # UPDATES is the total update count to stop at (default 30000, more than a week). The trainer options
@@ -253,6 +254,64 @@ if first:
           f"plays per game {statistics.mean(r['active_actions'][o] for r, o in seats):.1f}")
 PY
       echo "checkpoints: $(find "$run_dir" -path '*/train-*/checkpoints/update-*.pt' 2>/dev/null | wc -l), newest $(newest_checkpoint "$run_dir")"
+    fi
+    ;;
+  load)
+    # Live CPU use per core group and GPU use over 5 seconds, then where recent updates spent their time.
+    "$python" - "$engine_cpus" "$worker_cpus" "$control_cpus" <<'PY'
+import sys, time
+
+def parse(spec):
+    cores = []
+    for part in spec.split(","):
+        start, _, end = part.partition("-")
+        cores.extend(range(int(start), int(end or start) + 1))
+    return cores
+
+def sample():
+    rows = {}
+    for line in open("/proc/stat"):
+        name, *values = line.split()
+        if name.startswith("cpu") and name != "cpu":
+            values = [int(value) for value in values]
+            rows[int(name[3:])] = (sum(values), values[3] + values[4])
+    return rows
+
+before = sample()
+time.sleep(5)
+after = sample()
+busy = {core: 100 * (1 - (after[core][1] - before[core][1]) / max(after[core][0] - before[core][0], 1)) for core in after}
+named = {}
+for label, spec in zip(("engines", "workers", "trainer"), sys.argv[1:]):
+    cores = parse(spec)
+    named.update(dict.fromkeys(cores, label))
+    values = [busy[core] for core in cores if core in busy]
+    if not values:
+        continue
+    print(f"CPU {label:8s} {spec:>6s}: mean {sum(values) / len(values):3.0f}%  per core " + " ".join(f"{value:.0f}" for value in values))
+other = [busy[core] for core in busy if core not in named]
+if other:
+    print(f"CPU other    {'':>6s}: mean {sum(other) / len(other):3.0f}%")
+PY
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null \
+      | sed 's/^/GPU /' || echo "nvidia-smi not available"
+    if [[ -n ${2:-} ]]; then
+      "$python" - "$(latest_stage "$runs/$2")/metrics.jsonl" 2>/dev/null <<'PY' || echo "no metrics yet"
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1]).read().splitlines()[-10:]]
+mean = lambda key: sum(float(row.get(key, 0.0)) for row in rows) / len(rows)
+total, collect, optimize = mean("end_to_end_seconds"), mean("collection_seconds"), mean("optimizer_seconds")
+model, assembly = mean("collection_model_seconds"), mean("collection_assembly_seconds")
+waiting = max(collect - model - assembly - mean("collection_action_seconds") - mean("collection_command_seconds"), 0.0)
+share = lambda value: f"{value:5.1f}s {100 * value / total:3.0f}%"
+print(f"last {len(rows)} updates, mean {total:.1f}s per update:")
+print(f"  collection            {share(collect)}")
+print(f"    GPU inference       {share(model)}   ({mean('collection_inference_batches'):.0f} batches of ~{mean('collection_inference_mean_actor_rows'):.0f} rows)")
+print(f"    trainer batching    {share(assembly)}   (CPU, trainer cores)")
+print(f"    waiting for engines {share(waiting)}   (CPU, engine and worker cores)")
+print(f"  optimization (GPU)    {share(optimize)}")
+print(f"  per engine: native step {mean('collection_native_step_seconds'):.1f}s, observation parsing {mean('collection_tensorize_seconds'):.1f}s")
+PY
     fi
     ;;
   _run)
