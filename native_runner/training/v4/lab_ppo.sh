@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One machine, no Slurm: engines, worker server, topology and trainer in the background, cleaned up on exit.
 #
-#   lab_ppo.sh start NAME [UPDATES]   start a fresh run in runs/NAME (logs in runs/NAME/logs)
+#   lab_ppo.sh start NAME [UPDATES]   start a fresh run in runs/NAME (logs in runs/NAME/logs; the trainer
+#                                     writes metrics and checkpoints to a new runs/NAME/train-* per start)
 #   lab_ppo.sh resume NAME [UPDATES]  continue runs/NAME from its newest strict checkpoint
 #   lab_ppo.sh status [NAME]          processes, latest metrics, checkpoints and free disk
 #   lab_ppo.sh stop                   stop the run and clean up engines, workers and /dev/shm
@@ -88,8 +89,13 @@ prune_checkpoints() {
   done
 }
 
+# The trainer only writes into an empty directory, so every start or resume gets its own train-* stage.
+latest_stage() {
+  { find "$1" -mindepth 1 -maxdepth 1 -type d -name 'train-*' 2>/dev/null || true; } | sort | tail -n 1
+}
+
 newest_checkpoint() {
-  { find "$1/checkpoints" -maxdepth 1 -name 'update-*.pt' 2>/dev/null || true; } | sort | tail -n 1
+  { find "$1" -path '*/train-*/checkpoints/update-*.pt' 2>/dev/null || true; } | sort | tail -n 1
 }
 
 wait_for() {
@@ -111,7 +117,8 @@ wait_for() {
 
 run() {
   local run_dir=$1 updates=$2 resume=$3
-  local logs=$run_dir/logs
+  local logs=$run_dir/logs stage
+  stage=$run_dir/train-$(date +%Y%m%d-%H%M%S)
   trap cleanup EXIT
   trap 'log "stop requested"; exit 130' INT TERM
   log "cleaning up leftovers"
@@ -148,16 +155,16 @@ run() {
   fi
   extra=${extra:-$(default_extra_args)}
   echo "$extra" >"$run_dir/trainer-options.txt"
-  log "training to update $updates on GPU $train_gpus${resume:+ from $resume}"
+  log "training to update $updates on GPU $train_gpus into $stage${resume:+ from $resume}"
   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$train_gpus CR_PPO_EXTRA_ARGS=$extra \
-    bash "$script_dir/launch_ppo_multinode_training.sh" "$run_dir" "$run_dir/topology.json" "$updates" \
+    bash "$script_dir/launch_ppo_multinode_training.sh" "$stage" "$run_dir/topology.json" "$updates" \
     "${CR_PPO_SEGMENT_SECONDS:-40}" "$resume" >>"$logs/trainer.log" 2>&1 &
   local trainer_pid=$!
 
   while kill -0 "$trainer_pid" 2>/dev/null; do
     sleep 60 &
     wait $! || true
-    prune_checkpoints "$run_dir/checkpoints"
+    prune_checkpoints "$stage/checkpoints"
     if ! kill -0 "$engine_pid" 2>/dev/null || ! kill -0 "$worker_pid" 2>/dev/null; then
       log "FAILED: the engine node or the worker server exited; see engines.log and worker.log"
       exit 1
@@ -168,7 +175,7 @@ run() {
   done
   local status=0
   wait "$trainer_pid" || status=$?
-  prune_checkpoints "$run_dir/checkpoints"
+  prune_checkpoints "$stage/checkpoints"
   log "trainer exited with status $status; newest checkpoint: $(newest_checkpoint "$run_dir")"
   exit "$status"
 }
@@ -192,7 +199,7 @@ start() {
 case ${1:-} in
   start)
     shift
-    if [[ -e $runs/${1:?usage: lab_ppo.sh start NAME [UPDATES]}/metrics.jsonl ]]; then
+    if [[ -n $(latest_stage "$runs/${1:?usage: lab_ppo.sh start NAME [UPDATES]}") ]]; then
       echo "runs/$1 already holds a run; pick a new NAME or use: lab_ppo.sh resume $1" >&2
       exit 1
     fi
@@ -225,8 +232,9 @@ case ${1:-} in
     echo "emulators: $(pgrep -u "$user" -fc -- "qemu-system.*-avd crppo_" || true)  free disk: $(df -Ph "$runs" | awk 'NR == 2 {print $4}')"
     if [[ -n ${2:-} ]]; then
       run_dir=$runs/$2
+      stage=$(latest_stage "$run_dir")
       tail -n 3 "$run_dir/logs/supervisor.log" 2>/dev/null || true
-      "$python" - "$run_dir/metrics.jsonl" <<'PY' || true
+      "$python" - "$stage/metrics.jsonl" 2>/dev/null <<'PY' || echo "no metrics yet"
 import json, sys
 lines = open(sys.argv[1]).read().splitlines()[-5:]
 for line in lines:
@@ -234,7 +242,7 @@ for line in lines:
     print(f"update {m['update']}: {m['end_to_end_seconds']:.1f}s  frames/s {m['end_to_end_owner_frames_per_second']:.0f}  "
           f"entropy {m.get('entropy', float('nan')):.3f}  rejected {m['native_rejected_actions']}")
 PY
-      "$python" - "$run_dir/matches.jsonl" <<'PY' || true
+      "$python" - "$stage/matches.jsonl" 2>/dev/null <<'PY' || echo "no finished games yet"
 import json, statistics, sys
 rows = [json.loads(line) for line in open(sys.argv[1]).read().splitlines()[-256:]]
 seats = [(r, o) for r in rows for o in r["current_owners"]]
@@ -244,7 +252,7 @@ if first:
     print(f"last {len(rows)} games: learner first play 10%/median/90% = {q(.1):.0f}/{q(.5):.0f}/{q(.9):.0f}s, "
           f"plays per game {statistics.mean(r['active_actions'][o] for r, o in seats):.1f}")
 PY
-      echo "checkpoints: $(find "$run_dir/checkpoints" -name 'update-*.pt' 2>/dev/null | wc -l), newest $(newest_checkpoint "$run_dir")"
+      echo "checkpoints: $(find "$run_dir" -path '*/train-*/checkpoints/update-*.pt' 2>/dev/null | wc -l), newest $(newest_checkpoint "$run_dir")"
     fi
     ;;
   _run)
@@ -252,7 +260,7 @@ PY
     run "$@"
     ;;
   *)
-    sed -n '2,15p' "$0"
+    sed -n '2,/^set /{/^#/p}' "$0"
     exit 2
     ;;
 esac
