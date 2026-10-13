@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import shlex
 import socket
 import subprocess
 import time
@@ -185,6 +186,37 @@ def pin_engine_process(serial: str, endpoint: dict[str, Any]) -> None:
     endpoint["affinity_mask"] = mask
 
 
+# ActivityManager kills non-foreground processes whose CPU use exceeds a few
+# percent over each check interval ("excessive cpu ... limit=2").  Engine
+# processes are busy by design, so MuMu guests lost engines after ~25 minutes.
+POWER_CHECK_OVERRIDES = {
+    "power_check_interval": "86400000",
+    "power_check_max_cpu_1": "100",
+    "power_check_max_cpu_2": "100",
+    "power_check_max_cpu_3": "100",
+    "power_check_max_cpu_4": "100",
+}
+
+
+def merge_activity_manager_constants(current: str, overrides: dict[str, str]) -> str:
+    entries = {}
+    for item in current.strip().split(","):
+        key, separator, value = item.partition("=")
+        if separator and key.strip():
+            entries[key.strip()] = value.strip()
+    entries.update(overrides)
+    return ",".join(f"{key}={value}" for key, value in entries.items())
+
+
+def relax_power_check(serial: str) -> None:
+    current = adb(serial, "shell", "settings", "get", "global", "activity_manager_constants").stdout.strip()
+    merged = merge_activity_manager_constants("" if current == "null" else current, POWER_CHECK_OVERRIDES)
+    adb(serial, "shell", "settings", "put", "global", "activity_manager_constants", shlex.quote(merged))
+    stored = adb(serial, "shell", "settings", "get", "global", "activity_manager_constants").stdout.strip()
+    if merge_activity_manager_constants(stored, {}) != merged:
+        raise RuntimeError(f"{serial} failed to relax the excessive-CPU process check: {stored}")
+
+
 def configure_guest_once(serial: str, host_base: int, engines: int) -> dict[str, Any]:
     root_identity = wait_root(serial)
     nproc_text = adb(serial, "shell", "nproc").stdout.strip()
@@ -209,6 +241,7 @@ def configure_guest_once(serial: str, host_base: int, engines: int) -> dict[str,
     activity_settings = adb(serial, "shell", "dumpsys", "activity", "settings").stdout
     if "use_freezer=false" not in activity_settings:
         raise RuntimeError(f"{serial} failed to disable the cached-app freezer")
+    relax_power_check(serial)
     adb(serial, "shell", "am", "force-stop", "--user", "0", PACKAGE)
     time.sleep(0.5)
     for engine_id in range(engines):
