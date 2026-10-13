@@ -166,6 +166,26 @@ rm -rf /dev/shm/firstlight-ppo-local-* runs/node0
 
 **一周的粗略估算**：按 400 帧/秒算，一天约 3,500 万帧，一周约 2.4 亿帧，大约是 General 当初 PPO 总帧数（约 1.1 亿）的两倍。不过每次更新的批量只有原作者的 1/24，梯度噪声更大。
 
+### 正式训练的耗时构成（`spar-week1`，单卡）
+
+`lab_ppo.sh load` 实测，每次更新平均 28 秒：
+
+| 部分 | 时间 | 占比 |
+| --- | --- | --- |
+| GPU 推理（625 批，每批约 20 行） | 16.4 s | 58% |
+| 等引擎和 worker | 4.4 s | 16% |
+| 训练器拼批 | 1.7 s | 6% |
+| GPU 训练 | 3.5 s | 12% |
+
+CPU 远没跑满：引擎核约 26%，worker 核约 16%。GPU 利用率也只有 42%。真正卡住的是训练器里那个单线程的推理循环：每批要给 4 个模型（当前模型和 3 个固定对手）各跑一次前向，每次的固定开销都差不多。而凑批时只等其他引擎 2 毫秒，所以每批只凑到约 1.7 个引擎的数据。
+
+凑批等待时间可以用 `CR_PPO_INFERENCE_BATCH_WAIT_MS` 调（默认 2）。它不影响训练参数，所以可以停下来换一个值再续训，比较 `load` 里的批数和每次更新的总时间：
+
+```bash
+bash native_runner/training/v4/lab_ppo.sh stop
+CR_PPO_INFERENCE_BATCH_WAIT_MS=10 bash native_runner/training/v4/lab_ppo.sh resume spar-week1
+```
+
 ## 5. 延迟实验（21 tick ≈ 实战点击延迟）
 
 设置：General 对 General，B 方每次出牌和放技能都推迟 21 tick 生效；采样解码，两方用相同的默认卡组，100 局。

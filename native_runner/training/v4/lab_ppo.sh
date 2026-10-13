@@ -14,7 +14,7 @@
 # CR_LAB_ENGINE_CPUS (0-7), CR_LAB_WORKER_CPUS (8-15), CR_LAB_CONTROL_CPUS (16-19), CR_LAB_TRAIN_GPUS
 # (0; nvidia-smi numbers, e.g. 0,1), CR_LAB_KEEP_CHECKPOINTS (3) and CR_LAB_CHECKPOINT_BUCKET (1000):
 # the newest few strict checkpoints are kept plus the first one in every bucket of that many updates.
-# NCCL_P2P_DISABLE and other environment variables pass through to the trainer.
+# NCCL_P2P_DISABLE, CR_PPO_INFERENCE_BATCH_WAIT_MS and other environment variables pass through to the trainer.
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)

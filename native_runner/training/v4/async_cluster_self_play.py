@@ -55,7 +55,11 @@ from .tensors import (
 
 
 _PPO_CUDA_GRAPH_ROW_BUCKET = 32
-_INFERENCE_BATCH_WAIT_SECONDS = 0.002
+# After the first engine packet arrives, wait this long for more before running inference. Every batch costs a
+# near-fixed amount per policy model it touches, so a longer wait trades engine latency for fewer, larger batches.
+_INFERENCE_BATCH_WAIT_SECONDS = float(os.environ.get("CR_PPO_INFERENCE_BATCH_WAIT_MS", "2")) / 1000.0
+if not 0.0 <= _INFERENCE_BATCH_WAIT_SECONDS <= 1.0:
+    raise ValueError("CR_PPO_INFERENCE_BATCH_WAIT_MS must be in [0, 1000]")
 
 
 def _credit_hog_deployments_v4(
