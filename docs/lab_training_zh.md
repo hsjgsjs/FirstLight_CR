@@ -123,6 +123,34 @@ bash native_runner/training/v4/lab_ppo.sh resume spar-week1         # 中断后�
   - 等引擎的时间占比最大，并且 engines 或 workers 那组核接近 100%：说明瓶颈在 CPU。
   - GPU inference 占比最大，并且 GPU 利用率高：说明瓶颈在 GPU 推理。
 
+### 每天定时运行
+
+服务器只在固定时段可用时，用 `schedule` 每天自动续训、自动停止：
+
+```bash
+bash native_runner/training/v4/lab_ppo.sh schedule spar16-g3 07:30 18:50   # 每天 7:30 续训，18:50 前停
+bash native_runner/training/v4/lab_ppo.sh unschedule                        # 取消定时
+crontab -l                                                                  # 查看定时任务
+tail runs/schedule.log                                                      # 定时任务的日志
+```
+
+- 停止时间前 12 分钟开始等下一个检查点，一存好就停，所以几乎不丢进度；最晚到停止时间强制停。
+- 续训会自动用上第一次 `start` 时的引擎数、CPU 分配和 GPU 设置，这些都存在 `runs/名字/launch-env` 里，不用再手动带变量。
+- 定时任务用的是 `.env` 里的设置，不受当前终端里残留变量的影响。
+
+### 中途改参数
+
+- **续训时可以改**：总更新次数 `UPDATES`、`CR_PPO_INFERENCE_BATCH_WAIT_MS`。
+- **续训时不能改**：奖励、对手、延迟、gate 温度、引擎数、GPU 数，这些写在续训合同里。要改的话，就从最新检查点开一轮新的训练。模型权重全部保留，只是优化器状态和更新计数会重置：
+
+```bash
+bash native_runner/training/v4/lab_ppo.sh stop
+CKPT=$PWD/$(ls runs/旧名字/train-*/checkpoints/update-*.pt | sort | tail -1)
+OPTS=$(sed 's/旧参数/新参数/' runs/旧名字/trainer-options.txt)
+CR_PPO_CHECKPOINT=$CKPT CR_PPO_EXTRA_ARGS="$OPTS" CR_PPO_ENGINE_COUNT=16 CR_LAB_WORKER_CPUS=8-17 \
+  CR_LAB_CONTROL_CPUS=18-19 CR_LAB_TRAIN_GPUS=0,1 bash native_runner/training/v4/lab_ppo.sh start 新名字
+```
+
 ### 手动启动（排查问题时用）
 
 单机没有 Slurm，设 `SLURM_JOB_ID=local` 就能通过脚本的检查。
