@@ -136,6 +136,8 @@ run() {
   mkdir -p "$logs"
 
   log "starting $engine_count engines on CPUs $engine_cpus"
+  # More engines than engine CPUs: the emulators time-share them (each still gets one vCPU per engine).
+  (($(cpu_count "$engine_cpus") >= engine_count)) || export CR_PPO_ENGINE_CPU_SHARING=1
   taskset -c "$engine_cpus" bash "$script_dir/launch_ppo_engine_node.sh" "$node_dir" 0 "$engine_count" "$base_port" \
     >"$logs/engines.log" 2>&1 &
   local engine_pid=$!
