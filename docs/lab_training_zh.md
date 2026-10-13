@@ -97,7 +97,7 @@ python -m native_runner.training.v4.build_ppo_deck_pool --dataset-root datasets 
 
 ### 一键启动（推荐）
 
-`lab_ppo.sh` 在后台依次拉起引擎、worker、拓扑和训练器，日志写到 `runs/名字/logs/`，关掉终端也不影响：
+`lab_ppo.sh` 在后台依次拉起引擎、worker、拓扑和训练器，关掉终端也不影响。日志写到 `runs/名字/logs/`；训练器只肯往空目录里写，所以每次启动或续训，指标和检查点都写进一个新的 `runs/名字/train-时间戳/`：
 
 ```bash
 cd ~/FirstLight_CR && git pull
