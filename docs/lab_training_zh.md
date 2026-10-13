@@ -186,6 +186,18 @@ bash native_runner/training/v4/lab_ppo.sh stop
 CR_PPO_INFERENCE_BATCH_WAIT_MS=10 bash native_runner/training/v4/lab_ppo.sh resume spar-week1
 ```
 
+凑批等待时间实测没有帮助：从 2 毫秒改成 10 毫秒后，批数从 625 降到 479，GPU 推理省了约 2 秒，但等引擎的时间多了 3 秒，帧率还是 405–420，和原来一样。
+
+**真正的余量在引擎数量。** CPU 还有大半空闲，可以开 16 个引擎（4 台模拟器，各 4 个引擎），worker 和引擎共用核心。引擎数量写在续训合同里，所以只能新开一个训练，不能续训：
+
+```bash
+bash native_runner/training/v4/lab_ppo.sh stop
+CR_PPO_ENGINE_COUNT=16 CR_LAB_WORKER_CPUS=8-17 CR_LAB_CONTROL_CPUS=18-19 \
+  bash native_runner/training/v4/lab_ppo.sh start spar16
+```
+
+以后续训也要带上同样的这三个变量。
+
 ## 5. 延迟实验（21 tick ≈ 实战点击延迟）
 
 设置：General 对 General，B 方每次出牌和放技能都推迟 21 tick 生效；采样解码，两方用相同的默认卡组，100 局。
