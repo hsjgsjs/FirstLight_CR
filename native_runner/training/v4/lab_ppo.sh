@@ -8,8 +8,12 @@
 #   lab_ppo.sh load [NAME]            live CPU (per core group) and GPU use, and where updates spend time
 #   lab_ppo.sh stop [NAME MINUTES]    stop the run and clean up engines, workers and /dev/shm; with NAME and
 #                                     MINUTES, first wait up to MINUTES for the next strict checkpoint
-#   lab_ppo.sh schedule NAME HH:MM HH:MM   every day, resume NAME at the first time and stop it by the second
-#                                     (waiting for a checkpoint from 12 minutes before); replaces any schedule
+#   lab_ppo.sh schedule NAME HH:MM HH:MM [RETRY_MINUTES]   every day, resume NAME at the first time and
+#                                     stop it by the second (waiting for a checkpoint from 12 minutes before);
+#                                     for RETRY_MINUTES (default 90) after the start, check every 15 minutes
+#                                     and resume again if the run died without being stopped; replaces any
+#                                     earlier schedule
+#   lab_ppo.sh ensure NAME            resume NAME unless it is running or was stopped on purpose
 #   lab_ppo.sh unschedule             remove the daily schedule
 #
 # UPDATES is the total update count to stop at (default 30000, more than a week). The trainer options
@@ -233,12 +237,17 @@ wait_for_checkpoint() {
   log "no new checkpoint within $2 minutes; stopping anyway"
 }
 
+# Present after a deliberate stop (by hand or by the schedule) until the next start or resume, so
+# ensure can tell a run that was stopped from one that crashed.
+stop_marker=$runs/lab-stopped-on-purpose
+
 start() {
   local name=${1:?usage: lab_ppo.sh start|resume NAME [UPDATES]} updates=${2:-30000} resume=${3:-}
   if [[ -n $(supervisor_pids) ]]; then
     echo "a lab PPO run is already active; run: lab_ppo.sh stop" >&2
     exit 1
   fi
+  rm -f "$stop_marker"
   local run_dir=$runs/$name
   mkdir -p "$run_dir/logs"
   save_launch_env "$run_dir"
@@ -271,6 +280,7 @@ case ${1:-} in
     start "$1" "${2:-30000}" "$checkpoint"
     ;;
   stop)
+    mkdir -p "$runs" && date -Is >"$stop_marker"
     if [[ -n ${3:-} ]]; then
       log "waiting up to $3 minutes for the next checkpoint of $2"
       wait_for_checkpoint "$2" "$3"
@@ -301,9 +311,24 @@ case ${1:-} in
       echo "$((begin_minute % 60)) $((begin_minute / 60)) * * * bash $script resume $name >>$log_file 2>&1 # lab_ppo schedule"
       echo "$((drain_minute % 60)) $((drain_minute / 60)) * * * bash $script stop $name 11 >>$log_file 2>&1 # lab_ppo schedule"
       echo "$((end_minute % 60)) $((end_minute / 60)) * * * bash $script stop >>$log_file 2>&1 # lab_ppo schedule"
+      for ((offset = 15; offset <= ${5:-90}; offset += 15)); do
+        retry_minute=$(((begin_minute + offset) % 1440))
+        echo "$((retry_minute % 60)) $((retry_minute / 60)) * * * bash $script ensure $name >>$log_file 2>&1 # lab_ppo schedule"
+      done
     } | crontab -
-    echo "scheduled $name daily: resume at $begin, stop by $end (log: $log_file)"
+    echo "scheduled $name daily: resume at $begin, retry for ${5:-90} minutes, stop by $end (log: $log_file)"
     crontab -l | grep "# lab_ppo schedule"
+    ;;
+  ensure)
+    name=${2:?usage: lab_ppo.sh ensure NAME}
+    if [[ -n $(supervisor_pids) ]]; then
+      log "ensure $name: running"
+    elif [[ -e $stop_marker ]]; then
+      log "ensure $name: stopped on purpose at $(<"$stop_marker"); not restarting"
+    else
+      log "ensure $name: not running and not stopped on purpose; resuming"
+      exec bash "$script_dir/lab_ppo.sh" resume "$name"
+    fi
     ;;
   unschedule)
     { crontab -l 2>/dev/null || true; } | { grep -v "# lab_ppo schedule" || true; } | crontab -
