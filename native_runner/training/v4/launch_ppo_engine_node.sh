@@ -223,7 +223,10 @@ for index in $(seq 0 $((guest_count - 1))); do
     -e "s/^hw.ramSize=.*/hw.ramSize=${guest_memory_mb[$index]}M/" \
     "$avd_dir/config.ini"
   cp --reflink=auto --sparse=always "$source_avd/cache.img" "$avd_dir/cache.img"
-  # The emulator keeps writable partitions beside -data; it copies a stock key only when none is there.
+  # Emulator 37 builds a missing -data image from the system image's blank userdata and
+  # ignores -initdata, so the clone is seeded here. Writable partitions live beside -data;
+  # a stock encryption key is copied there only when none is present.
+  cp --reflink=auto --sparse=always "$initdata" "$emu_dir/userdata-qemu.img"
   [[ ! $encryption_key ]] || cp --reflink=auto --sparse=always "$encryption_key" "$emu_dir/encryptionkey.img"
   cp "$source_ini" "$avd_home/$name.ini"
   sed -i "s#^path=.*#path=$avd_dir#" "$avd_home/$name.ini"
