@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 import math
 import os
+import random
 import signal
 import sys
 import time
@@ -54,7 +55,11 @@ from .tensors import (
 
 
 _PPO_CUDA_GRAPH_ROW_BUCKET = 32
-_INFERENCE_BATCH_WAIT_SECONDS = 0.002
+# After the first engine packet arrives, wait this long for more before running inference. Every batch costs a
+# near-fixed amount per policy model it touches, so a longer wait trades engine latency for fewer, larger batches.
+_INFERENCE_BATCH_WAIT_SECONDS = float(os.environ.get("CR_PPO_INFERENCE_BATCH_WAIT_MS", "2")) / 1000.0
+if not 0.0 <= _INFERENCE_BATCH_WAIT_SECONDS <= 1.0:
+    raise ValueError("CR_PPO_INFERENCE_BATCH_WAIT_MS must be in [0, 1000]")
 
 
 def _credit_hog_deployments_v4(
@@ -640,6 +645,53 @@ class AsyncResidentEngineSpecV4:
     segment_decision_steps: int | None = None
     force_frozen_opponent_opening_after_seconds: int | None = None
     force_il_opponent_opening_after_seconds: int | None = None
+    execution_delay_ticks: tuple[int, int] | None = None
+    # (coefficient per elixir, grace elixir) for elixir wasted at full over the whole game after the
+    # owner's first executed card; None disables it.  Opening waits before the first card are free.
+    game_elixir_overflow: tuple[float, float] | None = None
+
+
+def game_elixir_overflow_penalty_v4(
+    *,
+    wasted: float,
+    accrued: float,
+    newly_wasted: float,
+    counting: bool,
+    coefficient: float,
+    grace: float,
+    step_cap: float,
+) -> tuple[float, float, float]:
+    """Charge whole-game overflow beyond ``grace``, counted only once ``counting`` (after the first card).
+
+    Returns the new (wasted, accrued cost, penalty this step); unpaid cost above ``step_cap`` carries over.
+    """
+    if not counting:
+        return wasted, accrued, 0.0
+    wasted += newly_wasted
+    penalty = min(step_cap, max(0.0, coefficient * max(0.0, wasted - grace) - accrued))
+    return wasted, accrued + penalty, penalty
+
+
+_DELAYABLE_KINDS = frozenset({ActionKind.PLAY_CARD, ActionKind.ACTIVATE_ABILITY})
+
+
+def apply_execution_delay_v4(
+    actions: tuple[ActionV1, ...], bounds: tuple[int, int] | None, key: str
+) -> tuple[ActionV1, ...]:
+    """Land plays and abilities a sampled number of ticks after the decision, as taps do on a live client.
+
+    The delay replaces the model's own offset (live play ignores it too) and is drawn once per decision
+    from ``bounds`` (inclusive), seeded by ``key`` so a rerun of the same match replays the same delays.
+    BattleEnvV1 keeps the slot pending and its elixir reserved until the action lands.
+    """
+
+    if bounds is None or not any(action.kind in _DELAYABLE_KINDS for action in actions):
+        return actions
+    delay = random.Random(key).randint(*bounds)
+    return tuple(
+        replace(action, execute_offset_ticks=delay) if action.kind in _DELAYABLE_KINDS else action
+        for action in actions
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -894,6 +946,14 @@ def _engine_worker(
         raise ValueError("frozen-opponent opening timeout must be positive")
     if spec.force_il_opponent_opening_after_seconds is not None and spec.force_il_opponent_opening_after_seconds <= 0:
         raise ValueError("IL opening timeout must be positive")
+    delay_bounds = spec.execution_delay_ticks
+    if delay_bounds is not None and not 1 <= delay_bounds[0] <= delay_bounds[1] <= 0xFFFF:
+        raise ValueError("execution delay must be 1 <= min <= max <= 65535 ticks")
+    game_overflow = spec.game_elixir_overflow
+    if game_overflow is not None and not (
+        all(math.isfinite(value) and value >= 0.0 for value in game_overflow) and game_overflow[0] > 0.0
+    ):
+        raise ValueError("game elixir overflow needs a positive coefficient and a nonnegative grace")
     validate_reward_parameters_v4(locals())
     segment_end_decision_steps = segment_decision_steps
     tensorize_seconds = 0.0
@@ -1116,6 +1176,11 @@ def _engine_worker(
                     )
                     for micro, item in enumerate(decoded.actions)
                 )
+                identified = apply_execution_delay_v4(
+                    identified,
+                    spec.execution_delay_ticks,
+                    f"{runtime.assignment.matchup.sequence}-{owner}-{runtime.observations[0].tick}",
+                )
                 decoded_by_match[match_index][owner] = identified
                 submitted_by_match[match_index][owner] = {item.action_id for item in identified}
                 action_tick = int(runtime.observations[0].tick)
@@ -1260,6 +1325,9 @@ def _engine_worker(
             cumulative_unilateral_wasted = list(runtime.cumulative_unilateral_elixir_overflow_wasted)
             max_continuous_wasted = list(runtime.max_continuous_elixir_overflow_wasted)
             first_overflow_tick = list(runtime.first_elixir_overflow_tick)
+            game_wasted = list(runtime.game_elixir_overflow_wasted)
+            game_accrued = list(runtime.game_elixir_overflow_cost_accrued)
+            game_totals = list(runtime.game_elixir_overflow_penalty_total)
             adjusted_reward = dict(reward)
             for owner in (0, 1):
                 newly_wasted = _newly_wasted_elixir_v4(
@@ -1304,6 +1372,21 @@ def _engine_worker(
                 if previous_personal_wasted <= mutual_elixir_overflow_grace < personal_wasted[owner]:
                     personal_grace_crossings[owner] += 1
                 adjusted_reward[owner] = float(adjusted_reward[owner]) - penalty
+                if game_overflow is not None:
+                    game_wasted[owner], game_accrued[owner], game_penalty = game_elixir_overflow_penalty_v4(
+                        wasted=game_wasted[owner],
+                        accrued=game_accrued[owner],
+                        newly_wasted=newly_wasted,
+                        counting=runtime.first_successful_card_tick[owner] is not None,
+                        coefficient=game_overflow[0],
+                        grace=game_overflow[1],
+                        step_cap=elixir_overflow_step_penalty_cap,
+                    )
+                    game_totals[owner] += game_penalty
+                    adjusted_reward[owner] -= game_penalty
+            runtime.game_elixir_overflow_wasted = (game_wasted[0], game_wasted[1])
+            runtime.game_elixir_overflow_cost_accrued = (game_accrued[0], game_accrued[1])
+            runtime.game_elixir_overflow_penalty_total = (game_totals[0], game_totals[1])
             runtime.personal_elixir_overflow_wasted = (personal_wasted[0], personal_wasted[1])
             runtime.personal_elixir_overflow_cost_accrued = (personal_accrued[0], personal_accrued[1])
             runtime.unilateral_elixir_overflow_wasted = (unilateral_wasted[0], unilateral_wasted[1])

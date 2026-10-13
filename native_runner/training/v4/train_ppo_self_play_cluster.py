@@ -844,6 +844,17 @@ def _load_history_models(
     return {checkpoint_id: cache[checkpoint_id] for checkpoint_id in required}
 
 
+def parse_execution_delay_ticks(value: str) -> tuple[int, int]:
+    low, _, high = value.strip().partition("-")
+    try:
+        bounds = (int(low), int(high or low))
+    except ValueError:
+        raise argparse.ArgumentTypeError("execution delay must be N or MIN-MAX ticks, e.g. 18-24") from None
+    if not 1 <= bounds[0] <= bounds[1] <= 0xFFFF:
+        raise argparse.ArgumentTypeError("execution delay must be 1 <= MIN <= MAX <= 65535 ticks")
+    return bounds
+
+
 def _validate_topology(ready: Mapping[str, object], *, world_size: int) -> tuple[int, int]:
     """Validate the one supported production topology and return its dimensions."""
 
@@ -880,6 +891,15 @@ def main() -> int:
     parser.add_argument("--checkpoint", type=Path, required=True, help="fresh learner initialization checkpoint")
     parser.add_argument(
         "--il-anchor-checkpoint", type=Path, help="frozen IL opponent checkpoint; defaults to --checkpoint"
+    )
+    parser.add_argument(
+        "--execution-delay-ticks",
+        type=parse_execution_delay_ticks,
+        help=(
+            "land every policy's card plays and abilities this many ticks after the decision, drawn per "
+            "decision from MIN-MAX (or a single N), to match a live client's tap latency (about 21 ticks); "
+            "rejections the delay causes are then counted but no longer fail the collection audit"
+        ),
     )
     parser.add_argument(
         "--il-opening-force-after-seconds",
@@ -955,6 +975,18 @@ def main() -> int:
         type=float,
         default=4.0,
         help="own wasted elixir exempt from the personal linear penalty",
+    )
+    parser.add_argument(
+        "--game-elixir-overflow-penalty",
+        type=float,
+        default=0.0,
+        help="linear cost per elixir wasted at full over the whole game after the first executed card (0=off)",
+    )
+    parser.add_argument(
+        "--game-elixir-overflow-grace",
+        type=float,
+        default=3.0,
+        help="whole-game wasted elixir after the first card exempt from --game-elixir-overflow-penalty",
     )
     parser.add_argument("--unilateral-elixir-overflow-penalty", type=float, default=0.0)
     parser.add_argument("--elixir-overflow-step-penalty-cap", type=float, default=0.1)
@@ -1107,6 +1139,13 @@ def main() -> int:
             "mutual_elixir_overflow_grace": args.personal_elixir_overflow_grace,
         }
     )
+    if not (
+        math.isfinite(args.game_elixir_overflow_penalty)
+        and math.isfinite(args.game_elixir_overflow_grace)
+        and args.game_elixir_overflow_penalty >= 0.0
+        and args.game_elixir_overflow_grace >= 0.0
+    ):
+        raise ValueError("game elixir overflow penalty and grace must be finite and nonnegative")
     if args.first_hog_deferral_penalty > 0.0 and args.first_hog_deferral_penalty_episode_cap <= 0.0:
         raise ValueError("first-Hog deferral penalty requires a positive episode cap")
     _gate_temperature_for_update(
@@ -1263,6 +1302,11 @@ def main() -> int:
     dist.all_gather_object(bc_identities, expert_bc_contract)
     if any(item != expert_bc_contract for item in bc_identities):
         raise RuntimeError("GPU ranks loaded different expert BC contracts")
+    game_elixir_overflow = (
+        (args.game_elixir_overflow_penalty, args.game_elixir_overflow_grace)
+        if args.game_elixir_overflow_penalty > 0.0
+        else None
+    )
     resume_contract = {
         "schema": "v4-ppo-strict-resume.v1",
         "anchor_checkpoint_id": anchor_state_id,
@@ -1333,6 +1377,12 @@ def main() -> int:
         "focus_tail_current_focus_percent": 75,
         "opening_force": opening_force_config,
     }
+    # Omit the optional key when disabled to preserve old undelayed strict resumes.
+    if args.execution_delay_ticks is not None:
+        resume_contract["execution_delay_ticks"] = list(args.execution_delay_ticks)
+    # Likewise omitted when off so existing strict resumes keep matching.
+    if game_elixir_overflow is not None:
+        resume_contract["game_elixir_overflow"] = list(game_elixir_overflow)
     # Omit the optional key when disabled to preserve old no-BC strict resumes.
     if expert_bc_contract is not None:
         resume_contract["expert_bc"] = expert_bc_contract
@@ -1418,6 +1468,8 @@ def main() -> int:
             worker_host=engine_worker_hosts[engine_index],
             worker_port=engine_worker_ports[engine_index],
             force_il_opponent_opening_after_seconds=(args.il_opening_force_after_seconds),
+            execution_delay_ticks=args.execution_delay_ticks,
+            game_elixir_overflow=game_elixir_overflow,
         )
         for engine_index in engine_indices
     )
@@ -1647,7 +1699,8 @@ def main() -> int:
                         for shard in gathered
                     )
                     and truncated == 0
-                    and rejected == 0
+                    # A delayed play can meet a board that changed meanwhile; count those, don't abort.
+                    and (rejected == 0 or args.execution_delay_ticks is not None)
                 )
                 failure = (
                     None
