@@ -112,16 +112,31 @@ def _fixed_cuda_graph_batch_v4(
     return replace(batch, active_effects=fixed_effects, relation_edges=fixed_relations)
 
 
-class _DeterministicCudaGraphV4:
-    """One reusable batch-1 deterministic graph owned by a loaded model."""
+class _PolicyCudaGraphV4:
+    """One reusable batch-1 decision graph (argmax or sampled) owned by a loaded model.
 
-    def __init__(self, device: torch.device) -> None:
+    Sampling draws from the default CUDA generator inside the graph, as the PPO rollout graphs do, so
+    each replay takes fresh random numbers and ``torch.manual_seed`` still seeds a battle.
+    """
+
+    def __init__(self, device: torch.device, *, sample: bool = False) -> None:
         self.device = device
+        self.sample = bool(sample)
         self.graph: torch.cuda.CUDAGraph | None = None
         self.batch: UniversalSemanticBatchV4 | None = None
         self.state: RecurrentPolicyStateV4 | None = None
         self.episode_start: torch.Tensor | None = None
         self.output: PolicyOutputV4 | None = None
+
+    def _decide(
+        self,
+        model: UniversalCardPolicyV4,
+        batch: UniversalSemanticBatchV4,
+        state: RecurrentPolicyStateV4,
+        episode_start: torch.Tensor,
+    ) -> PolicyOutputV4:
+        decide = model.sample_for_ppo_rollout if self.sample else model.act
+        return decide(batch, state, episode_start=episode_start, validate=False)
 
     def _capture(
         self,
@@ -142,13 +157,13 @@ class _DeterministicCudaGraphV4:
         warmup_stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
-                model.act(self.batch, self.state, episode_start=self.episode_start, validate=False)
+                self._decide(model, self.batch, self.state, self.episode_start)
         torch.cuda.current_stream(self.device).wait_stream(warmup_stream)
         torch.cuda.synchronize(self.device)
 
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph):
-            self.output = model.act(self.batch, self.state, episode_start=self.episode_start, validate=False)
+            self.output = self._decide(model, self.batch, self.state, self.episode_start)
         if self.output is None:
             raise RuntimeError("V4 CUDA Graph capture produced no output")
         # Replay once before exposing the static output tensors. Capture builds
@@ -175,7 +190,7 @@ class _DeterministicCudaGraphV4:
         return self.output
 
 
-_POLICY_CUDA_GRAPHS_V4: weakref.WeakKeyDictionary[UniversalCardPolicyV4, dict[str, _DeterministicCudaGraphV4]] = (
+_POLICY_CUDA_GRAPHS_V4: weakref.WeakKeyDictionary[UniversalCardPolicyV4, dict[str, _PolicyCudaGraphV4]] = (
     weakref.WeakKeyDictionary()
 )
 
@@ -242,13 +257,13 @@ class PolicySessionV4:
         self.state = None
         self._episode_started = False
         self._first_decision = True
-        self._cuda_graph: _DeterministicCudaGraphV4 | None = None
-        if self.device.type == "cuda" and not self.sample and not self.validate_tensors:
+        self._cuda_graph: _PolicyCudaGraphV4 | None = None
+        if self.device.type == "cuda" and not self.validate_tensors:
             by_device = _POLICY_CUDA_GRAPHS_V4.setdefault(model, {})
-            device_key = str(self.device)
+            device_key = f"{self.device}:{'sample' if self.sample else 'argmax'}"
             cached = by_device.get(device_key)
             if cached is None:
-                cached = _DeterministicCudaGraphV4(self.device)
+                cached = _PolicyCudaGraphV4(self.device, sample=self.sample)
                 by_device[device_key] = cached
             self._cuda_graph = cached
 
