@@ -399,6 +399,11 @@ leaked = sorted(r["cumulative_elixir_overflow_wasted"][o] for r, o in seats if r
 if leaked:
     k = lambda p: leaked[min(len(leaked) - 1, int(p * len(leaked)))]
     print(f"  learner elixir wasted per game 10%/median/90% = {k(.1):.1f}/{k(.5):.1f}/{k(.9):.1f}")
+# Only tracked when --game-elixir-overflow-penalty is on: waste after the learner's first card.
+after = sorted(r["game_elixir_overflow_wasted"][o] for r, o in seats if any(r.get("game_elixir_overflow_wasted") or ()))
+if after:
+    a = lambda p: after[min(len(after) - 1, int(p * len(after)))]
+    print(f"  ... after the first card 10%/median/90% = {a(.1):.1f}/{a(.5):.1f}/{a(.9):.1f}")
 # Win rate against each frozen opponent, earliest games versus latest; self-play is always about 50%.
 fixed = [r for r in rows if r["policy_matchup"] == "current-history" and r.get("opponent_checkpoint_id")]
 for opponent in sorted({r["opponent_checkpoint_id"] for r in fixed}, key=lambda value: names.get(value, value)):

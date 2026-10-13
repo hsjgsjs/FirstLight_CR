@@ -646,6 +646,30 @@ class AsyncResidentEngineSpecV4:
     force_frozen_opponent_opening_after_seconds: int | None = None
     force_il_opponent_opening_after_seconds: int | None = None
     execution_delay_ticks: tuple[int, int] | None = None
+    # (coefficient per elixir, grace elixir) for elixir wasted at full over the whole game after the
+    # owner's first executed card; None disables it.  Opening waits before the first card are free.
+    game_elixir_overflow: tuple[float, float] | None = None
+
+
+def game_elixir_overflow_penalty_v4(
+    *,
+    wasted: float,
+    accrued: float,
+    newly_wasted: float,
+    counting: bool,
+    coefficient: float,
+    grace: float,
+    step_cap: float,
+) -> tuple[float, float, float]:
+    """Charge whole-game overflow beyond ``grace``, counted only once ``counting`` (after the first card).
+
+    Returns the new (wasted, accrued cost, penalty this step); unpaid cost above ``step_cap`` carries over.
+    """
+    if not counting:
+        return wasted, accrued, 0.0
+    wasted += newly_wasted
+    penalty = min(step_cap, max(0.0, coefficient * max(0.0, wasted - grace) - accrued))
+    return wasted, accrued + penalty, penalty
 
 
 _DELAYABLE_KINDS = frozenset({ActionKind.PLAY_CARD, ActionKind.ACTIVATE_ABILITY})
@@ -925,6 +949,11 @@ def _engine_worker(
     delay_bounds = spec.execution_delay_ticks
     if delay_bounds is not None and not 1 <= delay_bounds[0] <= delay_bounds[1] <= 0xFFFF:
         raise ValueError("execution delay must be 1 <= min <= max <= 65535 ticks")
+    game_overflow = spec.game_elixir_overflow
+    if game_overflow is not None and not (
+        all(math.isfinite(value) and value >= 0.0 for value in game_overflow) and game_overflow[0] > 0.0
+    ):
+        raise ValueError("game elixir overflow needs a positive coefficient and a nonnegative grace")
     validate_reward_parameters_v4(locals())
     segment_end_decision_steps = segment_decision_steps
     tensorize_seconds = 0.0
@@ -1296,6 +1325,9 @@ def _engine_worker(
             cumulative_unilateral_wasted = list(runtime.cumulative_unilateral_elixir_overflow_wasted)
             max_continuous_wasted = list(runtime.max_continuous_elixir_overflow_wasted)
             first_overflow_tick = list(runtime.first_elixir_overflow_tick)
+            game_wasted = list(runtime.game_elixir_overflow_wasted)
+            game_accrued = list(runtime.game_elixir_overflow_cost_accrued)
+            game_totals = list(runtime.game_elixir_overflow_penalty_total)
             adjusted_reward = dict(reward)
             for owner in (0, 1):
                 newly_wasted = _newly_wasted_elixir_v4(
@@ -1340,6 +1372,21 @@ def _engine_worker(
                 if previous_personal_wasted <= mutual_elixir_overflow_grace < personal_wasted[owner]:
                     personal_grace_crossings[owner] += 1
                 adjusted_reward[owner] = float(adjusted_reward[owner]) - penalty
+                if game_overflow is not None:
+                    game_wasted[owner], game_accrued[owner], game_penalty = game_elixir_overflow_penalty_v4(
+                        wasted=game_wasted[owner],
+                        accrued=game_accrued[owner],
+                        newly_wasted=newly_wasted,
+                        counting=runtime.first_successful_card_tick[owner] is not None,
+                        coefficient=game_overflow[0],
+                        grace=game_overflow[1],
+                        step_cap=elixir_overflow_step_penalty_cap,
+                    )
+                    game_totals[owner] += game_penalty
+                    adjusted_reward[owner] -= game_penalty
+            runtime.game_elixir_overflow_wasted = (game_wasted[0], game_wasted[1])
+            runtime.game_elixir_overflow_cost_accrued = (game_accrued[0], game_accrued[1])
+            runtime.game_elixir_overflow_penalty_total = (game_totals[0], game_totals[1])
             runtime.personal_elixir_overflow_wasted = (personal_wasted[0], personal_wasted[1])
             runtime.personal_elixir_overflow_cost_accrued = (personal_accrued[0], personal_accrued[1])
             runtime.unilateral_elixir_overflow_wasted = (unilateral_wasted[0], unilateral_wasted[1])
