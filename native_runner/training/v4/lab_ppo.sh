@@ -11,7 +11,7 @@
 # UPDATES is the total update count to stop at (default 30000, more than a week). The trainer options
 # default to the sparring configuration in docs/lab_training_zh.md and CR_PPO_EXTRA_ARGS replaces them;
 # a resume reuses the options saved in runs/NAME/trainer-options.txt. Other settings:
-# CR_LAB_ENGINE_CPUS (0-7), CR_LAB_WORKER_CPUS (8-15), CR_LAB_CONTROL_CPUS (16-19), CR_LAB_TRAIN_GPUS
+# CR_PPO_ENGINE_COUNT (8), CR_LAB_ENGINE_CPUS (0-7), CR_LAB_WORKER_CPUS (8-15), CR_LAB_CONTROL_CPUS (16-19), CR_LAB_TRAIN_GPUS
 # (0; nvidia-smi numbers, e.g. 0,1), CR_LAB_KEEP_CHECKPOINTS (3) and CR_LAB_CHECKPOINT_BUCKET (1000):
 # the newest few strict checkpoints are kept plus the first one in every bucket of that many updates.
 # NCCL_P2P_DISABLE, CR_PPO_INFERENCE_BATCH_WAIT_MS and other environment variables pass through to the trainer.
@@ -48,6 +48,14 @@ default_extra_args() {
     "--personal-elixir-overflow-penalty 0.01 --personal-elixir-overflow-grace 1" \
     "--gate-temperature-start 0.5 --gate-temperature-end 0.2 --gate-temperature-anneal-updates 3000" \
     "--snapshot-every 200"
+}
+
+cpu_count() {
+  local part count=0
+  for part in ${1//,/ }; do
+    count=$((count + ${part#*-} - ${part%-*} + 1))
+  done
+  echo "$count"
 }
 
 supervisor_pids() {
@@ -135,9 +143,12 @@ run() {
     grep -q ENGINE_CLUSTER_READY "$logs/engines.log"
 
   log "starting the worker server on CPUs $worker_cpus"
+  local sharing=()
+  # More engines than worker CPUs: let the per-engine workers time-share the worker cores.
+  (($(cpu_count "$worker_cpus") >= engine_count)) || sharing=(--allow-worker-cpu-sharing)
   taskset -c "$worker_cpus" "$python" -m native_runner.training.v4.remote_ppo_worker_server \
     --bind-host "$host" --port "$worker_port" --global-start 0 --engine-count "$engine_count" \
-    --engine-base-port "$base_port" >"$logs/worker.log" 2>&1 &
+    --engine-base-port "$base_port" "${sharing[@]}" >"$logs/worker.log" 2>&1 &
   local worker_pid=$!
   wait_for "the worker server" 120 "$worker_pid" \
     bash -c "ss -ltnH 'sport = :$worker_port' | grep -q LISTEN"
