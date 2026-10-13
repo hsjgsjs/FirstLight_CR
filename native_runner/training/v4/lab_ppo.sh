@@ -10,9 +10,9 @@
 #                                     MINUTES, first wait up to MINUTES for the next strict checkpoint
 #   lab_ppo.sh schedule NAME HH:MM HH:MM [RETRY_MINUTES]   every day, resume NAME at the first time and
 #                                     stop it by the second (waiting for a checkpoint from 12 minutes before);
-#                                     for RETRY_MINUTES (default 90) after the start, check every 15 minutes
-#                                     and resume again if the run died without being stopped; replaces any
-#                                     earlier schedule
+#                                     for RETRY_MINUTES after the start (default: until the stop begins),
+#                                     check every 15 minutes and resume again if the run died without being
+#                                     stopped; replaces any earlier schedule
 #   lab_ppo.sh ensure NAME            resume NAME unless it is running or was stopped on purpose
 #   lab_ppo.sh unschedule             remove the daily schedule
 #
@@ -204,6 +204,7 @@ run() {
     prune_checkpoints "$stage/checkpoints"
     if ! kill -0 "$engine_pid" 2>/dev/null || ! kill -0 "$worker_pid" 2>/dev/null; then
       log "FAILED: the engine node or the worker server exited; see engines.log and worker.log"
+      save_guest_logs "$logs"
       exit 1
     fi
     if (($(df -Pk "$run_dir" | awk 'NR == 2 {print $4}') < 5 * 1024 * 1024)); then
@@ -214,7 +215,20 @@ run() {
   wait "$trainer_pid" || status=$?
   prune_checkpoints "$stage/checkpoints"
   log "trainer exited with status $status; newest checkpoint: $(newest_checkpoint "$run_dir")"
+  ((status == 0)) || save_guest_logs "$logs"
   exit "$status"
+}
+
+# The probe reports why it rejected a capture only in the guests' logcat, which is gone once the emulators
+# stop, so keep the tail of each guest's log after a failure.
+save_guest_logs() {
+  local adb=${CR_TRAINING_ADB:-adb} serial directory
+  directory=$1/guest-logcat-$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$directory"
+  for serial in $("$adb" devices 2>/dev/null | awk '$1 ~ /^emulator-/ && $2 == "device" {print $1}'); do
+    timeout 30 "$adb" -s "$serial" logcat -d -t 5000 >"$directory/$serial.txt" 2>&1 || true
+  done
+  log "saved guest logcat to $directory"
 }
 
 save_launch_env() {
@@ -317,18 +331,20 @@ case ${1:-} in
     drain_minute=$(((end_minute - 12 + 1440) % 1440))
     command -v crontab >/dev/null || { echo "crontab is not installed" >&2; exit 1; }
     script=$script_dir/lab_ppo.sh
+    # By default keep checking all day, until the checkpoint-aware stop begins.
+    retry_minutes=${5:-$(((drain_minute - begin_minute + 1440) % 1440 - 15))}
     log_file=$runs/schedule.log
     {
       { crontab -l 2>/dev/null || true; } | grep -v "# lab_ppo schedule" || true
       echo "$((begin_minute % 60)) $((begin_minute / 60)) * * * bash $script resume $name >>$log_file 2>&1 # lab_ppo schedule"
       echo "$((drain_minute % 60)) $((drain_minute / 60)) * * * bash $script stop $name 11 >>$log_file 2>&1 # lab_ppo schedule"
       echo "$((end_minute % 60)) $((end_minute / 60)) * * * bash $script stop >>$log_file 2>&1 # lab_ppo schedule"
-      for ((offset = 15; offset <= ${5:-90}; offset += 15)); do
+      for ((offset = 15; offset <= retry_minutes; offset += 15)); do
         retry_minute=$(((begin_minute + offset) % 1440))
         echo "$((retry_minute % 60)) $((retry_minute / 60)) * * * bash $script ensure $name >>$log_file 2>&1 # lab_ppo schedule"
       done
     } | crontab -
-    echo "scheduled $name daily: resume at $begin, retry for ${5:-90} minutes, stop by $end (log: $log_file)"
+    echo "scheduled $name daily: resume at $begin, retry for $retry_minutes minutes, stop by $end (log: $log_file)"
     crontab -l | grep "# lab_ppo schedule"
     ;;
   ensure)
