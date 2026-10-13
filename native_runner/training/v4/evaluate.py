@@ -16,6 +16,8 @@ from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .policy_session import build_policy_session_v4, load_policy_v4
 
+_DELAYABLE = frozenset({ActionKind.PLAY_CARD, ActionKind.ACTIVATE_ABILITY})
+
 
 def evaluate(
     checkpoint_a,
@@ -28,9 +30,12 @@ def evaluate(
     port=DEFAULT_PORT,
     device="cpu",
     sample=False,
+    delay_b_ticks=0,
 ):
     if games < 1:
         raise ValueError("games must be positive")
+    if not 0 <= delay_b_ticks <= 0xFFFF:
+        raise ValueError("delay_b_ticks must be in [0, 65535]")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     policies = [load_policy_v4(path, device=device) for path in (checkpoint_a, checkpoint_b)]
@@ -46,6 +51,7 @@ def evaluate(
     identity = {
         "games": games,
         "sample": sample,
+        "delay_b_ticks": delay_b_ticks,
         "match": asdict(match),
         "checkpoints": [
             {"path": str(p.checkpoint_path), "sha256": p.checkpoint_sha256, "checkpoint_id": p.checkpoint_id}
@@ -106,6 +112,13 @@ def evaluate(
                         chosen = ()
                         if observation.tick >= FIRST_POLICY_DECISION_TICK:
                             chosen = session.decide(observation).decoded.actions
+                            if delay_b_ticks and owner != a_owner:
+                                # Model B's plays land this many ticks after the decision, as taps do on a
+                                # live client; BattleEnvV1 keeps the slot pending and its elixir reserved.
+                                chosen = tuple(
+                                    replace(a, execute_offset_ticks=delay_b_ticks) if a.kind in _DELAYABLE else a
+                                    for a in chosen
+                                )
                             actions[owner] += sum(a.kind != ActionKind.WAIT for a in chosen)
                         else:
                             session.tensorizer.tensorize(observation, validate=False)
@@ -164,6 +177,12 @@ def main(argv=None):
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--sample", action="store_true")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--delay-b-ticks",
+        type=int,
+        default=0,
+        help="execute model B's card plays and abilities this many ticks after its decision (a live tap lands ~21)",
+    )
     args = parser.parse_args(argv)
     config = json.loads(args.match_config.read_text(encoding="utf-8")) if args.match_config else {}
     for key in ("owner0_account_id", "owner1_account_id"):
@@ -180,6 +199,7 @@ def main(argv=None):
         port=args.port,
         device=args.device,
         sample=args.sample,
+        delay_b_ticks=args.delay_b_ticks,
     )
     return 0
 
