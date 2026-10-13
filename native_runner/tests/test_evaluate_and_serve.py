@@ -101,6 +101,12 @@ def test_evaluation_delays_only_model_b_plays(monkeypatch, tmp_path):
     # Game 1: A is owner 0; game 2: A is owner 1. Only B's play is delayed; waits are untouched.
     offsets = [{owner: [a.execute_offset_ticks for a in actions] for owner, actions in step.items()} for step in sent]
     assert offsets == [{0: [1, 0], 1: [21, 0]}, {0: [21, 0], 1: [1, 0]}]
+    sent.clear()
+    evaluate.evaluate(
+        "a.pt", "b.pt", games=2, match=MatchConfig(seed=7), output=tmp_path, delay_a_ticks=19, delay_b_ticks=21
+    )
+    offsets = [{owner: [a.execute_offset_ticks for a in actions] for owner, actions in step.items()} for step in sent]
+    assert offsets == [{0: [19, 0], 1: [21, 0]}, {0: [21, 0], 1: [19, 0]}]
 
 
 def test_parallel_evaluation_splits_even_games_and_pools_results(tmp_path):

@@ -844,6 +844,17 @@ def _load_history_models(
     return {checkpoint_id: cache[checkpoint_id] for checkpoint_id in required}
 
 
+def parse_execution_delay_ticks(value: str) -> tuple[int, int]:
+    low, _, high = value.strip().partition("-")
+    try:
+        bounds = (int(low), int(high or low))
+    except ValueError:
+        raise argparse.ArgumentTypeError("execution delay must be N or MIN-MAX ticks, e.g. 18-24") from None
+    if not 1 <= bounds[0] <= bounds[1] <= 0xFFFF:
+        raise argparse.ArgumentTypeError("execution delay must be 1 <= MIN <= MAX <= 65535 ticks")
+    return bounds
+
+
 def _validate_topology(ready: Mapping[str, object], *, world_size: int) -> tuple[int, int]:
     """Validate the one supported production topology and return its dimensions."""
 
@@ -880,6 +891,15 @@ def main() -> int:
     parser.add_argument("--checkpoint", type=Path, required=True, help="fresh learner initialization checkpoint")
     parser.add_argument(
         "--il-anchor-checkpoint", type=Path, help="frozen IL opponent checkpoint; defaults to --checkpoint"
+    )
+    parser.add_argument(
+        "--execution-delay-ticks",
+        type=parse_execution_delay_ticks,
+        help=(
+            "land every policy's card plays and abilities this many ticks after the decision, drawn per "
+            "decision from MIN-MAX (or a single N), to match a live client's tap latency (about 21 ticks); "
+            "rejections the delay causes are then counted but no longer fail the collection audit"
+        ),
     )
     parser.add_argument(
         "--il-opening-force-after-seconds",
@@ -1333,6 +1353,9 @@ def main() -> int:
         "focus_tail_current_focus_percent": 75,
         "opening_force": opening_force_config,
     }
+    # Omit the optional key when disabled to preserve old undelayed strict resumes.
+    if args.execution_delay_ticks is not None:
+        resume_contract["execution_delay_ticks"] = list(args.execution_delay_ticks)
     # Omit the optional key when disabled to preserve old no-BC strict resumes.
     if expert_bc_contract is not None:
         resume_contract["expert_bc"] = expert_bc_contract
@@ -1418,6 +1441,7 @@ def main() -> int:
             worker_host=engine_worker_hosts[engine_index],
             worker_port=engine_worker_ports[engine_index],
             force_il_opponent_opening_after_seconds=(args.il_opening_force_after_seconds),
+            execution_delay_ticks=args.execution_delay_ticks,
         )
         for engine_index in engine_indices
     )
@@ -1647,7 +1671,8 @@ def main() -> int:
                         for shard in gathered
                     )
                     and truncated == 0
-                    and rejected == 0
+                    # A delayed play can meet a board that changed meanwhile; count those, don't abort.
+                    and (rejected == 0 or args.execution_delay_ticks is not None)
                 )
                 failure = (
                     None

@@ -165,10 +165,20 @@ python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --game
 
 ## 7. 待办（完整版）
 
-1. **训练加延迟**
-   - 训练器加 `--execution-delay-ticks 18-24`，传到 worker；双方的出牌和技能都加上随机延迟。
-   - 确认训练器怎么处理“被拒绝的出牌”（原作者要求为 0），必要时把延迟导致的拒绝单独放行。
-   - 评测器加 `--delay-a-ticks`，用来在双方都有延迟的条件下评测。
+1. **训练加延迟**（已完成）
+   - 训练器参数 `--execution-delay-ticks 18-24`（也可以写单个数，如 `21`）。每次决策随机抽一个延迟，双方的出牌和技能都在决策后这么多 tick 才生效，模型自己选的延迟偏移被忽略（和实战一致）。
+   - 开了延迟后，被拒绝的出牌只计数（W&B 里的 `safety/rejected_actions`），不再让这一轮采集作废；不开延迟时仍然要求为 0。
+   - 延迟写进续训合同：带延迟训练出的检查点，续训时也必须带同样的参数。
+   - 启动脚本新增 `CR_PPO_EXTRA_ARGS`，原样追加到训练器命令后面。
+   - 评测器新增 `--delay-a-ticks`，配合 `--delay-b-ticks` 在双方都有延迟的条件下评测。
+   - 冒烟测试（按第 3 节启动引擎和 worker 后，终端 3 改成）：
+
+     ```bash
+     CR_PPO_EXTRA_ARGS="--execution-delay-ticks 18-24" \
+       bash native_runner/training/v4/launch_ppo_multinode_training.sh runs/ppo-delay-smoke runs/topology.json 3 40
+     ```
+
+     看 3 次更新都能跑完，再看 `safety/rejected_actions` 有多少、每局出牌次数是否正常。
 2. **一键启动脚本**
    - 一条命令在后台拉起引擎、worker、拓扑和训练器，日志写到文件；
    - 使用双卡，并按第 3 节分配 CPU；
