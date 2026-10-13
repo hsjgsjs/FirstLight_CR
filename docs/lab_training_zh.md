@@ -64,19 +64,21 @@ uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install -r re
 
 ### `.env` 里和训练有关的设置
 
+`<user>` 换成服务器上自己的用户名。
+
 ```
-CR_AI_PYTHON=/home/ybk/FirstLight_CR/.venv/bin/python
-CR_TRAINING_ADB=/home/ybk/android-sdk/platform-tools/adb
-CR_TRAINING_SDK_ROOT=/home/ybk/android-sdk
-CR_EMULATOR=/home/ybk/android-sdk/emulator/emulator
-CR_SOURCE_AVD=/home/ybk/.android/avd/cr-base.avd
-CR_SOURCE_AVD_INI=/home/ybk/.android/avd/cr-base.ini
-CR_EMULATOR_INITDATA=/home/ybk/cr-train/prepared-userdata.img
-CR_EMULATOR_ENCRYPTIONKEY=/home/ybk/cr-train/prepared-encryptionkey.img
-CR_TRAINING_APK=/home/ybk/FirstLight_CR/build/cr-ai-train6.apk
-CR_EMULATOR_COMPAT=/home/ybk/cr-train/compat
-CR_PPO_CHECKPOINT=/home/ybk/FirstLight_CR/checkpoints/General/checkpoint-step-00000460.pt
-CR_PPO_DECK_POOL=/home/ybk/FirstLight_CR/runs/deck-pool.json
+CR_AI_PYTHON=/home/<user>/FirstLight_CR/.venv/bin/python
+CR_TRAINING_ADB=/home/<user>/android-sdk/platform-tools/adb
+CR_TRAINING_SDK_ROOT=/home/<user>/android-sdk
+CR_EMULATOR=/home/<user>/android-sdk/emulator/emulator
+CR_SOURCE_AVD=/home/<user>/.android/avd/cr-base.avd
+CR_SOURCE_AVD_INI=/home/<user>/.android/avd/cr-base.ini
+CR_EMULATOR_INITDATA=/home/<user>/cr-train/prepared-userdata.img
+CR_EMULATOR_ENCRYPTIONKEY=/home/<user>/cr-train/prepared-encryptionkey.img
+CR_TRAINING_APK=/home/<user>/FirstLight_CR/build/cr-ai-train6.apk
+CR_EMULATOR_COMPAT=/home/<user>/cr-train/compat
+CR_PPO_CHECKPOINT=/home/<user>/FirstLight_CR/checkpoints/General/checkpoint-step-00000460.pt
+CR_PPO_DECK_POOL=/home/<user>/FirstLight_CR/runs/deck-pool.json
 CR_PPO_DECK_POOL_SIZE=7089
 ```
 
