@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -88,12 +89,13 @@ def candidate(row: Mapping[str, Any], modes: Sequence[str], support: DeckSupport
     leaks = {side: players[side][0].get("elixir_leaked") for side in (winner, loser)}
     if owners is None or not all(isinstance(value, (int, float)) for value in leaks.values()):
         return None
-    deck = tuple(sorted(str(card["card_key"]) for card in players[winner][0]["deck"]))
+    decks = {side: tuple(sorted(str(card["card_key"]) for card in players[side][0]["deck"])) for side in players}
     return {
         "replay_tag": str(row["replay_tag"]),
         "game_mode": str(row["game_mode"]),
         "scoreline": scoreline,
-        "deck": deck,
+        "deck": decks[winner],
+        "loser_deck": decks[loser],
         "sides": {
             "winner": {"side": winner, "owner": owners[winner], "elixir_leaked": float(leaks[winner])},
             "loser": {"side": loser, "owner": owners[loser], "elixir_leaked": float(leaks[loser])},
@@ -114,19 +116,26 @@ def leak_cutoff(candidates: Sequence[Mapping[str, Any]], quantile: float) -> flo
     return leaks[min(len(leaks) - 1, max(0, int(quantile * (len(leaks) - 1))))]
 
 
+def top_decks(candidates: Sequence[Mapping[str, Any]], *, cutoff: float, count: int) -> frozenset[tuple[str, ...]]:
+    """The most common winner decks among replays that pass the elixir-leak cutoff."""
+    counts = Counter(item["deck"] for item in candidates if item["sides"]["winner"]["elixir_leaked"] <= cutoff)
+    return frozenset(deck for deck, _ in counts.most_common(count))
+
+
 def select(
     candidates: Sequence[Mapping[str, Any]],
     *,
     target: int,
     deck_cap: int,
     cutoff: float,
+    decks: frozenset[tuple[str, ...]] | None = None,
     shares: Mapping[str, float] = SCORELINE_SHARES,
     seed: int = 0,
 ) -> list[dict[str, Any]]:
     rng = random.Random(seed)
     groups: dict[str, list[Mapping[str, Any]]] = {scoreline: [] for scoreline in shares}
     for item in candidates:
-        if item["sides"]["winner"]["elixir_leaked"] <= cutoff:
+        if item["sides"]["winner"]["elixir_leaked"] <= cutoff and (decks is None or item["deck"] in decks):
             groups[item["scoreline"]].append(item)
     for group in groups.values():
         rng.shuffle(group)
@@ -143,7 +152,7 @@ def select(
             if deck_counts[item["deck"]] >= deck_cap:
                 continue
             deck_counts[item["deck"]] += 1
-            chosen.append(learn_sides(item, cutoff))
+            chosen.append(learn_sides(item, cutoff, decks))
             taken += 1
 
     for scoreline, share in shares.items():
@@ -156,12 +165,15 @@ def select(
     return chosen[:target]
 
 
-def learn_sides(item: Mapping[str, Any], cutoff: float) -> dict[str, Any]:
+def learn_sides(
+    item: Mapping[str, Any], cutoff: float, decks: frozenset[tuple[str, ...]] | None = None
+) -> dict[str, Any]:
     winner, loser = item["sides"]["winner"], item["sides"]["loser"]
     learn = [{**winner, "outcome": "win", "weight": 1.0}]
-    if item["scoreline"] == "1-0" and loser["elixir_leaked"] <= cutoff:
+    loser_deck_ok = decks is None or item.get("loser_deck") in decks
+    if item["scoreline"] == "1-0" and loser["elixir_leaked"] <= cutoff and loser_deck_ok:
         learn.append({**loser, "outcome": "close_loss", "weight": 0.5})
-    return {key: item[key] for key in ("replay_tag", "game_mode", "scoreline")} | {"learn": learn}
+    return {key: item[key] for key in ("replay_tag", "game_mode", "scoreline", "deck")} | {"learn": learn}
 
 
 def write_outputs(files: Sequence[Path], chosen: Sequence[Mapping[str, Any]], output: Path) -> int:
@@ -187,7 +199,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("dataset_root", type=Path, help="directory containing replays/part-*.parquet")
     parser.add_argument("output", type=Path)
     parser.add_argument("--target", type=int, default=10000)
-    parser.add_argument("--deck-cap", type=int, default=25, help="maximum replays per winner deck")
+    parser.add_argument("--top-decks", type=int, default=100, help="learn only the N most common winner decks (0=all)")
+    parser.add_argument(
+        "--deck-cap",
+        type=int,
+        default=0,
+        help="maximum replays per winner deck (0 = 1.5x target / selected decks, or 25)",
+    )
     parser.add_argument("--leak-quantile", type=float, default=0.5, help="winner elixir-leak quantile to keep")
     parser.add_argument("--modes", default=",".join(DEFAULT_MODES), help="comma-separated game_mode values")
     parser.add_argument("--seed", type=int, default=0)
@@ -209,7 +227,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             seen.add(item["replay_tag"])
             candidates.append(item)
     cutoff = leak_cutoff(candidates, args.leak_quantile)
-    chosen = select(candidates, target=args.target, deck_cap=args.deck_cap, cutoff=cutoff, seed=args.seed)
+    decks = top_decks(candidates, cutoff=cutoff, count=args.top_decks) if args.top_decks > 0 else None
+    deck_cap = args.deck_cap or (math.ceil(1.5 * args.target / max(1, len(decks))) if decks else 25)
+    chosen = select(candidates, target=args.target, deck_cap=deck_cap, cutoff=cutoff, decks=decks, seed=args.seed)
     written = write_outputs(files, chosen, args.output)
     summary = {
         "scanned_replays": scanned,
@@ -219,6 +239,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "selected_replays": written,
         "selected_by_scoreline": dict(Counter(item["scoreline"] for item in chosen)),
         "learned_sides": sum(len(item["learn"]) for item in chosen),
+        "selected_winner_decks": len({tuple(item["deck"]) for item in chosen}),
+        "deck_cap": deck_cap,
         "distinct_winner_decks": len({tuple(sorted(c["deck"])) for c in candidates}),
         "unsupported_card_keys": sorted(f"{k[0]}" for k, ok in support.cache.items() if not ok),
         "settings": {key: str(value) for key, value in vars(args).items()},
