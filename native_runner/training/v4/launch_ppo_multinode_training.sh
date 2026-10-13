@@ -63,6 +63,7 @@ exec "$python" -m torch.distributed.run \
   --nproc-per-node="$nproc_per_node" \
   -m native_runner.training.v4.train_ppo_self_play_cluster \
   --deck-pool "${CR_PPO_DECK_POOL:?Set CR_PPO_DECK_POOL in .env}" \
+  --expected-deck-pool-size "${CR_PPO_DECK_POOL_SIZE:-7695}" \
   --checkpoint "${CR_PPO_CHECKPOINT:?Set CR_PPO_CHECKPOINT in .env}" \
   "${resume_args[@]}" \
   --output-dir "$output_dir" \
@@ -74,4 +75,4 @@ exec "$python" -m torch.distributed.run \
   --lane-minibatch-size "${CR_PPO_LANE_MINIBATCH_SIZE:-384}" \
   --lane-microbatch-size "${CR_PPO_LANE_MICROBATCH_SIZE:-256}" \
   --sequence-chunk-steps "${CR_PPO_SEQUENCE_CHUNK_STEPS:-16}" \
-  --seed "${CR_PPO_SEED:-0}"
+  --seed "${CR_PPO_SEED:-20260827}"

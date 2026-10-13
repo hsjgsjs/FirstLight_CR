@@ -871,6 +871,12 @@ def _validate_topology(ready: Mapping[str, object], *, world_size: int) -> tuple
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deck-pool", type=Path, required=True)
+    parser.add_argument(
+        "--expected-deck-pool-size",
+        type=int,
+        default=7_695,
+        help="deck count the pool must hold (7,695 for the released models' pool; 0 accepts any size)",
+    )
     parser.add_argument("--checkpoint", type=Path, required=True, help="fresh learner initialization checkpoint")
     parser.add_argument(
         "--il-anchor-checkpoint", type=Path, help="frozen IL opponent checkpoint; defaults to --checkpoint"
@@ -1168,8 +1174,12 @@ def main() -> int:
     league_path = args.output_dir / "league.json"
 
     manifest = DeckPoolManifestV4.load(args.deck_pool)
-    if len(manifest.decks) != 7_695 or len(manifest.focus_decks) != 20:
-        raise ValueError("formal cluster PPO requires the verified 7,695/20 pool")
+    expected_decks = args.expected_deck_pool_size
+    if (expected_decks and len(manifest.decks) != expected_decks) or len(manifest.focus_decks) != 20:
+        raise ValueError(
+            f"deck pool holds {len(manifest.decks)} decks and {len(manifest.focus_decks)} focus decks; "
+            f"cluster PPO expects {expected_decks or 'any number of'} decks and 20 focus decks"
+        )
     deck_average_elixir_by_id = {deck.deck_id: deck.average_elixir for deck in manifest.decks}
     decks_by_id = {deck.deck_id: deck for deck in manifest.decks}
     try:
