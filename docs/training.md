@@ -110,12 +110,15 @@ python -m native_runner.training.v4.build_ppo_multinode_topology \
   --worker-cpus <worker-cpu-ids> --control-cpus <control-cpu-ids>
 ```
 
-Build a deck pool from the parent of your dataset directories (`datasets/*/replays/*.parquet`), or use `runs/demo/deck-pool.json` for a workflow check:
+Build a deck pool from the parent of your dataset directories (`datasets/*/replays/*.parquet`). Cluster PPO needs the 20 focus decks marked:
 
 ```sh
 python -m native_runner.training.v4.build_ppo_deck_pool \
-  --dataset-root ./datasets --output ./runs/deck-pool.json --minimum-uses 5
+  --dataset-root ./datasets --output ./runs/deck-pool.json --minimum-uses 5 \
+  --focus-decks native_runner/training/v4/focus_decks_20.json
 ```
+
+The trainer checks the pool size against `CR_PPO_DECK_POOL_SIZE` (default 7,695, the released models' pool; `0` accepts any size). The public IL_Replay replays yield a smaller pool, so set it to the `pool_size` the builder prints.
 
 Set `CR_PPO_DECK_POOL` and `CR_PPO_CHECKPOINT` to absolute paths in the training host’s `.env`. The included `checkpoints/General/checkpoint-step-00000460.pt` is one starting point. On the trainer host named in the topology and within the same allocation, run one update with 40-second rollout segments:
 
