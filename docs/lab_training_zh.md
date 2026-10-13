@@ -64,6 +64,8 @@ uv venv --python 3.12 .venv && source .venv/bin/activate && uv pip install -r re
 
 ### `.env` 里和训练有关的设置
 
+`<user>` 换成服务器上自己的用户名。
+
 ```
 CR_AI_PYTHON=/home/<user>/FirstLight_CR/.venv/bin/python
 CR_TRAINING_ADB=/home/<user>/android-sdk/platform-tools/adb
