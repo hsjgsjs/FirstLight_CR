@@ -103,6 +103,7 @@ python -m native_runner.training.v4.build_ppo_deck_pool --dataset-root datasets 
 cd ~/FirstLight_CR && git pull
 bash native_runner/training/v4/lab_ppo.sh start spar-week1          # 新开一个训练，默认跑到第 30000 次更新
 bash native_runner/training/v4/lab_ppo.sh status spar-week1         # 进度、最近对局的开局时间、检查点、剩余硬盘
+bash native_runner/training/v4/lab_ppo.sh load spar-week1           # CPU 各组和 GPU 的实时占用，以及每次更新的时间花在哪
 tail -f runs/spar-week1/logs/supervisor.log runs/spar-week1/logs/trainer.log
 bash native_runner/training/v4/lab_ppo.sh stop                      # 停止并清理
 bash native_runner/training/v4/lab_ppo.sh resume spar-week1         # 中断后从最新的检查点续训
@@ -113,6 +114,10 @@ bash native_runner/training/v4/lab_ppo.sh resume spar-week1         # 中断后�
 - **训练参数**默认是第 6 节的对练配置，实际用的参数存在 `runs/名字/trainer-options.txt`，续训时会自动沿用。要换参数就设 `CR_PPO_EXTRA_ARGS`（会整体替换默认参数），并且换一个新名字开训。
 - **检查点**：每打完一批对局存一个完整检查点（约 48 MB，大约每 8 次更新一个）。脚本只保留最新 3 个，再加每 1000 次更新的第一个，一周大约 1–2 GB。对手池快照每 200 次更新一个。
 - 剩余硬盘不足 5 GB 时，`supervisor.log` 里会出现警告。
+- **`load` 怎么看**：
+  - 「GPU inference」是 GPU 推理的时间；「trainer batching」是训练器拼批（CPU，16–19 核）；「waiting for engines」是在等引擎推进和 worker 解析画面（CPU，0–15 核）；「optimization」是 GPU 训练。
+  - 等引擎的时间占比最大，并且 engines 或 workers 那组核接近 100%：说明瓶颈在 CPU。
+  - GPU inference 占比最大，并且 GPU 利用率高：说明瓶颈在 GPU 推理。
 
 ### 手动启动（排查问题时用）
 
