@@ -22,6 +22,9 @@ emulator=${CR_EMULATOR:?Set CR_EMULATOR in .env}
 source_avd=${CR_SOURCE_AVD:?Set CR_SOURCE_AVD in .env}
 source_ini=${CR_SOURCE_AVD_INI:?Set CR_SOURCE_AVD_INI in .env}
 initdata=${CR_EMULATOR_INITDATA:?Set CR_EMULATOR_INITDATA in .env}
+# Android 12+ guests encrypt userdata with a key kept in encryptionkey.img; a
+# clone given only the prepared userdata cannot decrypt it and formats /data.
+encryption_key=${CR_EMULATOR_ENCRYPTIONKEY:-}
 apk=${CR_TRAINING_APK:?Set CR_TRAINING_APK in .env}
 probe=${CR_PROBE:-${CR_PPO_PROBE:-$repository_root/native_runner/probe/out/libcrprobe.so}}
 probe_installer=$script_dir/install_probe_idle_guests.py
@@ -91,7 +94,7 @@ if [[ -n ${CR_EMULATOR_DNS:-} ]]; then dns_args=(-dns-server "$CR_EMULATOR_DNS")
 
 for required in \
   "$python" "$adb" "$emulator" "$source_avd/config.ini" "$source_ini" \
-  "$initdata" "$apk" "$probe" \
+  "$initdata" ${encryption_key:+"$encryption_key"} "$apk" "$probe" \
   "$probe_installer" "$engine_configurator" "$endpoint_proxy"; do
   if [[ ! -e $required ]]; then
     echo "missing PPO cluster dependency: $required" >&2
@@ -220,6 +223,8 @@ for index in $(seq 0 $((guest_count - 1))); do
     -e "s/^hw.ramSize=.*/hw.ramSize=${guest_memory_mb[$index]}M/" \
     "$avd_dir/config.ini"
   cp --reflink=auto --sparse=always "$source_avd/cache.img" "$avd_dir/cache.img"
+  # The emulator keeps writable partitions beside -data; it copies a stock key only when none is there.
+  [[ ! $encryption_key ]] || cp --reflink=auto --sparse=always "$encryption_key" "$emu_dir/encryptionkey.img"
   cp "$source_ini" "$avd_home/$name.ini"
   sed -i "s#^path=.*#path=$avd_dir#" "$avd_home/$name.ini"
 done
