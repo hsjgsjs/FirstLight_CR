@@ -28,9 +28,10 @@
 set -euo pipefail
 
 launch_vars=(CR_PPO_ENGINE_COUNT CR_LAB_ENGINE_CPUS CR_LAB_WORKER_CPUS CR_LAB_CONTROL_CPUS CR_LAB_TRAIN_GPUS
-  CR_PPO_INFERENCE_BATCH_WAIT_MS CR_PPO_SEGMENT_SECONDS CR_PPO_LANE_MICROBATCH_SIZE NCCL_P2P_DISABLE)
+  CR_PPO_INFERENCE_BATCH_WAIT_MS CR_PPO_SEGMENT_SECONDS CR_PPO_LANE_MICROBATCH_SIZE NCCL_P2P_DISABLE
+  CR_PPO_CHECKPOINT)
 explicit_vars=" "
-for variable in "${launch_vars[@]}"; do
+for variable in "${launch_vars[@]}" CR_PPO_EXTRA_ARGS; do
   [[ ! -v $variable ]] || explicit_vars+="$variable "
 done
 
@@ -147,6 +148,11 @@ run() {
   stage=$run_dir/train-$(date +%Y%m%d-%H%M%S)
   trap cleanup EXIT
   trap 'log "stop requested"; exit 130' INT TERM
+  if [[ -z $resume && ! -f ${CR_PPO_CHECKPOINT:-} ]]; then
+    log "FAILED: the starting checkpoint CR_PPO_CHECKPOINT='${CR_PPO_CHECKPOINT:-}' is not a file"
+    exit 1
+  fi
+  log "starting from ${resume:-${CR_PPO_CHECKPOINT}}"
   log "cleaning up leftovers"
   cleanup
   rm -rf "$node_dir"
@@ -271,13 +277,19 @@ case ${1:-} in
   resume)
     shift
     checkpoint=$(newest_checkpoint "$runs/${1:?usage: lab_ppo.sh resume NAME [UPDATES]}")
-    if [[ -z $checkpoint ]]; then
+    load_launch_env "$runs/$1"
+    if [[ -n $checkpoint ]]; then
+      echo "resuming from $checkpoint"
+      start "$1" "${2:-30000}" "$checkpoint"
+    elif [[ -s $runs/$1/trainer-options.txt && -f ${CR_PPO_CHECKPOINT:-} ]]; then
+      # The run never reached a strict checkpoint: start it again from its own starting point and options.
+      echo "runs/$1 has no strict checkpoint yet; starting it again from $CR_PPO_CHECKPOINT"
+      [[ $explicit_vars == *" CR_PPO_EXTRA_ARGS "* ]] || export CR_PPO_EXTRA_ARGS="$(<"$runs/$1/trainer-options.txt")"
+      start "$1" "${2:-30000}"
+    else
       echo "runs/$1 has no strict checkpoint to resume from" >&2
       exit 1
     fi
-    echo "resuming from $checkpoint"
-    load_launch_env "$runs/$1"
-    start "$1" "${2:-30000}" "$checkpoint"
     ;;
   stop)
     mkdir -p "$runs" && date -Is >"$stop_marker"
