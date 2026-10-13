@@ -93,7 +93,28 @@ python -m native_runner.training.v4.build_ppo_deck_pool --dataset-root datasets 
 
 结果是 7,089 套牌组，其中 20 套是重点卡组。
 
-## 3. 手动启动（一键脚本完成前）
+## 3. 启动训练
+
+### 一键启动（推荐）
+
+`lab_ppo.sh` 在后台依次拉起引擎、worker、拓扑和训练器，日志写到 `runs/名字/logs/`，关掉终端也不影响：
+
+```bash
+cd ~/FirstLight_CR && git pull
+bash native_runner/training/v4/lab_ppo.sh start spar-week1          # 新开一个训练，默认跑到第 30000 次更新
+bash native_runner/training/v4/lab_ppo.sh status spar-week1         # 进度、最近对局的开局时间、检查点、剩余硬盘
+tail -f runs/spar-week1/logs/supervisor.log runs/spar-week1/logs/trainer.log
+bash native_runner/training/v4/lab_ppo.sh stop                      # 停止并清理
+bash native_runner/training/v4/lab_ppo.sh resume spar-week1         # 中断后从最新的检查点续训
+```
+
+- **启动前**会先清理上次残留的模拟器、worker、训练器和 `/dev/shm/firstlight-ppo-local-*`；**退出时**（训练结束、`stop`、出错）也会自动清理。只动自己账号下、名字是 `crppo_*` 的模拟器，不碰别人的。
+- **默认单卡**（GPU 0），CPU 按下表分配。第二块卡空着，可以在训练中途拿来评测。改用双卡：`CR_LAB_TRAIN_GPUS=0,1`；双卡之间通信出问题时再加 `NCCL_P2P_DISABLE=1`。
+- **训练参数**默认是第 6 节的对练配置，实际用的参数存在 `runs/名字/trainer-options.txt`，续训时会自动沿用。要换参数就设 `CR_PPO_EXTRA_ARGS`（会整体替换默认参数），并且换一个新名字开训。
+- **检查点**：每打完一批对局存一个完整检查点（约 48 MB，大约每 8 次更新一个）。脚本只保留最新 3 个，再加每 1000 次更新的第一个，一周大约 1–2 GB。对手池快照每 200 次更新一个。
+- 剩余硬盘不足 5 GB 时，`supervisor.log` 里会出现警告。
+
+### 手动启动（排查问题时用）
 
 单机没有 Slurm，设 `SLURM_JOB_ID=local` 就能通过脚本的检查。
 
@@ -160,10 +181,26 @@ python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --game
 
 - **做通用对练模型，不做专精。** 对练要什么卡组都能打、打法正常。
 - **训练时加入执行延迟。** 学习者和对手都加，延迟在 18–24 tick 之间随机。
-- **对手池**：自我对战 50%；固定对手（冻结的 General、速猪专精 2）30%；锚定对手 Active IL 20%。不用被动的 IL 当主要对手，避免模型靠欺负被动对手刷胜率。
-- **双卡训练**：`--gpus 2`，CPU 分配见第 3 节。
-- **对手池快照间隔**改成约 200 次更新一次。默认的每 8 次一次，几天就会把硬盘写满。
+- **对手**：自我对战 40%；固定对手 60%，从冻结的 General、Active IL、速猪专精 1 里均匀抽。原版 IL 占 0%（只作为锚点登记，不上场）。原版 IL 很被动，打它学到的是等对方犯错。
+- **开局要主动**（见下面的测试）：
+  - 圣水溢出惩罚 `--personal-elixir-overflow-penalty 0.01`，满格后多浪费 1 点就开始扣（`--personal-elixir-overflow-grace 1`）；
+  - gate 温度在前 3000 次更新里从 0.5 降到 0.2，让模型前期多尝试早出牌，最后回到默认值。
+- **单卡训练。** 实测双卡采集反而慢 20%（两个进程各管 4 个引擎，推理批更小，还要抢 4 个控制核），优化只快 1.5 秒，总时间更长。
+- **对手池快照间隔**改成 200 次更新一次。默认每 8 次一次，几天就会把硬盘写满。
 - **评测要看两件事**：一是双方都带延迟时，训练出的模型对 General 的胜率；二是每局出牌次数，以及第一张牌出得早不早。不只看胜率。
+
+### 开局等待问题（10 次更新的测试）
+
+General 习惯等到双倍圣水（约 120 秒）才出第一张牌，原作者在 `training_history.md` 里也记录过这个现象。下表是学习者第一次出牌时间的中位数：
+
+| 配置 | 自我对战 | 打固定对手 | 每局出牌 |
+| --- | --- | --- | --- |
+| 默认（100% 打原版 IL） | — | 172 s（打原版 IL） | 34 |
+| 换对手 + 溢出惩罚（`spar-test`） | 155 s | 121 s | 33–35 |
+| 再把 gate 温度提到 0.5（`spar-test2`） | 47 s | 29 s | 39–41 |
+
+- 默认的 gate 温度是 0.2，把「出牌还是等」的 logit 放大了 5 倍，开局几乎总是等。所以开局阶段的 entropy 是 0，模型从来没有尝试过早出牌。
+- 10 次更新几乎没让模型学到东西，上表的变化主要来自采样方式变了。真正要练到人类水平（开局 10–20 秒出牌），靠的是一周里溢出惩罚慢慢起作用。训练中用 `lab_ppo.sh status` 看开局时间是否在往前移；如果第 1–2 天没有进展，再考虑专门给「第一张牌」加奖励，或者用人类录像约束（`--expert-bc-manifest`）。
 
 ## 7. 待办（完整版）
 
@@ -181,16 +218,11 @@ python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --game
      ```
 
      看 3 次更新都能跑完，再看 `safety/rejected_actions` 有多少、每局出牌次数是否正常。
-2. **一键启动脚本**
-   - 一条命令在后台拉起引擎、worker、拓扑和训练器，日志写到文件；
-   - 使用双卡，并按第 3 节分配 CPU；
-   - `CR_PPO_EXTRA_ARGS` 透传训练器参数（对手池、快照间隔、延迟）；
-   - 启动前检查并清理上次残留的进程和 `/dev/shm` 目录，退出时（正常、Ctrl+C 或出错）自动清理；
-   - 预留 `NCCL_P2P_DISABLE` 开关；
-   - 中断后用 `CR_PPO_RESUME_CHECKPOINT` 续训。
+2. **一键启动脚本**（已完成）：`lab_ppo.sh`，用法见第 3 节。
 3. **对练专用的调整**
-   - 研究 `--expert-bc-manifest`：用人类录像约束打法，让它更像人；
+   - 对手配置和开局主动性（已完成，见第 6 节）；
+   - 训练中盯开局时间。如果不往前移，就给第一张牌加奖励，或者研究 `--expert-bc-manifest`（用人类录像约束打法，需要先建录像数据）；
    - 按常见流派调整重点卡组或它的占比，让卡组覆盖面更广。
 4. **可选优化**：让 12 个引擎共用 8 个核，引擎在等推理时 CPU 是空闲的，这样可能提高吞吐。
 
-流程：先在服务器上用 3 次更新做带延迟的冒烟测试，再正式跑一周；第 3 天和结束时各评测一次。
+流程：用 `lab_ppo.sh start` 正式跑一周；第 3 天和结束时各评测一次（双方都带延迟，对 General 的胜率，以及开局时间和每局出牌次数）。
