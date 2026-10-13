@@ -179,15 +179,18 @@ class _PolicyCudaGraphV4:
         state: RecurrentPolicyStateV4,
         episode_start: torch.Tensor,
     ) -> PolicyOutputV4:
-        if self.graph is None:
-            return self._capture(model, host_batch, state, episode_start)
-        if self.batch is None or self.state is None or self.episode_start is None or self.output is None:
-            raise RuntimeError("V4 CUDA Graph storage is incomplete")
-        _copy_tensor_record_(self.batch, _fixed_cuda_graph_batch_v4(host_batch))
-        _copy_tensor_record_(self.state, state)
-        self.episode_start.copy_(episode_start)
-        self.graph.replay()
-        return self.output
+        # Capture and replay use the current device's streams and memory pool: on cuda:1 with the
+        # process left on cuda:0 the capture fails, so make the graph's device current.
+        with torch.cuda.device(self.device):
+            if self.graph is None:
+                return self._capture(model, host_batch, state, episode_start)
+            if self.batch is None or self.state is None or self.episode_start is None or self.output is None:
+                raise RuntimeError("V4 CUDA Graph storage is incomplete")
+            _copy_tensor_record_(self.batch, _fixed_cuda_graph_batch_v4(host_batch))
+            _copy_tensor_record_(self.state, state)
+            self.episode_start.copy_(episode_start)
+            self.graph.replay()
+            return self.output
 
 
 _POLICY_CUDA_GRAPHS_V4: weakref.WeakKeyDictionary[UniversalCardPolicyV4, dict[str, _PolicyCudaGraphV4]] = (
