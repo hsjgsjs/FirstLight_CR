@@ -394,6 +394,11 @@ first = sorted(r["first_nonwait_action_tick"][o] / 20 for r, o in seats if r["fi
 q = lambda p: first[min(len(first) - 1, int(p * len(first)))]
 print(f"{len(rows)} finished games; last {len(recent)}: learner first play 10%/median/90% = "
       f"{q(.1):.0f}/{q(.5):.0f}/{q(.9):.0f}s, plays per game {statistics.mean(r['active_actions'][o] for r, o in seats):.1f}")
+# Whole-game elixir wasted at full, comparable to the replays' elixir_leaked (expert winners: median ~2.3).
+leaked = sorted(r["cumulative_elixir_overflow_wasted"][o] for r, o in seats if r.get("cumulative_elixir_overflow_wasted"))
+if leaked:
+    k = lambda p: leaked[min(len(leaked) - 1, int(p * len(leaked)))]
+    print(f"  learner elixir wasted per game 10%/median/90% = {k(.1):.1f}/{k(.5):.1f}/{k(.9):.1f}")
 # Win rate against each frozen opponent, earliest games versus latest; self-play is always about 50%.
 fixed = [r for r in rows if r["policy_matchup"] == "current-history" and r.get("opponent_checkpoint_id")]
 for opponent in sorted({r["opponent_checkpoint_id"] for r in fixed}, key=lambda value: names.get(value, value)):
