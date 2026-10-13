@@ -85,6 +85,8 @@ Confirm `production_ready`, then shut down the base AVD. Use the emulator’s `q
 qemu-img convert -O raw <userdata-source> <prepared-userdata.img>
 ```
 
+Android 12 and later encrypt userdata with a key stored in the AVD’s `encryptionkey.img`. Convert it the same way (from `encryptionkey.img.qcow2` when present) and set `CR_EMULATOR_ENCRYPTIONKEY` to the result; without it, each clone fails to decrypt the prepared data, formats `/data`, and its engines report `production_ready: false` with `content_assets_mapped: false`.
+
 Set `CR_EMULATOR_INITDATA` to this prepared image, `CR_SOURCE_AVD` / `CR_SOURCE_AVD_INI` to the matching base AVD, and `CR_TRAINING_APK` to the same signed APK. The prepared userdata must contain the matching application and content. Node launchers clone it for independent guests.
 
 ## 7. Distributed PPO
