@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -48,6 +49,21 @@ def pooled(output):
     }
 
 
+def shard_device(device):
+    """A shard's --device and environment: a cuda:N shard sees only GPU N (nvidia-smi numbering) as cuda.
+
+    This also overrides a CUDA_VISIBLE_DEVICES left in the calling shell, which would otherwise hide
+    the other GPU and make cuda:1 an invalid ordinal.
+    """
+
+    kind, _, number = device.partition(":")
+    if kind != "cuda" or not number:
+        return device, None
+    if not number.isdigit():
+        raise ValueError(f"invalid CUDA device: {device}")
+    return "cuda", {**os.environ, "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": number}
+
+
 def main(argv=None):
     # No prefix matching: the evaluator's own --device must pass through, not be read as --devices.
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
@@ -58,7 +74,10 @@ def main(argv=None):
     parser.add_argument(
         "--devices",
         type=lambda value: [item.strip() for item in value.split(",") if item.strip()],
-        help="spread shards round-robin over these devices, e.g. cuda:0,cuda:1 (overrides --device)",
+        help=(
+            "spread shards round-robin over these devices, e.g. cuda:0,cuda:1 (overrides --device); "
+            "GPU numbers follow nvidia-smi, and each shard sees only its own GPU"
+        ),
     )
     args, passthrough = parser.parse_known_args(argv)
     if args.devices and "--device" in passthrough:
@@ -75,11 +94,14 @@ def main(argv=None):
             sys.executable, "-m", "native_runner.training.v4.evaluate", *passthrough,
             "--port", str(port), "--games", str(games), "--seed", str(seed), "--output", str(shard),
         ]
+        environment = None
         if args.devices:
-            command += ["--device", args.devices[index % len(args.devices)]]
+            device, environment = shard_device(args.devices[index % len(args.devices)])
+            command += ["--device", device]
         shard.mkdir(parents=True, exist_ok=True)
         log = (shard / "evaluate.log").open("w", encoding="utf-8")
-        processes.append((port, subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT), log))
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=environment)
+        processes.append((port, process, log))
         seed += games
     failed = []
     for port, process, log in processes:
