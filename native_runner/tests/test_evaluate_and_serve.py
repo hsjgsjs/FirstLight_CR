@@ -159,3 +159,25 @@ def test_service_preserves_one_state_until_end_and_rejects_wrong_owner(monkeypat
     assert calls == ["new", "start", "act", "act", "end"]
     with pytest.raises(ValueError, match="start"):
         service.handle({"op": "act", "observation": obs})
+
+
+def test_parallel_evaluation_spreads_shards_over_devices(monkeypatch, tmp_path):
+    from native_runner.training.v4 import evaluate_parallel
+
+    commands = []
+
+    class Process:
+        def __init__(self, command, **kwargs):
+            commands.append(command)
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(evaluate_parallel.subprocess, "Popen", Process)
+    evaluate_parallel.main([
+        "--ports", "28000-28002", "--games", "6", "--output", str(tmp_path),
+        "--devices", "cuda:0,cuda:1", "--checkpoint-a", "a.pt", "--device", "cuda", "--sample",
+    ])
+    devices = [command[command.index("--device") + 1] for command in commands]
+    assert devices == ["cuda:0", "cuda:1", "cuda:0"]
+    assert all(command.count("--device") == 1 and "--sample" in command for command in commands)
