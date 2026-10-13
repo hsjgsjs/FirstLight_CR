@@ -176,3 +176,14 @@ def test_contract_refusals_name_the_missing_form() -> None:
     assert learn_contract_miss(play, capture, seen) and learn_contract_miss(ability, capture, seen)
     assert seen == {1: {5: 1, 6: 2}}
     assert not learn_contract_miss(play, capture, seen)  # already known: no endless rebuilds
+
+
+def test_live_play_samples_its_actions_unless_told_otherwise() -> None:
+    import inspect
+
+    from native_runner.live_match import LiveEpisode
+
+    # A greedy argmax of a decision every 0.25 s is nearly always "wait": sample like offline_agent.
+    assert inspect.signature(LiveEpisode).parameters["sample"].default is True
+    source = inspect.getsource(__import__("native_runner.live_play", fromlist=["play_battle"]).play_battle)
+    assert 'sample=not getattr(args, "deterministic", False)' in source

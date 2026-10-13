@@ -203,6 +203,7 @@ class LiveEpisode:
         *,
         device: str = "cpu",
         forms_seen: FormsSeen | None = None,
+        sample: bool = True,
     ) -> None:
         from .battle_env import BattleEnvV1
         from .rich_telemetry_adapter import RuntimeEffectCatalog
@@ -233,7 +234,9 @@ class LiveEpisode:
             },
         )
         native.floors = lambda: event_floors(self.env)
-        self.session = build_policy_session_v4(self.env, model, actor_owner=owner, device=device, sample=False)
+        # Sampled like offline_agent: a deterministic argmax of a per-0.25s decision is almost
+        # always "wait", so a greedy policy hardly ever plays a card.
+        self.session = build_policy_session_v4(self.env, model, actor_owner=owner, device=device, sample=sample)
         elixir = {o: next(p.elixir_exact for p in obs.players if p.owner == o) for o, obs in observations.items()}
         self.session.start_episode(observations[owner], initial_elixir=elixir)
         self.observation = observations[owner]

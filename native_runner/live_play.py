@@ -421,7 +421,10 @@ def play_battle(
     try:
         while True:
             try:
-                episode = LiveEpisode(native, model, seat, device=args.device, forms_seen=forms_seen)
+                episode = LiveEpisode(
+                    native, model, seat, device=args.device, forms_seen=forms_seen,
+                    sample=not getattr(args, "deterministic", False),
+                )
                 observe_forms({"ordinary": native.ordinary}, forms_seen)
                 log({"event": "contract", "tick": episode.observation.tick,
                      "forms": [list(episode.match.deck0_form_availability),
@@ -493,7 +496,7 @@ def replay(directory: Path, checkpoint: str, owner: int, *, full_rings: bool = F
     captures = [json.load(gzip.open(path, "rt", encoding="utf-8")) for path in sorted(directory.glob("sample-*.json.gz"))]
     if not captures:
         raise SystemExit(f"no sample-*.json.gz in {directory}")
-    args = argparse.Namespace(owner=owner, account_id=None, checkpoint=checkpoint, device="cpu")
+    args = argparse.Namespace(owner=owner, account_id=None, checkpoint=checkpoint, device="cpu", deterministic=True)
     summary = play_battle(
         load_policy_v4(checkpoint, device="cpu").model,
         args,
@@ -634,6 +637,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             command.add_argument("--device", default=None, help="cuda or cpu (default: cuda when available)")
             command.add_argument("--games", type=int, default=0, help="battles to play (0: until stopped)")
             command.add_argument("--dry-run", action="store_true", help="decide and log, but do not tap")
+            command.add_argument("--deterministic", action="store_true",
+                                 help="always take the most likely action (rarely plays; default samples)")
     args = parser.parse_args(None if argv is None else list(argv))
     if args.command == "shot":
         shot(args)
