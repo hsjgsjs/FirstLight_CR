@@ -161,23 +161,27 @@ def test_service_preserves_one_state_until_end_and_rejects_wrong_owner(monkeypat
         service.handle({"op": "act", "observation": obs})
 
 
-def test_parallel_evaluation_spreads_shards_over_devices(monkeypatch, tmp_path):
+def test_parallel_evaluation_gives_each_shard_one_gpu(monkeypatch, tmp_path):
     from native_runner.training.v4 import evaluate_parallel
 
-    commands = []
+    launched = []
 
     class Process:
-        def __init__(self, command, **kwargs):
-            commands.append(command)
+        def __init__(self, command, env=None, **kwargs):
+            launched.append((command, env))
 
         def wait(self):
             return 0
 
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")  # left over in the calling shell
     monkeypatch.setattr(evaluate_parallel.subprocess, "Popen", Process)
     evaluate_parallel.main([
         "--ports", "28000-28002", "--games", "6", "--output", str(tmp_path),
         "--devices", "cuda:0,cuda:1", "--checkpoint-a", "a.pt", "--device", "cuda", "--sample",
     ])
-    devices = [command[command.index("--device") + 1] for command in commands]
-    assert devices == ["cuda:0", "cuda:1", "cuda:0"]
-    assert all(command.count("--device") == 1 and "--sample" in command for command in commands)
+    assert [env["CUDA_VISIBLE_DEVICES"] for _command, env in launched] == ["0", "1", "0"]
+    assert all(env["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID" for _command, env in launched)
+    for command, _env in launched:
+        assert command.count("--device") == 1 and command[command.index("--device") + 1] == "cuda"
+        assert "--sample" in command
+    assert evaluate_parallel.shard_device("cpu") == ("cpu", None)

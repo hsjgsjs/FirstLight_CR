@@ -1223,23 +1223,6 @@ def test_sampled_cuda_graph_reproduces_under_a_seed_and_draws_fresh_numbers() ->
     assert len({tuple(d.candidate_uid.flatten().tolist()) + tuple(d.gate.flatten().tolist()) for d in draws}) > 1
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two GPUs required")
-@pytest.mark.parametrize("sample", (False, True))
-def test_policy_cuda_graph_runs_on_a_non_current_gpu(sample: bool) -> None:
-    device = torch.device("cuda:1")
-    torch.cuda.set_device(0)
-    torch.manual_seed(20261013)
-    model = _model().to(device).eval()
-    runner = _PolicyCudaGraphV4(device, sample=sample)
-    state = model.initial_state(1, device=device)
-    start = torch.tensor([True], dtype=torch.bool, device=device)
-    with torch.inference_mode():
-        for _ in range(2):
-            output = runner.run(model, _batch(batch_size=1), state, start)
-    torch.cuda.synchronize(device)
-    assert output.actions.gate.device == device and torch.cuda.current_device() == 0
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph required")
 def test_deterministic_cuda_graph_matches_eager_across_variable_sets() -> None:
     torch.manual_seed(20260819)
