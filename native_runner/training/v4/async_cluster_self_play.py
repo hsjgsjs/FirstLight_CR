@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 import math
 import os
+import random
 import signal
 import sys
 import time
@@ -640,6 +641,29 @@ class AsyncResidentEngineSpecV4:
     segment_decision_steps: int | None = None
     force_frozen_opponent_opening_after_seconds: int | None = None
     force_il_opponent_opening_after_seconds: int | None = None
+    execution_delay_ticks: tuple[int, int] | None = None
+
+
+_DELAYABLE_KINDS = frozenset({ActionKind.PLAY_CARD, ActionKind.ACTIVATE_ABILITY})
+
+
+def apply_execution_delay_v4(
+    actions: tuple[ActionV1, ...], bounds: tuple[int, int] | None, key: str
+) -> tuple[ActionV1, ...]:
+    """Land plays and abilities a sampled number of ticks after the decision, as taps do on a live client.
+
+    The delay replaces the model's own offset (live play ignores it too) and is drawn once per decision
+    from ``bounds`` (inclusive), seeded by ``key`` so a rerun of the same match replays the same delays.
+    BattleEnvV1 keeps the slot pending and its elixir reserved until the action lands.
+    """
+
+    if bounds is None or not any(action.kind in _DELAYABLE_KINDS for action in actions):
+        return actions
+    delay = random.Random(key).randint(*bounds)
+    return tuple(
+        replace(action, execute_offset_ticks=delay) if action.kind in _DELAYABLE_KINDS else action
+        for action in actions
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -894,6 +918,9 @@ def _engine_worker(
         raise ValueError("frozen-opponent opening timeout must be positive")
     if spec.force_il_opponent_opening_after_seconds is not None and spec.force_il_opponent_opening_after_seconds <= 0:
         raise ValueError("IL opening timeout must be positive")
+    delay_bounds = spec.execution_delay_ticks
+    if delay_bounds is not None and not 1 <= delay_bounds[0] <= delay_bounds[1] <= 0xFFFF:
+        raise ValueError("execution delay must be 1 <= min <= max <= 65535 ticks")
     validate_reward_parameters_v4(locals())
     segment_end_decision_steps = segment_decision_steps
     tensorize_seconds = 0.0
@@ -1115,6 +1142,11 @@ def _engine_worker(
                         ),
                     )
                     for micro, item in enumerate(decoded.actions)
+                )
+                identified = apply_execution_delay_v4(
+                    identified,
+                    spec.execution_delay_ticks,
+                    f"{runtime.assignment.matchup.sequence}-{owner}-{runtime.observations[0].tick}",
                 )
                 decoded_by_match[match_index][owner] = identified
                 submitted_by_match[match_index][owner] = {item.action_id for item in identified}

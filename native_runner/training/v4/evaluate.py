@@ -30,12 +30,13 @@ def evaluate(
     port=DEFAULT_PORT,
     device="cpu",
     sample=False,
+    delay_a_ticks=0,
     delay_b_ticks=0,
 ):
     if games < 1:
         raise ValueError("games must be positive")
-    if not 0 <= delay_b_ticks <= 0xFFFF:
-        raise ValueError("delay_b_ticks must be in [0, 65535]")
+    if not (0 <= delay_a_ticks <= 0xFFFF and 0 <= delay_b_ticks <= 0xFFFF):
+        raise ValueError("delay ticks must be in [0, 65535]")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if torch.device(device).type == "cuda" and torch.device(device).index is not None:
@@ -53,6 +54,7 @@ def evaluate(
     identity = {
         "games": games,
         "sample": sample,
+        "delay_a_ticks": delay_a_ticks,
         "delay_b_ticks": delay_b_ticks,
         "match": asdict(match),
         "checkpoints": [
@@ -114,11 +116,12 @@ def evaluate(
                         chosen = ()
                         if observation.tick >= FIRST_POLICY_DECISION_TICK:
                             chosen = session.decide(observation).decoded.actions
-                            if delay_b_ticks and owner != a_owner:
-                                # Model B's plays land this many ticks after the decision, as taps do on a
+                            delay = delay_a_ticks if owner == a_owner else delay_b_ticks
+                            if delay:
+                                # The model's plays land this many ticks after the decision, as taps do on a
                                 # live client; BattleEnvV1 keeps the slot pending and its elixir reserved.
                                 chosen = tuple(
-                                    replace(a, execute_offset_ticks=delay_b_ticks) if a.kind in _DELAYABLE else a
+                                    replace(a, execute_offset_ticks=delay) if a.kind in _DELAYABLE else a
                                     for a in chosen
                                 )
                             actions[owner] += sum(a.kind != ActionKind.WAIT for a in chosen)
@@ -180,6 +183,12 @@ def main(argv=None):
     parser.add_argument("--sample", action="store_true")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
+        "--delay-a-ticks",
+        type=int,
+        default=0,
+        help="execute model A's card plays and abilities this many ticks after its decision (a live tap lands ~21)",
+    )
+    parser.add_argument(
         "--delay-b-ticks",
         type=int,
         default=0,
@@ -201,6 +210,7 @@ def main(argv=None):
         port=args.port,
         device=args.device,
         sample=args.sample,
+        delay_a_ticks=args.delay_a_ticks,
         delay_b_ticks=args.delay_b_ticks,
     )
     return 0

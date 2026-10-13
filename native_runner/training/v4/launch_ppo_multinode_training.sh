@@ -17,6 +17,8 @@ resume_args=()
 if [[ -n $resume_checkpoint ]]; then
   resume_args=(--resume-checkpoint "$resume_checkpoint")
 fi
+# Further trainer options, split on whitespace, e.g. "--execution-delay-ticks 18-24 --snapshot-every 200".
+read -r -a extra_args <<< "${CR_PPO_EXTRA_ARGS:-}"
 
 readarray -t topology_values < <("$python" - "$topology" <<'PY'
 import json
@@ -75,4 +77,5 @@ exec "$python" -m torch.distributed.run \
   --lane-minibatch-size "${CR_PPO_LANE_MINIBATCH_SIZE:-384}" \
   --lane-microbatch-size "${CR_PPO_LANE_MICROBATCH_SIZE:-256}" \
   --sequence-chunk-steps "${CR_PPO_SEQUENCE_CHUNK_STEPS:-16}" \
-  --seed "${CR_PPO_SEED:-20260827}"
+  --seed "${CR_PPO_SEED:-20260827}" \
+  "${extra_args[@]}"
