@@ -96,7 +96,7 @@ Copy-Item .env.example .env
 
 ## 训练与评测
 
-使用 [IL_Replay](https://huggingface.co/datasets/VanguardX101/IL_Replay) 开始模仿学习，也可以先执行 `python tools/make_demo_data.py` 生成小规模流程样例。[训练指南](docs/training.md)覆盖缓存生成、IL、引擎集群、Linux AVD 准备及分布式 PPO。单机实验室服务器上的搭建记录、实测数据和延迟实验见[实验室训练记录](docs/lab_training_zh.md)。
+使用 [IL_Replay](https://huggingface.co/datasets/VanguardX101/IL_Replay) 开始模仿学习，也可以先执行 `python tools/make_demo_data.py` 生成小规模流程样例。[训练指南](docs/training.md)覆盖缓存生成、IL、引擎集群、Linux AVD 准备及分布式 PPO。单机实验室服务器上的搭建记录、实测数据和延迟实验见[实验室训练记录](docs/lab_training_zh.md)，把模型练成像人的陪练的过程见[陪练训练记录](docs/sparring_journey_zh.md)。
 
 比较两个随附模型时，先停止控制台任务，再执行：
 
