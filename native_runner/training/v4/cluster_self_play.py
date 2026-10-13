@@ -78,6 +78,7 @@ class _MatchRuntimeV4:
     active_actions: tuple[int, int] = (0, 0)
     first_nonwait_action_tick: tuple[int | None, int | None] = (None, None)
     first_successful_card_tick: tuple[int | None, int | None] = (None, None)
+    last_play_landing_tick: tuple[int | None, int | None] = (None, None)
     full_elixir_deferred_decision_ticks_before_first_card: tuple[int, int] = (0, 0)
     rejected_actions: tuple[int, int] = (0, 0)
     rejection_details: list[dict[str, object]] = field(default_factory=list)
