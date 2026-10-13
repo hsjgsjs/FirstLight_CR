@@ -21,7 +21,7 @@ import torch
 import torch.distributed as dist
 
 from ...match_factory import NATIVE_GAMEPLAY_END_TICK
-from .async_cluster_self_play import AsyncResidentEngineSpecV4, collect_async_cluster_wave_v4
+from .async_cluster_self_play import AsyncResidentEngineSpecV4, collect_async_cluster_wave_v4, parse_play_gap_ticks
 from .checkpoint import CHECKPOINT_SCHEMA_V4, load_actor_critic_checkpoint, save_actor_critic_checkpoint
 from .cluster_self_play import ClusterCollectionV4, ClusterMatchAssignmentV4
 from .deck_pool import DeckIdentityV4, DeckPoolManifestV4
@@ -902,6 +902,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--min-play-gap-ticks",
+        type=parse_play_gap_ticks,
+        help=(
+            "land each policy's consecutive card plays and abilities at least MIN-MAX ticks apart (drawn per "
+            "play; a tick is 50 ms, so 4-8 is 200-400 ms), as a human cannot tap two cards at once"
+        ),
+    )
+    parser.add_argument(
         "--il-opening-force-after-seconds",
         type=int,
         help=(
@@ -1383,6 +1391,8 @@ def main() -> int:
     # Likewise omitted when off so existing strict resumes keep matching.
     if game_elixir_overflow is not None:
         resume_contract["game_elixir_overflow"] = list(game_elixir_overflow)
+    if args.min_play_gap_ticks is not None:
+        resume_contract["min_play_gap_ticks"] = list(args.min_play_gap_ticks)
     # Omit the optional key when disabled to preserve old no-BC strict resumes.
     if expert_bc_contract is not None:
         resume_contract["expert_bc"] = expert_bc_contract
@@ -1470,6 +1480,7 @@ def main() -> int:
             force_il_opponent_opening_after_seconds=(args.il_opening_force_after_seconds),
             execution_delay_ticks=args.execution_delay_ticks,
             game_elixir_overflow=game_elixir_overflow,
+            min_play_gap_ticks=args.min_play_gap_ticks,
         )
         for engine_index in engine_indices
     )

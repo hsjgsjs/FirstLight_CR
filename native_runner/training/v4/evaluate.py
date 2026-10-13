@@ -12,6 +12,7 @@ from ...contracts import ActionKind, ActionV1
 from ...cr_native_env import DEFAULT_HOST, DEFAULT_PORT, NativeClashEnv
 from ...match_factory import MatchConfig
 from ...rich_telemetry_adapter import RuntimeEffectCatalog
+from .async_cluster_self_play import parse_play_gap_ticks, space_plays_v4
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .policy_session import build_policy_session_v4, load_policy_v4
@@ -32,6 +33,7 @@ def evaluate(
     sample=False,
     delay_a_ticks=0,
     delay_b_ticks=0,
+    min_play_gap_ticks=None,
 ):
     if games < 1:
         raise ValueError("games must be positive")
@@ -56,6 +58,7 @@ def evaluate(
         "sample": sample,
         "delay_a_ticks": delay_a_ticks,
         "delay_b_ticks": delay_b_ticks,
+        "min_play_gap_ticks": min_play_gap_ticks,
         "match": asdict(match),
         "checkpoints": [
             {"path": str(p.checkpoint_path), "sha256": p.checkpoint_sha256, "checkpoint_id": p.checkpoint_id}
@@ -107,6 +110,7 @@ def evaluate(
                 for owner, session in enumerate(sessions):
                     session.start_episode(observations[owner], initial_elixir=initial_elixir)
                 actions = [0, 0]
+                last_landing = [None, None]
                 rejected = set()
                 terminated = truncated = False
                 while not terminated and not truncated:
@@ -124,6 +128,13 @@ def evaluate(
                                     replace(a, execute_offset_ticks=delay) if a.kind in _DELAYABLE else a
                                     for a in chosen
                                 )
+                            chosen, last_landing[owner] = space_plays_v4(
+                                tuple(chosen),
+                                min_play_gap_ticks,
+                                f"{index}-{owner}-{observation.tick}",
+                                decision_tick=int(observation.tick),
+                                last_landing_tick=last_landing[owner],
+                            )
                             actions[owner] += sum(a.kind != ActionKind.WAIT for a in chosen)
                         else:
                             session.tensorizer.tensorize(observation, validate=False)
@@ -194,6 +205,11 @@ def main(argv=None):
         default=0,
         help="execute model B's card plays and abilities this many ticks after its decision (a live tap lands ~21)",
     )
+    parser.add_argument(
+        "--min-play-gap-ticks",
+        type=parse_play_gap_ticks,
+        help="land each side's consecutive plays and abilities at least MIN-MAX ticks apart (4-8 = 200-400 ms)",
+    )
     args = parser.parse_args(argv)
     config = json.loads(args.match_config.read_text(encoding="utf-8")) if args.match_config else {}
     for key in ("owner0_account_id", "owner1_account_id"):
@@ -212,6 +228,7 @@ def main(argv=None):
         sample=args.sample,
         delay_a_ticks=args.delay_a_ticks,
         delay_b_ticks=args.delay_b_ticks,
+        min_play_gap_ticks=args.min_play_gap_ticks,
     )
     return 0
 

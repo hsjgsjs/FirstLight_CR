@@ -58,7 +58,7 @@ export CR_PPO_ENGINES_PER_GUEST=${CR_PPO_ENGINES_PER_GUEST:-4}
 default_extra_args() {
   # The path to Active IL contains a space, and the trainer options are split on whitespace.
   ln -sfn "$repository_root/checkpoints/active IL/checkpoint-step-00000030.pt" "$runs/active-il.pt"
-  echo "--execution-delay-ticks 18-24 --self-play-percent 40 --fixed-opponent-percent 60" \
+  echo "--execution-delay-ticks 18-24 --min-play-gap-ticks 4-8 --self-play-percent 40 --fixed-opponent-percent 60" \
     "--fixed-opponent-checkpoint checkpoints/General/checkpoint-step-00000460.pt" \
     "--fixed-opponent-checkpoint $runs/active-il.pt" \
     "--fixed-opponent-checkpoint checkpoints/2_6hog_expert/hog26-specialist1.pt" \

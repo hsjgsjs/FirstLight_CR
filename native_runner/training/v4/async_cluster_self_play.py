@@ -646,6 +646,8 @@ class AsyncResidentEngineSpecV4:
     force_frozen_opponent_opening_after_seconds: int | None = None
     force_il_opponent_opening_after_seconds: int | None = None
     execution_delay_ticks: tuple[int, int] | None = None
+    # Minimum ticks, drawn from (min, max), between an owner's consecutive plays and abilities landing.
+    min_play_gap_ticks: tuple[int, int] | None = None
     # (coefficient per elixir, grace elixir) for elixir wasted at full over the whole game after the
     # owner's first executed card; None disables it.  Opening waits before the first card are free.
     game_elixir_overflow: tuple[float, float] | None = None
@@ -692,6 +694,47 @@ def apply_execution_delay_v4(
         replace(action, execute_offset_ticks=delay) if action.kind in _DELAYABLE_KINDS else action
         for action in actions
     )
+
+
+def space_plays_v4(
+    actions: tuple[ActionV1, ...],
+    gap_bounds: tuple[int, int] | None,
+    key: str,
+    *,
+    decision_tick: int,
+    last_landing_tick: int | None,
+) -> tuple[tuple[ActionV1, ...], int | None]:
+    """Push each play or ability to land a sampled gap after the owner's previous one, as a human cannot tap
+    two cards at once: a second card in the same decision, or one whose delay lands it right after the last.
+
+    Gaps are drawn per action from ``gap_bounds`` (inclusive), seeded by ``key``. Returns the actions and the
+    owner's new last landing tick; plays already far enough apart keep their offsets.
+    """
+
+    if gap_bounds is None or not any(action.kind in _DELAYABLE_KINDS for action in actions):
+        return actions, last_landing_tick
+    rng = random.Random(f"gap-{key}")
+    spaced = []
+    for action in actions:
+        if action.kind in _DELAYABLE_KINDS:
+            landing = decision_tick + action.execute_offset_ticks
+            if last_landing_tick is not None:
+                landing = max(landing, last_landing_tick + rng.randint(*gap_bounds))
+            action = replace(action, execute_offset_ticks=landing - decision_tick)
+            last_landing_tick = landing
+        spaced.append(action)
+    return tuple(spaced), last_landing_tick
+
+
+def parse_play_gap_ticks(value: str) -> tuple[int, int]:
+    low, _, high = value.strip().partition("-")
+    try:
+        bounds = (int(low), int(high or low))
+    except ValueError:
+        raise ValueError("play gap must be N or MIN-MAX ticks, e.g. 4-8") from None
+    if not 1 <= bounds[0] <= bounds[1] <= 200:
+        raise ValueError("play gap must be 1 <= MIN <= MAX <= 200 ticks")
+    return bounds
 
 
 @dataclass(frozen=True, slots=True)
@@ -949,6 +992,9 @@ def _engine_worker(
     delay_bounds = spec.execution_delay_ticks
     if delay_bounds is not None and not 1 <= delay_bounds[0] <= delay_bounds[1] <= 0xFFFF:
         raise ValueError("execution delay must be 1 <= min <= max <= 65535 ticks")
+    gap_bounds = spec.min_play_gap_ticks
+    if gap_bounds is not None and not 1 <= gap_bounds[0] <= gap_bounds[1] <= 200:
+        raise ValueError("minimum play gap must be 1 <= min <= max <= 200 ticks")
     game_overflow = spec.game_elixir_overflow
     if game_overflow is not None and not (
         all(math.isfinite(value) and value >= 0.0 for value in game_overflow) and game_overflow[0] > 0.0
@@ -1181,6 +1227,15 @@ def _engine_worker(
                     spec.execution_delay_ticks,
                     f"{runtime.assignment.matchup.sequence}-{owner}-{runtime.observations[0].tick}",
                 )
+                last_landing = list(runtime.last_play_landing_tick)
+                identified, last_landing[owner] = space_plays_v4(
+                    identified,
+                    spec.min_play_gap_ticks,
+                    f"{runtime.assignment.matchup.sequence}-{owner}-{runtime.observations[0].tick}",
+                    decision_tick=int(runtime.observations[0].tick),
+                    last_landing_tick=last_landing[owner],
+                )
+                runtime.last_play_landing_tick = (last_landing[0], last_landing[1])
                 decoded_by_match[match_index][owner] = identified
                 submitted_by_match[match_index][owner] = {item.action_id for item in identified}
                 action_tick = int(runtime.observations[0].tick)
