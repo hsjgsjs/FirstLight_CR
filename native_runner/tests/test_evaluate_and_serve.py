@@ -59,6 +59,70 @@ def test_evaluation_counts_complete_matches_and_alternates_models(monkeypatch, t
     assert len(ended) == 6
 
 
+def test_evaluation_delays_only_model_b_plays(monkeypatch, tmp_path):
+    terminal = NS(winner=0, to_dict=lambda: {"winner": 0, "ended": True})
+    observations = {
+        owner: NS(tick=100, owner=owner, players=[NS(owner=owner, elixir_exact=5.0)], events=[], terminal=terminal)
+        for owner in (0, 1)
+    }
+    sent = []
+
+    class Environment:
+        def __init__(self, **kwargs):
+            pass
+
+        def reset(self, *, match_config, options):
+            return observations, {}
+
+        def step(self, commands, **kwargs):
+            sent.append(commands)
+            return observations, {}, {"__all__": True}, {"__all__": False}, {}
+
+    def session(environment, model, *, actor_owner, **kwargs):
+        plays = (ActionV1.play(actor_owner, 0, (3, 20), execute_offset_ticks=1), ActionV1.wait(actor_owner, ticks=5))
+        return NS(start_episode=lambda *a, **k: None, decide=lambda o: NS(decoded=NS(actions=plays)),
+                  end_episode=lambda: None)
+
+    monkeypatch.setattr(
+        evaluate,
+        "load_policy_v4",
+        lambda path, **k: NS(model=path, checkpoint_path=Path(path), checkpoint_sha256="hash", checkpoint_id=path),
+    )
+    monkeypatch.setattr(
+        evaluate,
+        "production_semantic_bundle",
+        lambda: NS(native_card_catalog=None, semantic_subset_contract=None, native_effect_catalog=None),
+    )
+    monkeypatch.setattr(evaluate.RuntimeEffectCatalog, "from_catalog", lambda c: None)
+    monkeypatch.setattr(evaluate, "NativeClashEnv", lambda *a, **k: NS(close_transport=lambda: None))
+    monkeypatch.setattr(evaluate, "BattleEnvV1", Environment)
+    monkeypatch.setattr(evaluate, "build_policy_session_v4", session)
+    evaluate.evaluate("a.pt", "b.pt", games=2, match=MatchConfig(seed=7), output=tmp_path, delay_b_ticks=21)
+    # Game 1: A is owner 0; game 2: A is owner 1. Only B's play is delayed; waits are untouched.
+    offsets = [{owner: [a.execute_offset_ticks for a in actions] for owner, actions in step.items()} for step in sent]
+    assert offsets == [{0: [1, 0], 1: [21, 0]}, {0: [21, 0], 1: [1, 0]}]
+
+
+def test_parallel_evaluation_splits_even_games_and_pools_results(tmp_path):
+    from native_runner.training.v4.evaluate_parallel import parse_ports, pooled, split_games
+
+    assert parse_ports("28000-28002,28005") == [28000, 28001, 28002, 28005]
+    assert split_games(10, 8) == [2, 2, 2, 2, 2]
+    assert split_games(11, 4) == [4, 3, 2, 2] and sum(split_games(100, 8)) == 100
+    for index, rows in enumerate(([(0, "a", [10, 4])], [(1, "b", [6, 12]), (0, None, [5, 5])])):
+        shard = tmp_path / f"shard-{index:02d}"
+        shard.mkdir()
+        shard.joinpath("matches.jsonl").write_text("".join(
+            '{"a_owner": %d, "winner": %s, "terminated": true, "truncated": false, "actions_by_owner": %s, '
+            '"rejected_actions": 0}\n' % (a_owner, "null" if winner is None else f'"{winner}"', actions)
+            for a_owner, winner, actions in rows
+        ))
+    summary = pooled(tmp_path)
+    assert (summary["a_wins"], summary["b_wins"], summary["draws"]) == (1, 1, 1)
+    assert summary["a_actions_per_game"] == round((10 + 12 + 5) / 3, 1)
+    assert summary["b_actions_per_game"] == round((4 + 6 + 5) / 3, 1)
+
+
 def test_service_preserves_one_state_until_end_and_rejects_wrong_owner(monkeypatch):
     from native_runner.training.v4.expert import FIRST_POLICY_DECISION_TICK
 
