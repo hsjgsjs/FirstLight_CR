@@ -46,9 +46,9 @@ The evaluator alternates sides and moves each model’s assigned deck with it. K
 
 评测器逐局交换上下方，卡组随对应模型一起交换。比较不同模型时，保持卡组、形态、塔兵、等级、起始种子和解码方式一致。评测速猪专精模型时，显式配置速猪卡组。
 
-`--delay-b-ticks N` makes model B's card plays and abilities execute N ticks after its decision, as a tap does on a live client (about 21), to measure how much that latency costs. To spread games over several idle engines, run `python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --games N --output DIR` with the same evaluator options; it writes one `shard-*` directory per engine and a pooled `summary.json` that also reports each model's average card plays per game.
+`--delay-b-ticks N` makes model B's card plays and abilities execute N ticks after its decision, as a tap does on a live client (about 21), to measure how much that latency costs. To spread games over several idle engines, run `python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --games N --output DIR` with the same evaluator options (`--devices cuda:0,cuda:1` spreads the shards over two GPUs); it writes one `shard-*` directory per engine and a pooled `summary.json` that also reports each model's average card plays per game.
 
-`--delay-b-ticks N` 让模型 B 的下牌和技能在决策后 N tick 才生效，模拟实战中点击的延迟（约 21 tick），用来衡量这段延迟的影响。要在多个空闲引擎上并行评测，运行 `python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --games N --output DIR`，其余评测参数照常传入；每个引擎写一个 `shard-*` 目录，汇总结果写在 `summary.json`，其中还有双方每局平均下牌次数。
+`--delay-b-ticks N` 让模型 B 的下牌和技能在决策后 N tick 才生效，模拟实战中点击的延迟（约 21 tick），用来衡量这段延迟的影响。要在多个空闲引擎上并行评测，运行 `python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --games N --output DIR`，其余评测参数照常传入（`--devices cuda:0,cuda:1` 把各个引擎的评测轮流分到两块 GPU 上）；每个引擎写一个 `shard-*` 目录，汇总结果写在 `summary.json`，其中还有双方每局平均下牌次数。
 
 | Output / 输出 | Contents / 内容 |
 | --- | --- |

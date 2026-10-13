@@ -49,12 +49,21 @@ def pooled(output):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    # No prefix matching: the evaluator's own --device must pass through, not be read as --devices.
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--ports", type=parse_ports, required=True, help="engine control ports, e.g. 28000-28007")
     parser.add_argument("--games", type=int, required=True)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--devices",
+        type=lambda value: [item.strip() for item in value.split(",") if item.strip()],
+        help="spread shards round-robin over these devices, e.g. cuda:0,cuda:1 (overrides --device)",
+    )
     args, passthrough = parser.parse_known_args(argv)
+    if args.devices and "--device" in passthrough:
+        index = passthrough.index("--device")
+        del passthrough[index:index + 2]
     if args.games < 1:
         parser.error("--games must be positive")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -66,6 +75,8 @@ def main(argv=None):
             sys.executable, "-m", "native_runner.training.v4.evaluate", *passthrough,
             "--port", str(port), "--games", str(games), "--seed", str(seed), "--output", str(shard),
         ]
+        if args.devices:
+            command += ["--device", args.devices[index % len(args.devices)]]
         shard.mkdir(parents=True, exist_ok=True)
         log = (shard / "evaluate.log").open("w", encoding="utf-8")
         processes.append((port, subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT), log))
