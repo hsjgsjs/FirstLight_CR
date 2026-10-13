@@ -243,15 +243,30 @@ for line in lines:
     print(f"update {m['update']}: {m['end_to_end_seconds']:.1f}s  frames/s {m['end_to_end_owner_frames_per_second']:.0f}  "
           f"entropy {m.get('entropy', float('nan')):.3f}  rejected {m['native_rejected_actions']}")
 PY
-      "$python" - "$stage/matches.jsonl" 2>/dev/null <<'PY' || echo "no finished games yet"
+      "$python" - "$run_dir" 2>/dev/null <<'PY' || echo "no finished games yet"
 import json, statistics, sys
-rows = [json.loads(line) for line in open(sys.argv[1]).read().splitlines()[-256:]]
-seats = [(r, o) for r in rows for o in r["current_owners"]]
+from pathlib import Path
+stages = sorted(Path(sys.argv[1]).glob("train-*"))
+rows = [json.loads(line) for stage in stages if (stage / "matches.jsonl").exists()
+        for line in (stage / "matches.jsonl").read_text().splitlines()]
+names = {}
+for stage in stages:
+    if (stage / "league.json").exists():
+        for entry in json.loads((stage / "league.json").read_text())["entries"]:
+            names[entry["checkpoint_id"]] = Path(entry["checkpoint_path"]).stem
+recent = rows[-256:]
+seats = [(r, o) for r in recent for o in r["current_owners"]]
 first = sorted(r["first_nonwait_action_tick"][o] / 20 for r, o in seats if r["first_nonwait_action_tick"][o] is not None)
-if first:
-    q = lambda p: first[min(len(first) - 1, int(p * len(first)))]
-    print(f"last {len(rows)} games: learner first play 10%/median/90% = {q(.1):.0f}/{q(.5):.0f}/{q(.9):.0f}s, "
-          f"plays per game {statistics.mean(r['active_actions'][o] for r, o in seats):.1f}")
+q = lambda p: first[min(len(first) - 1, int(p * len(first)))]
+print(f"{len(rows)} finished games; last {len(recent)}: learner first play 10%/median/90% = "
+      f"{q(.1):.0f}/{q(.5):.0f}/{q(.9):.0f}s, plays per game {statistics.mean(r['active_actions'][o] for r, o in seats):.1f}")
+# Win rate against each frozen opponent, earliest games versus latest; self-play is always about 50%.
+fixed = [r for r in rows if r["policy_matchup"] == "current-history" and r.get("opponent_checkpoint_id")]
+for opponent in sorted({r["opponent_checkpoint_id"] for r in fixed}, key=lambda value: names.get(value, value)):
+    games = [r["result"][r["current_owners"][0]] for r in fixed if r["opponent_checkpoint_id"] == opponent]
+    rate = lambda part: f"{100 * sum(value > 0 for value in part) / len(part):.0f}% of {len(part)}" if part else "-"
+    window = min(300, len(games) // 2)
+    print(f"  vs {names.get(opponent, opponent[:12]):32s} win rate: first {rate(games[:window])}  latest {rate(games[-window:] if window else games)}")
 PY
       echo "checkpoints: $(find "$run_dir" -path '*/train-*/checkpoints/update-*.pt' 2>/dev/null | wc -l), newest $(newest_checkpoint "$run_dir")"
     fi
