@@ -6,7 +6,11 @@
 #   lab_ppo.sh resume NAME [UPDATES]  continue runs/NAME from its newest strict checkpoint
 #   lab_ppo.sh status [NAME]          processes, latest metrics, checkpoints and free disk
 #   lab_ppo.sh load [NAME]            live CPU (per core group) and GPU use, and where updates spend time
-#   lab_ppo.sh stop                   stop the run and clean up engines, workers and /dev/shm
+#   lab_ppo.sh stop [NAME MINUTES]    stop the run and clean up engines, workers and /dev/shm; with NAME and
+#                                     MINUTES, first wait up to MINUTES for the next strict checkpoint
+#   lab_ppo.sh schedule NAME HH:MM HH:MM   every day, resume NAME at the first time and stop it by the second
+#                                     (waiting for a checkpoint from 12 minutes before); replaces any schedule
+#   lab_ppo.sh unschedule             remove the daily schedule
 #
 # UPDATES is the total update count to stop at (default 30000, more than a week). The trainer options
 # default to the sparring configuration in docs/lab_training_zh.md and CR_PPO_EXTRA_ARGS replaces them;
@@ -15,7 +19,16 @@
 # (0; nvidia-smi numbers, e.g. 0,1), CR_LAB_KEEP_CHECKPOINTS (3) and CR_LAB_CHECKPOINT_BUCKET (1000):
 # the newest few strict checkpoints are kept plus the first one in every bucket of that many updates.
 # NCCL_P2P_DISABLE, CR_PPO_INFERENCE_BATCH_WAIT_MS and other environment variables pass through to the trainer.
+# A start saves these launch settings to runs/NAME/launch-env and a resume restores them, unless the same
+# variable is given on the resume command line.
 set -euo pipefail
+
+launch_vars=(CR_PPO_ENGINE_COUNT CR_LAB_ENGINE_CPUS CR_LAB_WORKER_CPUS CR_LAB_CONTROL_CPUS CR_LAB_TRAIN_GPUS
+  CR_PPO_INFERENCE_BATCH_WAIT_MS CR_PPO_SEGMENT_SECONDS CR_PPO_LANE_MICROBATCH_SIZE NCCL_P2P_DISABLE)
+explicit_vars=" "
+for variable in "${launch_vars[@]}"; do
+  [[ ! -v $variable ]] || explicit_vars+="$variable "
+done
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repository_root=$(cd -- "$script_dir/../../.." && pwd)
@@ -194,6 +207,32 @@ run() {
   exit "$status"
 }
 
+save_launch_env() {
+  local variable
+  for variable in "${launch_vars[@]}"; do
+    [[ ! -v $variable ]] || echo "$variable=${!variable}"
+  done >"$1/launch-env"
+}
+
+load_launch_env() {
+  local key value
+  [[ -f $1/launch-env ]] || return 0
+  while IFS='=' read -r key value; do
+    [[ $explicit_vars == *" $key "* ]] || export "$key=$value"
+  done <"$1/launch-env"
+}
+
+# Wait up to $2 minutes for a strict checkpoint newer than the current one in runs/$1.
+wait_for_checkpoint() {
+  local before deadline=$((SECONDS + $2 * 60))
+  before=$(newest_checkpoint "$runs/$1")
+  while ((SECONDS < deadline)) && [[ -n $(supervisor_pids) ]]; do
+    [[ $(newest_checkpoint "$runs/$1") == "$before" ]] || { log "new checkpoint $(newest_checkpoint "$runs/$1")"; return; }
+    sleep 15
+  done
+  log "no new checkpoint within $2 minutes; stopping anyway"
+}
+
 start() {
   local name=${1:?usage: lab_ppo.sh start|resume NAME [UPDATES]} updates=${2:-30000} resume=${3:-}
   if [[ -n $(supervisor_pids) ]]; then
@@ -202,6 +241,7 @@ start() {
   fi
   local run_dir=$runs/$name
   mkdir -p "$run_dir/logs"
+  save_launch_env "$run_dir"
   setsid nohup bash "$script_dir/lab_ppo.sh" _run "$run_dir" "$updates" "$resume" \
     >>"$run_dir/logs/supervisor.log" 2>&1 </dev/null &
   echo "started run $name in the background (supervisor pid $!)"
@@ -227,9 +267,14 @@ case ${1:-} in
       exit 1
     fi
     echo "resuming from $checkpoint"
+    load_launch_env "$runs/$1"
     start "$1" "${2:-30000}" "$checkpoint"
     ;;
   stop)
+    if [[ -n ${3:-} ]]; then
+      log "waiting up to $3 minutes for the next checkpoint of $2"
+      wait_for_checkpoint "$2" "$3"
+    fi
     pids=$(supervisor_pids)
     if [[ -n $pids ]]; then
       kill -TERM $pids
@@ -240,6 +285,29 @@ case ${1:-} in
     fi
     cleanup
     echo "stopped; remaining processes: $(pgrep -u "$user" -fc -- "-avd crppo_|remote_ppo_worker_server|train_ppo_self_play_cluster" || true)"
+    ;;
+  schedule)
+    name=${2:?usage: lab_ppo.sh schedule NAME HH:MM HH:MM} begin=${3:?start time HH:MM} end=${4:?stop time HH:MM}
+    [[ $begin =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || { echo "bad start time $begin" >&2; exit 2; }
+    begin_minute=$((10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]}))
+    [[ $end =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]] || { echo "bad stop time $end" >&2; exit 2; }
+    end_minute=$((10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]}))
+    drain_minute=$(((end_minute - 12 + 1440) % 1440))
+    command -v crontab >/dev/null || { echo "crontab is not installed" >&2; exit 1; }
+    script=$script_dir/lab_ppo.sh
+    log_file=$runs/schedule.log
+    {
+      { crontab -l 2>/dev/null || true; } | grep -v "# lab_ppo schedule" || true
+      echo "$((begin_minute % 60)) $((begin_minute / 60)) * * * bash $script resume $name >>$log_file 2>&1 # lab_ppo schedule"
+      echo "$((drain_minute % 60)) $((drain_minute / 60)) * * * bash $script stop $name 11 >>$log_file 2>&1 # lab_ppo schedule"
+      echo "$((end_minute % 60)) $((end_minute / 60)) * * * bash $script stop >>$log_file 2>&1 # lab_ppo schedule"
+    } | crontab -
+    echo "scheduled $name daily: resume at $begin, stop by $end (log: $log_file)"
+    crontab -l | grep "# lab_ppo schedule"
+    ;;
+  unschedule)
+    { crontab -l 2>/dev/null || true; } | { grep -v "# lab_ppo schedule" || true; } | crontab -
+    echo "daily schedule removed"
     ;;
   status)
     echo "supervisor: $(supervisor_pids | tr '\n' ' ')"
