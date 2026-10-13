@@ -38,6 +38,8 @@ def evaluate(
         raise ValueError("delay_b_ticks must be in [0, 65535]")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    if torch.device(device).type == "cuda" and torch.device(device).index is not None:
+        torch.cuda.set_device(torch.device(device))
     policies = [load_policy_v4(path, device=device) for path in (checkpoint_a, checkpoint_b)]
     bundle = production_semantic_bundle()
     native = NativeClashEnv(host, port, timeout=30.0)
