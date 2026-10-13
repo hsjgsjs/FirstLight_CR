@@ -87,3 +87,16 @@ def test_main_writes_selected_rows(tmp_path):
     lines = [json.loads(line) for line in (out / "selection.jsonl").read_text().splitlines()]
     assert written.num_rows == 4 and [line["replay_tag"] for line in lines] == written["replay_tag"].to_pylist()
     assert json.loads((out / "summary.json").read_text())["selected_replays"] == 4
+
+
+def test_top_decks_limit_winners_and_close_loss_sides():
+    candidates = [fake(f"a{i}", "1-0", deck=("pop",)) for i in range(5)]
+    candidates += [fake(f"b{i}", "1-0", deck=("rare",)) for i in range(2)]
+    candidates += [fake("c", "1-0", leak=9.0, deck=("leaky",)) for _ in range(9)]
+    decks = sel.top_decks(candidates, cutoff=5.0, count=1)
+    assert decks == frozenset({("pop",)})
+    chosen = sel.select(candidates, target=10, deck_cap=100, cutoff=5.0, decks=decks)
+    assert len(chosen) == 5 and {c["deck"] for c in chosen} == {("pop",)}
+    item = fake("d", "1-0") | {"loser_deck": ("rare",)}
+    assert len(sel.learn_sides(item, 5.0, decks)["learn"]) == 1
+    assert len(sel.learn_sides(item | {"loser_deck": ("pop",)}, 5.0, decks)["learn"]) == 2
