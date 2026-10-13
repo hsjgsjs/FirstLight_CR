@@ -124,8 +124,13 @@ for value in values:
     print(value)
 PY
 )
-if ((cpu_offset + engine_count > ${#allocated_cpus[@]})); then
-  echo "CPU offset $cpu_offset plus $engine_count engines exceeds ${#allocated_cpus[@]} CPUs" >&2
+# CR_PPO_ENGINE_CPU_SHARING=1 lets guests time-share the allocated CPUs (pools wrap around them) when there
+# are more engines than CPUs; each guest still gets one vCPU per engine.
+cpu_sharing=${CR_PPO_ENGINE_CPU_SHARING:-0}
+shared_cpus=$((${#allocated_cpus[@]} - cpu_offset))
+if ((cpu_offset + engine_count > ${#allocated_cpus[@]})) && [[ $cpu_sharing != 1 || $shared_cpus -lt $max_guest_engines ]]; then
+  echo "CPU offset $cpu_offset plus $engine_count engines exceeds ${#allocated_cpus[@]} CPUs" \
+    "(set CR_PPO_ENGINE_CPU_SHARING=1 to share CPUs between guests)" >&2
   exit 94
 fi
 
@@ -133,7 +138,15 @@ engine_cpu_pools=()
 cpu_cursor=0
 for ((guest=0; guest<guest_count; guest++)); do
   count=${guest_engines[$guest]}
-  pool=$(IFS=,; echo "${allocated_cpus[*]:cpu_offset+cpu_cursor:count}")
+  if ((cpu_offset + engine_count > ${#allocated_cpus[@]})); then
+    members=()
+    for ((slot=0; slot<count; slot++)); do
+      members+=("${allocated_cpus[cpu_offset + (cpu_cursor + slot) % shared_cpus]}")
+    done
+    pool=$(IFS=,; echo "${members[*]}")
+  else
+    pool=$(IFS=,; echo "${allocated_cpus[*]:cpu_offset+cpu_cursor:count}")
+  fi
   engine_cpu_pools+=("$pool")
   cpu_cursor=$((cpu_cursor + count))
 done
@@ -143,6 +156,7 @@ if [[ $cpu_cursor -ne $engine_count ]]; then
 fi
 control_cpus=$(
   selected_end=$((cpu_offset + engine_count))
+  ((selected_end <= ${#allocated_cpus[@]})) || selected_end=${#allocated_cpus[@]}
   values=("${allocated_cpus[@]:0:cpu_offset}" "${allocated_cpus[@]:selected_end}")
   IFS=,
   echo "${values[*]}"
