@@ -277,7 +277,11 @@ print(f"{len(rows)} finished games; last {len(recent)}: learner first play 10%/m
 fixed = [r for r in rows if r["policy_matchup"] == "current-history" and r.get("opponent_checkpoint_id")]
 for opponent in sorted({r["opponent_checkpoint_id"] for r in fixed}, key=lambda value: names.get(value, value)):
     games = [r["result"][r["current_owners"][0]] for r in fixed if r["opponent_checkpoint_id"] == opponent]
-    rate = lambda part: f"{100 * sum(value > 0 for value in part) / len(part):.0f}% of {len(part)}" if part else "-"
+    # Draws (result 0) are neither wins nor losses; show them so they don't read as losses.
+    rate = lambda part: (
+        f"{100 * sum(value > 0 for value in part) / len(part):.0f}% win "
+        f"{100 * sum(value == 0 for value in part) / len(part):.0f}% draw of {len(part)}"
+    ) if part else "-"
     window = min(300, len(games) // 2)
     print(f"  vs {names.get(opponent, opponent[:12]):32s} win rate: first {rate(games[:window])}  latest {rate(games[-window:] if window else games)}")
 PY
