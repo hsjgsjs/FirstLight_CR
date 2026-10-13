@@ -16,7 +16,7 @@ from native_runner.training.v4.checkpoint import load_actor_critic_checkpoint, s
 from native_runner.training.v4.dataset import screen_replay_payload
 from native_runner.training.v4.train_imitation_cache import _DistributedImitationModule
 from native_runner.training.v4.components import SpatialScatterEncoder
-from native_runner.training.v4.policy_session import _DeterministicCudaGraphV4
+from native_runner.training.v4.policy_session import _PolicyCudaGraphV4
 from native_runner.training.v4.distributed_ppo import (
     _balanced_lane_permutation,
     distributed_ppo_update_v4,
@@ -1184,6 +1184,45 @@ def test_spatial_scatter_autocast_keeps_scatter_dtype(dtype: torch.dtype) -> Non
     assert torch.isfinite(result).all()
 
 
+def test_policy_sessions_keep_separate_argmax_and_sampled_cuda_graphs() -> None:
+    from native_runner.training.v4.policy_session import PolicySessionV4
+
+    class Model:
+        pass
+
+    model = Model()
+    greedy = PolicySessionV4(model, object(), device="cuda", sample=False)
+    sampled = PolicySessionV4(model, object(), device="cuda", sample=True)
+    again = PolicySessionV4(model, object(), device="cuda", sample=True)
+    assert greedy._cuda_graph is not None and not greedy._cuda_graph.sample
+    assert sampled._cuda_graph is again._cuda_graph and sampled._cuda_graph.sample
+    assert PolicySessionV4(model, object(), device="cuda", sample=True, validate_tensors=True)._cuda_graph is None
+    assert PolicySessionV4(model, object(), device="cpu", sample=True)._cuda_graph is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph required")
+def test_sampled_cuda_graph_reproduces_under_a_seed_and_draws_fresh_numbers() -> None:
+    device = torch.device("cuda")
+    torch.manual_seed(20261013)
+    model = _model().to(device).eval()
+    batch = _batch(batch_size=1)
+    state = model.initial_state(1, device=device)
+    start = torch.tensor([True], dtype=torch.bool, device=device)
+    runner = _PolicyCudaGraphV4(device, sample=True)
+
+    def draw(seed: int):
+        torch.manual_seed(seed)
+        output = runner.run(model, batch, state, start)
+        torch.cuda.synchronize(device)
+        return _clone_tensor_tree(output.actions)
+
+    with torch.inference_mode():
+        runner.run(model, batch, state, start)
+        _assert_tensor_tree_equal(draw(7), draw(7))
+        draws = [draw(seed) for seed in range(40)]
+    assert len({tuple(d.candidate_uid.flatten().tolist()) + tuple(d.gate.flatten().tolist()) for d in draws}) > 1
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA Graph required")
 def test_deterministic_cuda_graph_matches_eager_across_variable_sets() -> None:
     torch.manual_seed(20260819)
@@ -1192,7 +1231,7 @@ def test_deterministic_cuda_graph_matches_eager_across_variable_sets() -> None:
     first_batch = _batch(batch_size=1)
     initial_state = model.initial_state(1, device=device)
     first_start = torch.tensor([True], dtype=torch.bool, device=device)
-    runner = _DeterministicCudaGraphV4(device)
+    runner = _PolicyCudaGraphV4(device)
 
     with torch.inference_mode():
         eager_first = model.act(
