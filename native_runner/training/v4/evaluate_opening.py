@@ -22,16 +22,20 @@ from .evaluation_protocol import balanced_cases, paired_summary
 from .policy_session import resolve_v4_checkpoint
 
 
-def build_schedule(match, *, blocks, opening_seconds, deck_pool=None):
-    if blocks < 1:
-        raise ValueError("blocks must be positive")
+def build_schedule(match, *, blocks, opening_seconds, deck_pool=None, block_start=0):
+    if blocks < 1 or block_start < 0:
+        raise ValueError("blocks must be positive and block_start nonnegative")
     rng = random.Random(match.seed)
     cases = []
-    for block in range(blocks):
+    # Advance the same deck RNG for skipped blocks so changing engine count does
+    # not change any block's seed, decks, ordering or opening deadline.
+    for block in range(block_start + blocks):
         base = replace(match, seed=match.seed + block)
         ids = None
         if deck_pool is not None:
             base, ids = sample_deck_pair(base, deck_pool, rng)
+        if block < block_start:
+            continue
         cases.extend(balanced_cases(
             base, block=block,
             deadline_seconds=opening_force_seconds_v4(opening_seconds, base.seed),
@@ -84,6 +88,7 @@ def main(argv=None):
     parser.add_argument("--checkpoint-a", required=True, help="fixed reference policy")
     parser.add_argument("--checkpoint-b", required=True, help="opponent tested with and without the timeout")
     parser.add_argument("--blocks", type=int, default=20, help="8 games per block (default: 160 games total)")
+    parser.add_argument("--block-start", type=int, default=0, help="first global block index for parallel workers")
     parser.add_argument("--opening-seconds", type=parse_seconds_range, default=(8.0, 20.0))
     parser.add_argument("--match-config", type=Path)
     parser.add_argument("--deck-pool", type=Path)
@@ -100,8 +105,8 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--plan-only", action="store_true", help="write the schedule without loading models or connecting")
     args = parser.parse_args(argv)
-    if args.blocks < 1 or args.cpu_threads < 1:
-        parser.error("--blocks and --cpu-threads must be positive")
+    if args.blocks < 1 or args.cpu_threads < 1 or args.block_start < 0:
+        parser.error("--blocks and --cpu-threads must be positive; --block-start must be nonnegative")
     if not 0 <= args.max_score_drop <= 1 or not 0 <= args.delay_ticks <= 65535:
         parser.error("invalid score-drop margin or execution delay")
     if args.gate_temperature is not None and (not math.isfinite(args.gate_temperature) or args.gate_temperature <= 0):
@@ -117,7 +122,10 @@ def main(argv=None):
     )
     match = MatchConfig(**config)
     deck_pool = None if args.deck_pool is None else DeckPoolManifestV4.load(args.deck_pool)
-    schedule = build_schedule(match, blocks=args.blocks, opening_seconds=args.opening_seconds, deck_pool=deck_pool)
+    schedule = build_schedule(
+        match, blocks=args.blocks, opening_seconds=args.opening_seconds,
+        deck_pool=deck_pool, block_start=args.block_start,
+    )
     args.output.mkdir(parents=True, exist_ok=True)
     plan = {
         "schema": "opening-evaluation.v1", "device": "cpu", "games": len(schedule),

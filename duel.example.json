@@ -3,6 +3,7 @@
   "checkpoint_b": "checkpoints/General/checkpoint-step-00000460.pt",
   "opening_seconds": "8-20",
   "blocks": 20,
+  "engines": 1,
   "seed": 1,
   "battle_level": 11,
   "cpu_threads": 1,

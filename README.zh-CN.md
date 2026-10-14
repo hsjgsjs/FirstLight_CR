@@ -110,7 +110,7 @@ Copy-Item .env.example .env
 
 用 `--games` 设置对局数，`--match-config` 指定卡组与等级，`--seed` 设置起始种子。结果文件和指标见[模型评测](checkpoints/README.md#evaluation--模型评测)。接入自己的 actor 循环可使用 [JSON 行策略服务](docs/policy_service.md)。
 
-评估“强制固定对手早出牌”是否削弱对手，在已配置模拟环境的 Linux 主机运行 **`bash duel.sh`** 即可：自动启动 CPU 引擎、进行自然/强制配对对弈、输出报告并清理进程。首次自动生成 `duel.local.json` 保存模型和评测条件，默认 General 对 General、20 组。详见 [CPU 配对对弈说明](docs/opening_evaluation_zh.md)。
+评估“强制固定对手早出牌”是否削弱对手，在已配置模拟环境的 Linux 主机运行 **`bash duel.sh`** 即可：自动启动 CPU 引擎、进行自然/强制配对对弈、输出报告并清理进程。首次自动生成 `duel.local.json` 保存模型和评测条件，默认 1 个引擎、General 对 General、20 组。可用 `bash duel.sh --engines 4` 按完整组并行评测，自动合并报告。详见 [CPU 配对对弈说明](docs/opening_evaluation_zh.md)。
 
 ## 文档
 
