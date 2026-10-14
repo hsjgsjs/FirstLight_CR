@@ -127,8 +127,9 @@ def main(argv=None):
         deck_pool=deck_pool, block_start=args.block_start,
     )
     args.output.mkdir(parents=True, exist_ok=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     plan = {
-        "schema": "opening-evaluation.v1", "device": "cpu", "games": len(schedule),
+        "schema": "opening-evaluation.v1", "device": device, "games": len(schedule),
         "options": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
         "cases": [asdict(case) for case in schedule],
     }
@@ -143,7 +144,7 @@ def main(argv=None):
     torch.set_num_threads(args.cpu_threads)
     evaluate(
         checkpoint_a, checkpoint_b, games=len(schedule), match=match, output=args.output,
-        host=args.host, port=args.port, device="cpu", sample=not args.deterministic,
+        host=args.host, port=args.port, device=device, sample=not args.deterministic,
         delay_a_ticks=args.delay_ticks, delay_b_ticks=args.delay_ticks,
         min_play_gap_ticks=args.min_play_gap_ticks,
         gate_temperature_a=args.gate_temperature, gate_temperature_b=args.gate_temperature,

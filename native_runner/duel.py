@@ -309,7 +309,8 @@ def run(args):
         (parent / "duel-latest.txt").write_text(str(output) + "\n", encoding="utf-8")
         (output / "settings.json").write_text(json.dumps(options, indent=2), encoding="utf-8")
         say(f"结果目录：{output}\n配置：{args.config}\n共 {options['blocks']} 组，每组 8 局，使用 {engine_count} 个引擎。")
-        env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "PYTHONUNBUFFERED": "1"}
+        eval_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        engine_env_base = {**eval_env, "CUDA_VISIBLE_DEVICES": ""}
         engine = evaluation = None
         workers = []
         runtime = None
@@ -327,7 +328,7 @@ def run(args):
             with (output / "prepare.log").open("w", encoding="utf-8") as log:
                 evaluation = subprocess.Popen(
                     evaluator_command(options, host=host, port=port, output=output / "plan-check") + ["--plan-only"],
-                    cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                    cwd=ROOT, env=eval_env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                 )
                 if evaluation.wait():
                     tail(output / "prepare.log")
@@ -338,7 +339,7 @@ def run(args):
                 compat = runtime / "compat"
                 compat.mkdir()
                 engine_env = {
-                    **env, "CR_AI_ROOT": str(ROOT), "CR_AI_PYTHON": sys.executable,
+                    **engine_env_base, "CR_AI_ROOT": str(ROOT), "CR_AI_PYTHON": sys.executable,
                     "CR_PPO_GUEST_PREFIX": f"crduel_{os.getuid()}", "CR_PPO_LOOPBACK_ONLY": "1",
                     "CR_PPO_ENGINES_PER_GUEST": "1", "CR_PPO_CPU_OFFSET": "0",
                     "CR_EMULATOR_COMPAT": os.environ.get("CR_EMULATOR_COMPAT") or str(compat),
@@ -361,7 +362,7 @@ def run(args):
                 shard_options = {**options, "blocks": count, "block_start": block_start}
                 evaluation = subprocess.Popen(
                     evaluator_command(shard_options, host=host, port=port + index, output=destination),
-                    cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                    cwd=ROOT, env=eval_env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                 )
                 workers.append({
                     "process": evaluation, "results": destination, "log": log_path,

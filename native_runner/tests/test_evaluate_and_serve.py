@@ -267,14 +267,28 @@ def test_scheduled_evaluation_locksteps_one_block_on_resident_slots(monkeypatch,
         built.append(kwargs)
         return Engine()
 
+    forwards = []
+
+    def forward(entries):
+        forwards.append(len(entries))
+        return [(entry[1], None) for entry in entries]
+
     def session(environment, model, *, actor_owner, **kwargs):
-        def decide(observation, force_opening=False):
+        def prepare_host_batch(observation):
+            return ("host", True)
+
+        def finish_decision(observation, host_batch, context, force_opening=False):
             return NS(
                 decoded=NS(actions=(ActionV1.wait(actor_owner, ticks=5),)),
                 forced_opening=force_opening,
             )
 
-        return NS(start_episode=lambda *a, **k: None, decide=decide, end_episode=lambda: ended.append(actor_owner))
+        return NS(
+            start_episode=lambda *a, **k: None,
+            prepare_host_batch=prepare_host_batch,
+            finish_decision=finish_decision,
+            end_episode=lambda: ended.append(actor_owner),
+        )
 
     monkeypatch.setattr(
         evaluate,
@@ -285,6 +299,7 @@ def test_scheduled_evaluation_locksteps_one_block_on_resident_slots(monkeypatch,
     )
     monkeypatch.setattr(evaluate, "build_resident_engine_v4", build_engine)
     monkeypatch.setattr(evaluate, "build_policy_session_v4", session)
+    monkeypatch.setattr(evaluate, "forward_resident_contexts", forward)
     monkeypatch.setattr(evaluate, "NativeClashEnv", lambda *a, **k: (_ for _ in ()).throw(AssertionError("json path")))
     schedule = balanced_cases(MatchConfig(seed=7), block=0, deadline_seconds=12.0)
     result = evaluate.evaluate(
@@ -293,6 +308,7 @@ def test_scheduled_evaluation_locksteps_one_block_on_resident_slots(monkeypatch,
     assert built[0]["capture_mode"] == "compact" and built[0]["lanes"] == 8
     assert built[0]["base_port"] == evaluate.DEFAULT_PORT
     assert rounds == [tuple(range(8))]
+    assert forwards == [16]
     assert stepped == [{"record_trace": False, "policy_features_only": True}] * 8
     assert result["completed"] == 8 and result["a_wins"] + result["b_wins"] == 8
     assert len((tmp_path / "matches.jsonl").read_text().splitlines()) == 8
@@ -302,6 +318,36 @@ def test_scheduled_evaluation_locksteps_one_block_on_resident_slots(monkeypatch,
     rows = [json.loads(line) for line in (tmp_path / "matches.jsonl").read_text().splitlines()]
     assert [row["opening_overrides"]["b"] for row in rows if row["condition"] == "forced"] == [1, 1, 1, 1]
     assert [row["opening_overrides"]["b"] for row in rows if row["condition"] == "natural"] == [0, 0, 0, 0]
+
+
+def test_forward_resident_contexts_batches_each_model():
+    import torch
+
+    from native_runner.training.v4.tensors import RecurrentPolicyStateV4
+
+    calls = []
+
+    class Model:
+        def __init__(self, name):
+            self.name = name
+
+        def forward(self, batch, state, episode_start=None, validate=False):
+            calls.append((self.name, int(state.hidden.shape[0]), str(episode_start.device)))
+            return state
+
+    def entry(model, value):
+        state = RecurrentPolicyStateV4(hidden=torch.full((1, 2), value), cell=torch.full((1, 2), value))
+        return (NS(model=model, state=state, device=torch.device("cpu")), state, value == 1.0)
+
+    model_a, model_b = Model("a"), Model("b")
+    rows = evaluate.forward_resident_contexts([
+        entry(model_a, 1.0), entry(model_b, 2.0), entry(model_a, 3.0),
+    ])
+    assert calls == [("a", 2, "cpu"), ("b", 1, "cpu")]
+    assert float(rows[0][1].hidden[0, 0]) == 1.0
+    assert float(rows[1][1].hidden[0, 0]) == 2.0
+    assert float(rows[2][1].hidden[0, 0]) == 3.0
+    assert tuple(rows[0][0].hidden.shape) == (1, 2)
 
 
 def json_transport(path):

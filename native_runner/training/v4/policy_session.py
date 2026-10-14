@@ -369,6 +369,70 @@ class PolicySessionV4:
         self._first_decision = False
         return PolicyDecisionV4(decoded=decoded, inference_ms=inference_ms, forced_opening=forced_opening)
 
+    def prepare_host_batch(self, observation: ObservationV1):
+        """Tensorize one decision without running the model or drawing random numbers."""
+
+        if not self._episode_started or self.state is None:
+            raise RuntimeError("start_episode must run before offline V4 inference")
+        if observation.owner != self.actor_owner:
+            raise ValueError("offline observation owner changed during the battle")
+        host_batch = self.tensorizer.tensorize(observation, validate=self.validate_tensors)
+        return host_batch, self._first_decision
+
+    @torch.inference_mode()
+    def finish_decision(
+        self,
+        observation: ObservationV1,
+        host_batch: UniversalSemanticBatchV4,
+        context,
+        *,
+        force_opening: bool = False,
+    ) -> PolicyDecisionV4:
+        """Sample on CPU from a context already computed for this row, then advance the session.
+
+        The paired evaluator calls this inside its per-decision CPU generator fork. A GPU
+        forward must already have happened, so this draw does not use the CUDA generator.
+        """
+
+        if observation.owner != self.actor_owner:
+            raise ValueError("offline observation owner changed during the battle")
+        output = self.model._select_action(
+            host_batch,
+            context,
+            sample=self.model.ppo_rollout_sampling if self.sample else False,
+            validate=self.validate_tensors,
+        )
+        forced_opening = False
+        if force_opening and int(output.actions.gate[0]) == GATE_WAIT:
+            legal = ShadowCandidateLegality(host_batch.candidates, self.tensorizer.config).candidate_mask()
+            if bool(legal.any().item()):
+                select = (
+                    self.model.sample_after_preselected_act if self.sample else self.model.act_after_preselected_act
+                )
+                output = select(host_batch, context, validate=self.validate_tensors)
+                forced_opening = True
+        output.actions.validate(self.tensorizer.config, candidate_count=int(host_batch.candidates.mask.shape[1]))
+        decoded = decode_action_sequence_v4(
+            output.actions,
+            host_batch.candidates,
+            row=0,
+            observation=observation,
+            catalog=self.tensorizer.catalog,
+            deck=self.tensorizer.deck,
+            card_costs=self.tensorizer.card_costs,
+            ability_id_by_vocab_id=self.tensorizer.ability_id_by_vocab_id,
+            horizontal_mirror=self.tensorizer.perspective.horizontal_mirror,
+            hand_slot_permutation=(self.tensorizer.perspective.hand_slot_permutation),
+            config=self.tensorizer.config,
+            base_latency_ticks=1,
+            base_latency_ms=0.0,
+            validate=False,
+        )
+        self.tensorizer.record_action(output.actions, host_batch, row=0, validate=False)
+        self.state = output.next_state.to(self.device)
+        self._first_decision = False
+        return PolicyDecisionV4(decoded=decoded, inference_ms=0.0, forced_opening=forced_opening)
+
 
 def build_policy_session_v4(
     environment: BattleEnvV1,

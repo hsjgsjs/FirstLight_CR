@@ -8,7 +8,7 @@
 bash duel.sh
 ```
 
-它会读取 `.env` 中已有的 Linux 模拟环境配置，自动选择空闲端口、启动 CPU 模拟引擎、等待就绪，再运行评测。默认使用 **1 个引擎、General 对 General、8–20 秒开局超时、20 组（160 局）**。模型推理固定使用 CPU，引擎采用软件渲染，不启动训练器，不依赖 CUDA。
+它会读取 `.env` 中已有的 Linux 模拟环境配置，自动选择空闲端口、启动 CPU 模拟引擎、等待就绪，再运行评测。默认使用 **1 个引擎、General 对 General、8–20 秒开局超时、20 组（160 局）**。模拟器不占 GPU。模型前向在能看到 CUDA 时放到 GPU 上，采样仍在 CPU。
 
 首次运行会从 `duel.example.json` 自动生成 **`duel.local.json`**。以后改这个本机文件即可，仍然只运行 `bash duel.sh`；该文件不会提交到 Git，也不会被普通更新覆盖。比如改 `checkpoint_a` / `checkpoint_b` 换模型，改 `blocks` 换组数，改 `opening_seconds` 换截止时间。所有相对数据路径均相对于仓库根目录。
 
@@ -81,7 +81,7 @@ python -m native_runner.training.v4.evaluate_opening \
   --output evaluations/opening-smoke
 ```
 
-正式评测把 `--blocks` 改为 50 或 100，分别是 400 或 800 局，并用新的输出目录。CPU 资源有限时可以先跑 20 组（160 局），结合区间宽度再决定后续规模。每一组的 8 局在同一个引擎的 8 个槽上同时推进，采集用训练的 compact 格式，不再逐局拉取完整 JSON。两份模型仍只加载一次。`--cpu-threads` 控制 PyTorch 算子线程，不是并行对局数。
+正式评测把 `--blocks` 改为 50 或 100，分别是 400 或 800 局，并用新的输出目录。CPU 资源有限时可以先跑 20 组（160 局），结合区间宽度再决定后续规模。每一组的 8 局在同一个引擎的 8 个槽上同时推进，采集用训练的 compact 格式。同一拍所有观测按模型各做一次前向：机器上看得到 CUDA 时这次前向在 GPU 上，采样仍用 CPU 随机数，避免强制出牌打乱配对序列。两份模型仍只加载一次。`--cpu-threads` 控制 CPU 上的 PyTorch 算子线程，不是并行对局数。
 
 其他条件通过以下参数设置：
 

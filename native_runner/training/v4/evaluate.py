@@ -29,6 +29,7 @@ from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .policy_session import build_policy_session_v4, load_policy_v4
 from .ppo_runtime import ppo_environment_config_v4
+from .tensors import concatenate_padded_tensor_records, concatenate_tensor_records
 
 # One training engine exposes eight resident slots, and one opening block is eight games.
 RESIDENT_EVAL_LANES = 8
@@ -149,6 +150,84 @@ def _choose_commands(
     return commands
 
 
+def forward_resident_contexts(entries):
+    """One forward per model for every ready decision.
+
+    ``entries`` are ``(session, host batch, first decision)``. Sampling stays
+    with the caller so each row can draw from the CPU generator. Returns the
+    padded host row and a CPU context, aligned with ``entries``.
+    """
+
+    results = [None] * len(entries)
+    grouped: dict[int, list[int]] = {}
+    for index, (session, _host, _first) in enumerate(entries):
+        grouped.setdefault(id(session.model), []).append(index)
+    for indexes in grouped.values():
+        sessions = [entries[index][0] for index in indexes]
+        model = sessions[0].model
+        device = sessions[0].device
+        combined = concatenate_padded_tensor_records(tuple(entries[index][1] for index in indexes))
+        combined_input = combined.to_model_input(device)
+        state = concatenate_tensor_records(tuple(session.state for session in sessions)).to(device)
+        episode_start = torch.tensor(
+            [bool(entries[index][2]) for index in indexes], dtype=torch.bool, device=device
+        )
+        context = model.forward(combined_input, state, episode_start=episode_start, validate=False)
+        cpu_context = context.to("cpu")
+        for local, index in enumerate(indexes):
+            results[index] = (combined.narrow_batch(local, 1), cpu_context.narrow_batch(local, 1))
+    return results
+
+
+def _commands_from_contexts(
+    lane,
+    contexts,
+    *,
+    delay_a_ticks,
+    delay_b_ticks,
+    min_play_gap_ticks,
+):
+    """Turn one lane's precomputed contexts into engine commands.
+
+    ``contexts`` maps owner to ``(host batch, cpu context, force)`` for owners
+    whose tick is ready. Earlier ticks only refresh the tensorizer.
+    """
+
+    commands = {}
+    for owner, session in enumerate(lane.sessions):
+        observation = lane.observations[owner]
+        chosen = ()
+        if observation.tick >= FIRST_POLICY_DECISION_TICK:
+            host_batch, context, force = contexts[owner]
+            side = "a" if owner == lane.a_owner else "b"
+            with paired_cpu_rng(lane.seed, side, observation.tick):
+                decision = session.finish_decision(
+                    observation, host_batch, context, force_opening=force
+                )
+            lane.opening_overrides[owner] += int(decision.forced_opening)
+            chosen = decision.decoded.actions
+            delay = delay_a_ticks if owner == lane.a_owner else delay_b_ticks
+            if delay:
+                chosen = tuple(
+                    replace(action, execute_offset_ticks=delay) if action.kind in _DELAYABLE else action
+                    for action in chosen
+                )
+            chosen, lane.last_landing[owner] = space_plays_v4(
+                tuple(chosen),
+                min_play_gap_ticks,
+                f"{lane.seed}-{side}-{observation.tick}",
+                decision_tick=int(observation.tick),
+                last_landing_tick=lane.last_landing[owner],
+            )
+            lane.actions[owner] += sum(action.kind != ActionKind.WAIT for action in chosen)
+            if lane.first_play_tick[owner] is None and any(action.kind != ActionKind.WAIT for action in chosen):
+                lane.first_play_tick[owner] = int(observation.tick)
+        else:
+            session.tensorizer.tensorize(observation, validate=False)
+        commands[owner] = tuple(chosen) or (ActionV1.wait(owner, ticks=POLICY_DECISION_TICKS),)
+    return commands
+
+
 def _absorb_step(observations, first_card_tick, rejected):
     for observation in observations.values():
         for owner in (0, 1):
@@ -260,6 +339,24 @@ class _ResidentLane:
     truncated: bool = False
 
 
+def _share_identical_policies(policies):
+    """Use one copy when both sides are the same checkpoint, so one forward covers every row."""
+
+    first, second = policies
+    try:
+        same = (
+            first.checkpoint_sha256 == second.checkpoint_sha256
+            and first.model.ppo_gate_temperature == second.model.ppo_gate_temperature
+            and first.model.ppo_action_temperature == second.model.ppo_action_temperature
+            and first.model.ppo_continue_temperature == second.model.ppo_continue_temperature
+        )
+    except AttributeError:
+        return policies
+    if not same:
+        return policies
+    return (first, first)
+
+
 def _evaluate_resident(
     policies,
     *,
@@ -281,6 +378,7 @@ def _evaluate_resident(
     forced openings, delays and the paired RNG stay on this side of the socket.
     """
 
+    policies = _share_identical_policies(policies)
     engine = build_resident_engine_v4(
         0,
         environment_config=ppo_environment_config_v4(),
@@ -347,24 +445,40 @@ def _evaluate_resident(
                         )
                     engine.coordinator.start_session()
                     while any(lane.active for lane in lanes):
+                        entries = []
+                        owners = []
+                        for lane in lanes:
+                            if not lane.active:
+                                continue
+                            for owner, session in enumerate(lane.sessions):
+                                observation = lane.observations[owner]
+                                if observation.tick < FIRST_POLICY_DECISION_TICK:
+                                    continue
+                                force_owner = _frozen_opponent_opening_force_owner_v4(
+                                    current_owners=(lane.a_owner,),
+                                    active_actions=tuple(lane.actions),
+                                    tick=int(observation.tick),
+                                    after_seconds=lane.case.force_b_seconds,
+                                )
+                                force = owner == force_owner
+                                lane.opening_requests[owner] += int(force)
+                                host_batch, first = session.prepare_host_batch(observation)
+                                owners.append((lane, owner, force))
+                                entries.append((session, host_batch, first))
+                        forwarded = forward_resident_contexts(entries) if entries else []
+                        by_lane = {}
+                        for (lane, owner, force), forwarded_row in zip(owners, forwarded, strict=True):
+                            host_batch, context = forwarded_row
+                            by_lane.setdefault(lane.env_id, {})[owner] = (host_batch, context, force)
                         pending = []
                         for lane in lanes:
                             if not lane.active:
                                 continue
                             pending.append((
                                 lane,
-                                _choose_commands(
-                                    lane.sessions,
-                                    lane.observations,
-                                    a_owner=lane.a_owner,
-                                    case=lane.case,
-                                    seed=lane.seed,
-                                    game_index=lane.index,
-                                    actions=lane.actions,
-                                    last_landing=lane.last_landing,
-                                    first_play_tick=lane.first_play_tick,
-                                    opening_requests=lane.opening_requests,
-                                    opening_overrides=lane.opening_overrides,
+                                _commands_from_contexts(
+                                    lane,
+                                    by_lane.get(lane.env_id, {}),
                                     delay_a_ticks=delay_a_ticks,
                                     delay_b_ticks=delay_b_ticks,
                                     min_play_gap_ticks=min_play_gap_ticks,
@@ -456,8 +570,10 @@ def evaluate(
         raise ValueError("games must be positive")
     if not (0 <= delay_a_ticks <= 0xFFFF and 0 <= delay_b_ticks <= 0xFFFF):
         raise ValueError("delay ticks must be in [0, 65535]")
-    if schedule is not None and (len(schedule) != games or torch.device(device).type != "cpu"):
-        raise ValueError("a paired schedule requires CPU inference and exactly games cases")
+    if schedule is not None and len(schedule) != games:
+        raise ValueError("a paired schedule requires exactly games cases")
+    if schedule is not None and torch.device(device).type not in ("cpu", "cuda"):
+        raise ValueError("a paired schedule runs the model on cpu or cuda; sampling stays on the CPU generator")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if torch.device(device).type == "cuda" and torch.device(device).index is not None:
