@@ -388,10 +388,10 @@ class PolicySessionV4:
         *,
         force_opening: bool = False,
     ) -> PolicyDecisionV4:
-        """Sample on CPU from a context already computed for this row, then advance the session.
+        """Sample this row from a context already computed on the model device.
 
-        The paired evaluator calls this inside its per-decision CPU generator fork. A GPU
-        forward must already have happened, so this draw does not use the CUDA generator.
+        The paired evaluator calls this inside its per-decision generator fork, which
+        resets the CPU generator and, when the model is on CUDA, the CUDA generator too.
         """
 
         if observation.owner != self.actor_owner:

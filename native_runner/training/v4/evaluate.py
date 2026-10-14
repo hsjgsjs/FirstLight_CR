@@ -42,12 +42,16 @@ def paired_cpu_rng(seed, side, tick):
     """Independent model/decision draws, shared across the paired conditions.
 
     Resetting per decision prevents an extra forced sample on B from shifting A's
-    stream or either model's later draws. Only the CPU generator is touched.
+    stream or either model's later draws. The CPU generator is always reset. When
+    the model samples on CUDA, that generator is reset from the same key.
     """
     key = f"evaluation-{seed}-{side}-{tick}".encode()
     value = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "little")
-    with torch.random.fork_rng(devices=[]):
+    cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    with torch.random.fork_rng(devices=cuda_devices):
         torch.set_rng_state(torch.Generator(device="cpu").manual_seed(value).get_state())
+        if cuda_devices:
+            torch.cuda.manual_seed_all(value)
         yield
 
 
@@ -153,9 +157,9 @@ def _choose_commands(
 def forward_resident_contexts(entries):
     """One forward per model for every ready decision.
 
-    ``entries`` are ``(session, host batch, first decision)``. Sampling stays
-    with the caller so each row can draw from the CPU generator. Returns the
-    padded host row and a CPU context, aligned with ``entries``.
+    ``entries`` are ``(session, host batch, first decision)``. The returned host
+    row and context stay on the model device, because the action heads live there.
+    Sampling is still per row, under the paired generator.
     """
 
     results = [None] * len(entries)
@@ -173,9 +177,8 @@ def forward_resident_contexts(entries):
             [bool(entries[index][2]) for index in indexes], dtype=torch.bool, device=device
         )
         context = model.forward(combined_input, state, episode_start=episode_start, validate=False)
-        cpu_context = context.to("cpu")
         for local, index in enumerate(indexes):
-            results[index] = (combined.narrow_batch(local, 1), cpu_context.narrow_batch(local, 1))
+            results[index] = (combined_input.narrow_batch(local, 1), context.narrow_batch(local, 1))
     return results
 
 
@@ -189,7 +192,7 @@ def _commands_from_contexts(
 ):
     """Turn one lane's precomputed contexts into engine commands.
 
-    ``contexts`` maps owner to ``(host batch, cpu context, force)`` for owners
+    ``contexts`` maps owner to ``(host batch, context, force)`` for owners
     whose tick is ready. Earlier ticks only refresh the tensorizer.
     """
 
