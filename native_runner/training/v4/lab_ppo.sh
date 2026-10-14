@@ -71,7 +71,10 @@ default_extra_args() {
     "--fixed-opponent-checkpoint $runs/active-il.pt" \
     "--fixed-opponent-checkpoint checkpoints/2_6hog_expert/hog26-specialist1.pt" \
     "--il-anchor-checkpoint checkpoints/IL/checkpoint-step-00029396.pt" \
-    "--personal-elixir-overflow-penalty 0.01 --personal-elixir-overflow-grace 1" \
+    "--personal-elixir-overflow-penalty 0 --personal-elixir-overflow-grace 0" \
+    "--game-elixir-overflow-penalty 0.01 --game-elixir-overflow-grace 3" \
+    "--early-first-play-penalty 0 --early-first-play-free-seconds 6" \
+    "--fixed-opponent-opening-force-after-seconds 6-20 --spell-king-activation-penalty 0.1" \
     "--gate-temperature-start 0.5 --gate-temperature-end 0.2 --gate-temperature-anneal-updates 3000" \
     "--snapshot-every 200"
 }

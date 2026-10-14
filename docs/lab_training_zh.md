@@ -224,17 +224,31 @@ python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --game
 - **训练时加入执行延迟。** 学习者和对手都加，延迟在 18–24 tick 之间随机。
 - **两张牌不能同时落地。** `--min-play-gap-ticks 4-8`：同一方连续两次出牌或技能，落地至少相隔随机 4–8 tick（1 tick = 50 ms，即 200–400 ms），和人手点两张牌的间隔一致。原来一次决策最多能出 2 张牌，而且同一 tick 落地；相邻两次决策各自抽延迟，也可能几乎同时落地。新开的训练默认带上；已有的训练用 `options 名字 --min-play-gap-ticks 4-8` 加上，下一次续训自动热启动。评测器也有同名参数，对双方都生效。
 - **对手**：自我对战 40%；固定对手 60%，从冻结的 General、Active IL、速猪专精 1 里均匀抽。原版 IL 占 0%（只作为锚点登记，不上场）。原版 IL 很被动，打它学到的是等对方犯错。
-- **开局要主动**（见下面的测试）：
-  - 圣水溢出惩罚 `--personal-elixir-overflow-penalty 0.01`，满格后多浪费 1 点就开始扣（`--personal-elixir-overflow-grace 1`）；
-  - gate 温度在前 3000 次更新里从 0.5 降到 0.2，让模型前期多尝试早出牌，最后回到默认值。
-- **整局圣水浪费惩罚（可选）**：`--game-elixir-overflow-penalty C --game-elixir-overflow-grace G`。从学习者**第一张牌真正下出之后**开始，把整局满格浪费的圣水累加，超过 G 点后每多浪费 1 点扣 C。开局为了等对手而满格等待不算在内。上面那条按段计算的惩罚，每次圣水降到 10 以下就清零，所以一局里可以反复白白浪费；这一项补上了整局总量。参照：人类录像里胜方整局浪费的中位数约 2.3 点（`elixir_leaked`）。`status` 会显示「after the first card」这一行。已有的训练用 `options` 加上，下一次续训自动热启动。
-- **过早先手惩罚（可选）**：`--early-first-play-penalty C --early-first-play-free-seconds T`。学习者在对手还没有牌落地时抢先下出全场第一张牌，按出牌时间扣分：第一个决策点（4.5 秒）扣 C，线性降到 T 秒时为 0。对手已经先下牌时应对不扣。建议 C = 0.1、T = 14（开局 5 点圣水涨满的时间）。和满圣水惩罚一起，给开局留出 14–22 秒的自由区间。`status` 会显示先手被罚的比例。已有的训练用 `options` 加上，下一次续训自动热启动。
-- **固定对手开局（可选）**：`--fixed-opponent-opening-force-after-seconds 8-20`。固定对手（General、Active IL、速猪专精等）开局都要等很久才出牌，学习者能靠「对手发呆」占便宜，开局越练越早。这个参数让固定对手如果到了每局随机抽的时间（8–20 秒之间）还没出牌，就强制它出第一张牌（出什么、放哪仍由它自己的模型决定）。学习者于是常常面对主动开局的对手，可以选择等对手先出再应对。改的是对手行为，不是奖励。`status` 会显示被强制开局的比例和中位时间。也可以写单个数，如 `20`。
+- **连续满费溢出惩罚关闭**：`--personal-elixir-overflow-penalty 0 --personal-elixir-overflow-grace 0`。不开启按连续满费段计算的惩罚。
+- **整局圣水浪费惩罚开启**：`--game-elixir-overflow-penalty 0.01 --game-elixir-overflow-grace 3`。从学习者**第一张牌真正下出之后**开始，把整局满格浪费的圣水累加，超过 3 点后每多浪费 1 点扣 0.01。降到 10 以下不会重置这个整局累计值；首牌前的等待不算在内。`status` 会显示「after the first card」这一行。
+- **过早先手惩罚关闭**：`--early-first-play-penalty 0 --early-first-play-free-seconds 6`。保留 6 秒免罚时间配置，因系数为 0，目前不参与奖励，也不会强制学习者在 6 秒出牌。
+- **固定对手开局开启**：`--fixed-opponent-opening-force-after-seconds 6-20`。每局均匀抽取一个 6–20 秒的阈值，对手到时仍未行动才强制它出牌；具体卡牌、落点仍由对手模型决定。学习者不受强制，自博弈也不受强制。实际落地还要经过决策间隔和执行延迟，不保证恰好在阈值时落地。
+- **法术误激活敌方主塔惩罚开启**：`--spell-king-activation-penalty 0.1`。任何法术首次伤害沉睡的敌方主塔时，每局每方扣一次 0.1。任意敌方公主塔此前已摧毁或在本次结算区间内摧毁、主塔已激活或直接被击杀时不扣。仅根据真实伤害来源归因，归因失败会单独记录。
+- **温度退火不变**：gate 温度在前 3000 次更新里从 0.5 降到 0.2。
 - **GPU 数量看引擎数。** 引擎少时单卡更快；引擎多到单卡显存不够时用双卡。
 - **对手池快照间隔**改成 200 次更新一次。默认每 8 次一次，几天就会把硬盘写满。
 - **评测要看两件事**：一是双方都带延迟时，训练出的模型对 General 的胜率；二是每局出牌次数，以及第一张牌出得早不早。不只看胜率。
 
-### 开局等待问题（10 次更新的测试）
+以上是新训练的默认配置；已有训练会保留其保存的参数，不会因更新脚本而自动更改。将 `spar16` 改为这组配置：
+
+```bash
+bash native_runner/training/v4/lab_ppo.sh options spar16 \
+  --personal-elixir-overflow-penalty 0 --personal-elixir-overflow-grace 0 \
+  --game-elixir-overflow-penalty 0.01 --game-elixir-overflow-grace 3 \
+  --early-first-play-penalty 0 --early-first-play-free-seconds 6 \
+  --fixed-opponent-opening-force-after-seconds 6-20 \
+  --unset --fireball-king-activation-penalty \
+  --spell-king-activation-penalty 0.1
+```
+
+这条命令保留该训练的对手比例、执行延迟、落牌间隔和温度退火。保存后下一次 `resume spar16` 才生效；正在运行的训练保留启动时的配置。奖励配置改变后脚本会从最新严格检查点热启动新阶段。
+
+### 开局等待问题（早期配置的 10 次更新测试）
 
 General 习惯等到双倍圣水（约 120 秒）才出第一张牌，原作者在 `training_history.md` 里也记录过这个现象。下表是学习者第一次出牌时间的中位数：
 
@@ -245,7 +259,7 @@ General 习惯等到双倍圣水（约 120 秒）才出第一张牌，原作者�
 | 再把 gate 温度提到 0.5（`spar-test2`） | 47 s | 29 s | 39–41 |
 
 - 默认的 gate 温度是 0.2，把「出牌还是等」的 logit 放大了 5 倍，开局几乎总是等。所以开局阶段的 entropy 是 0，模型从来没有尝试过早出牌。
-- 10 次更新几乎没让模型学到东西，上表的变化主要来自采样方式变了。真正要练到人类水平（开局 10–20 秒出牌），靠的是一周里溢出惩罚慢慢起作用。训练中用 `lab_ppo.sh status` 看开局时间是否在往前移；如果第 1–2 天没有进展，再考虑专门给「第一张牌」加奖励，或者用人类录像约束（`--expert-bc-manifest`）。
+- 这个短测试无法区分学习效果和温度改变造成的采样变化。新配置关闭了首牌前的连续满费惩罚，固定对手在 6–20 秒主动开局，整局溢出惩罚只约束首牌之后的浪费。应分别观察自博弈和固定对手局的首牌时间，不能仅凭固定对手局开局变早判断学习者已经学会主动先手。若自博弈仍持续空等，再考虑混入主动先手的人类录像（`--expert-bc-manifest`），并独立评测其效果。
 
 ## 7. 待办（完整版）
 
