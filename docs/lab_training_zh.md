@@ -227,7 +227,7 @@ python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --game
 - **连续满费溢出惩罚关闭**：`--personal-elixir-overflow-penalty 0 --personal-elixir-overflow-grace 0`。不开启按连续满费段计算的惩罚。
 - **整局圣水浪费惩罚开启**：`--game-elixir-overflow-penalty 0.01 --game-elixir-overflow-grace 3`。从学习者**第一张牌真正下出之后**开始，把整局满格浪费的圣水累加，超过 3 点后每多浪费 1 点扣 0.01。降到 10 以下不会重置这个整局累计值；首牌前的等待不算在内。`status` 会显示「after the first card」这一行。
 - **过早先手惩罚关闭**：`--early-first-play-penalty 0 --early-first-play-free-seconds 6`。保留 6 秒免罚时间配置，因系数为 0，目前不参与奖励，也不会强制学习者在 6 秒出牌。
-- **固定对手开局开启**：`--fixed-opponent-opening-force-after-seconds 6-20`。每局均匀抽取一个 6–20 秒的阈值，对手到时仍未行动才强制它出牌；具体卡牌、落点仍由对手模型决定。学习者不受强制，自博弈也不受强制。实际落地还要经过决策间隔和执行延迟，不保证恰好在阈值时落地。
+- **固定对手混合开局**：`--fixed-opponent-opening-force-after-seconds 6-20 --fixed-opponent-opening-natural-percent 20`。每局冻结对手以 20% 概率豁免全部开局超时，完全按自己的策略行动，可以等到 120 秒，也可以自然提前出牌；其余 80% 每局均匀抽取一个 6–20 秒的阈值，到时仍未行动才强制出牌。这个比例是冻结对手局中的占比，不是所有对局的占比；在 40% 自博弈、60% 固定对手的配置下，约 12% 的总对局是豁免对手，48% 有开局超时，自博弈 40% 不受强制。比例是随机概率，小批次不保证恰好 20%。每局的选择跨 rollout 段保持不变；状态和逐局记录会显示豁免情况。学习者不受强制，实际落地仍受决策间隔和执行延迟影响。
 - **法术误激活敌方主塔惩罚开启**：`--spell-king-activation-penalty 0.1`。任何法术首次伤害沉睡的敌方主塔时，每局每方扣一次 0.1。任意敌方公主塔此前已摧毁或在本次结算区间内摧毁、主塔已激活或直接被击杀时不扣。仅根据真实伤害来源归因，归因失败会单独记录。
 - **温度退火不变**：gate 温度在前 3000 次更新里从 0.5 降到 0.2。
 - **GPU 数量看引擎数。** 引擎少时单卡更快；引擎多到单卡显存不够时用双卡。
@@ -242,6 +242,7 @@ bash native_runner/training/v4/lab_ppo.sh options spar16 \
   --game-elixir-overflow-penalty 0.01 --game-elixir-overflow-grace 3 \
   --early-first-play-penalty 0 --early-first-play-free-seconds 6 \
   --fixed-opponent-opening-force-after-seconds 6-20 \
+  --fixed-opponent-opening-natural-percent 20 \
   --unset --fireball-king-activation-penalty \
   --spell-king-activation-penalty 0.1
 ```
@@ -259,7 +260,7 @@ General 习惯等到双倍圣水（约 120 秒）才出第一张牌，原作者�
 | 再把 gate 温度提到 0.5（`spar-test2`） | 47 s | 29 s | 39–41 |
 
 - 默认的 gate 温度是 0.2，把「出牌还是等」的 logit 放大了 5 倍，开局几乎总是等。所以开局阶段的 entropy 是 0，模型从来没有尝试过早出牌。
-- 这个短测试无法区分学习效果和温度改变造成的采样变化。新配置关闭了首牌前的连续满费惩罚，固定对手在 6–20 秒主动开局，整局溢出惩罚只约束首牌之后的浪费。应分别观察自博弈和固定对手局的首牌时间，不能仅凭固定对手局开局变早判断学习者已经学会主动先手。若自博弈仍持续空等，再考虑混入主动先手的人类录像（`--expert-bc-manifest`），并独立评测其效果。
+- 这个短测试无法区分学习效果和温度改变造成的采样变化。新配置关闭了首牌前的连续满费惩罚，80% 的冻结对手局设有 6–20 秒开局超时，整局溢出惩罚只约束首牌之后的浪费。应分别观察自博弈、豁免冻结对手和受限冻结对手局的首牌时间，不能仅凭固定对手局开局变早判断学习者已经学会主动先手。若自博弈仍持续空等，再考虑混入主动先手的人类录像（`--expert-bc-manifest`），并独立评测其效果。
 
 ## 7. 待办（完整版）
 

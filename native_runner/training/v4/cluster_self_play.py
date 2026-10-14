@@ -86,6 +86,9 @@ class _MatchRuntimeV4:
     deck_average_elixir: tuple[float, float] = (0.0, 0.0)
     opening_forced_owner: int | None = None
     opening_forced_tick: int | None = None
+    opening_force_exempt: bool = False
+    opening_force_deadline_seconds: float | None = None
+    opening_force_planned: bool = False
     elixir_overflow_wasted: tuple[float, float] = (0.0, 0.0)
     elixir_overflow_penalty_total: tuple[float, float] = (0.0, 0.0)
     personal_elixir_overflow_wasted: tuple[float, float] = (0.0, 0.0)
@@ -381,6 +384,8 @@ def _terminal_report(runtime: _MatchRuntimeV4) -> dict[str, object]:
         "deck_average_elixir": runtime.deck_average_elixir,
         "opening_forced_owner": runtime.opening_forced_owner,
         "opening_forced_tick": runtime.opening_forced_tick,
+        "opening_force_exempt": runtime.opening_force_exempt,
+        "opening_force_deadline_seconds": runtime.opening_force_deadline_seconds,
         "elixir_overflow_wasted": runtime.elixir_overflow_wasted,
         "elixir_overflow_penalty_total": (runtime.elixir_overflow_penalty_total),
         "personal_elixir_overflow_wasted": (runtime.personal_elixir_overflow_wasted),

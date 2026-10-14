@@ -941,6 +941,10 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--fixed-opponent-opening-natural-percent", type=int, default=0,
+        help="percent of frozen-opponent games exempt from opening timeouts (0-100)",
+    )
+    parser.add_argument(
         "--self-play-percent", type=int, default=0, help="percent of games using current versus current"
     )
     parser.add_argument(
@@ -1075,6 +1079,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--validate", action="store_true")
     args = parser.parse_args()
+    if not 0 <= args.fixed_opponent_opening_natural_percent <= 100:
+        raise ValueError("fixed-opponent opening natural percent must be in [0, 100]")
     if (
         not math.isfinite(args.expert_bc_coefficient)
         or args.expert_bc_coefficient <= 0
@@ -1463,6 +1469,8 @@ def main() -> int:
         resume_contract["fixed_opponent_opening_force_after_seconds"] = list(
             args.fixed_opponent_opening_force_after_seconds
         )
+    if args.fixed_opponent_opening_natural_percent:
+        resume_contract["fixed_opponent_opening_natural_percent"] = args.fixed_opponent_opening_natural_percent
     # Omit the optional key when disabled to preserve old no-BC strict resumes.
     if expert_bc_contract is not None:
         resume_contract["expert_bc"] = expert_bc_contract
@@ -1549,6 +1557,7 @@ def main() -> int:
             worker_port=engine_worker_ports[engine_index],
             force_il_opponent_opening_after_seconds=(args.il_opening_force_after_seconds),
             force_frozen_opponent_opening_after_seconds=args.fixed_opponent_opening_force_after_seconds,
+            frozen_opponent_opening_natural_percent=args.fixed_opponent_opening_natural_percent,
             execution_delay_ticks=args.execution_delay_ticks,
             game_elixir_overflow=game_elixir_overflow,
             early_first_play=early_first_play,
