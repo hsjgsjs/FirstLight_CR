@@ -202,3 +202,108 @@ def test_parallel_evaluation_gives_each_shard_one_gpu(monkeypatch, tmp_path):
         assert command.count("--device") == 1 and command[command.index("--device") + 1] == "cuda"
         assert "--sample" in command
     assert evaluate_parallel.shard_device("cpu") == ("cpu", None)
+
+
+def test_scheduled_evaluation_locksteps_one_block_on_resident_slots(monkeypatch, tmp_path):
+    import json
+
+    from native_runner.training.v4.evaluation_protocol import balanced_cases
+
+    built = []
+    stepped = []
+    rounds = []
+    ended = []
+    terminal = NS(winner=0, to_dict=lambda: {"winner": 0, "ended": True})
+    observations = {
+        owner: NS(
+            tick=300, owner=owner, players=[NS(owner=owner, elixir_exact=5.0)], events=[], terminal=terminal,
+        )
+        for owner in (0, 1)
+    }
+
+    class Environment:
+        def __init__(self):
+            self.native = NS()
+
+        def reset(self, *, match_config, options):
+            assert options["render_mode"] == "headless"
+            assert options["decision_ticks"] == 5
+            return observations, {}
+
+        def step(self, commands, **kwargs):
+            stepped.append(kwargs)
+            assert set(commands) == {0, 1}
+            return observations, {}, {"__all__": True}, {"__all__": False}, {}
+
+    class Coordinator:
+        def close_session(self):
+            return None
+
+        def start_session(self):
+            return None
+
+        def begin_round(self, env_ids):
+            rounds.append(tuple(env_ids))
+
+        def finish_round(self):
+            return None
+
+        def abort_round(self, error):
+            raise AssertionError(error)
+
+    class Engine:
+        def __init__(self):
+            self.natives = tuple(NS() for _ in range(8))
+            self.environments = tuple(Environment() for _ in range(8))
+            self.coordinator = Coordinator()
+
+        def prepare(self):
+            return None
+
+        def close(self):
+            built.append("closed")
+
+    def build_engine(*args, **kwargs):
+        built.append(kwargs)
+        return Engine()
+
+    def session(environment, model, *, actor_owner, **kwargs):
+        def decide(observation, force_opening=False):
+            return NS(
+                decoded=NS(actions=(ActionV1.wait(actor_owner, ticks=5),)),
+                forced_opening=force_opening,
+            )
+
+        return NS(start_episode=lambda *a, **k: None, decide=decide, end_episode=lambda: ended.append(actor_owner))
+
+    monkeypatch.setattr(
+        evaluate,
+        "load_policy_v4",
+        lambda path, **k: NS(
+            model=_Model(path), checkpoint_path=Path(path), checkpoint_sha256="hash", checkpoint_id=path
+        ),
+    )
+    monkeypatch.setattr(evaluate, "build_resident_engine_v4", build_engine)
+    monkeypatch.setattr(evaluate, "build_policy_session_v4", session)
+    monkeypatch.setattr(evaluate, "NativeClashEnv", lambda *a, **k: (_ for _ in ()).throw(AssertionError("json path")))
+    schedule = balanced_cases(MatchConfig(seed=7), block=0, deadline_seconds=12.0)
+    result = evaluate.evaluate(
+        "a.pt", "b.pt", games=8, match=MatchConfig(seed=7), output=tmp_path, schedule=schedule,
+    )
+    assert built[0]["capture_mode"] == "compact" and built[0]["lanes"] == 8
+    assert built[0]["base_port"] == evaluate.DEFAULT_PORT
+    assert rounds == [tuple(range(8))]
+    assert stepped == [{"record_trace": False, "policy_features_only": True}] * 8
+    assert result["completed"] == 8 and result["a_wins"] + result["b_wins"] == 8
+    assert len((tmp_path / "matches.jsonl").read_text().splitlines()) == 8
+    assert json_transport(tmp_path) == "resident-compact"
+    assert built[-1] == "closed"
+    assert len(ended) == 16
+    rows = [json.loads(line) for line in (tmp_path / "matches.jsonl").read_text().splitlines()]
+    assert [row["opening_overrides"]["b"] for row in rows if row["condition"] == "forced"] == [1, 1, 1, 1]
+    assert [row["opening_overrides"]["b"] for row in rows if row["condition"] == "natural"] == [0, 0, 0, 0]
+
+
+def json_transport(path):
+    import json
+    return json.loads((path / "identity.json").read_text(encoding="utf-8"))["transport"]

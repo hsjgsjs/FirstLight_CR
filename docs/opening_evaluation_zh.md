@@ -81,7 +81,7 @@ python -m native_runner.training.v4.evaluate_opening \
   --output evaluations/opening-smoke
 ```
 
-正式评测把 `--blocks` 改为 50 或 100，分别是 400 或 800 局，并用新的输出目录。CPU 资源有限时可以先跑 20 组（160 局），结合区间宽度再决定后续规模。程序顺序复用同一个引擎和两份已加载模型；`--cpu-threads` 控制 PyTorch 算子线程，不是并行对局数。
+正式评测把 `--blocks` 改为 50 或 100，分别是 400 或 800 局，并用新的输出目录。CPU 资源有限时可以先跑 20 组（160 局），结合区间宽度再决定后续规模。每一组的 8 局在同一个引擎的 8 个槽上同时推进，采集用训练的 compact 格式，不再逐局拉取完整 JSON。两份模型仍只加载一次。`--cpu-threads` 控制 PyTorch 算子线程，不是并行对局数。
 
 其他条件通过以下参数设置：
 

@@ -1,8 +1,9 @@
 """Evaluate two checkpoints in complete, sequential offline native matches."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
@@ -22,10 +23,15 @@ from .async_cluster_self_play import (
     parse_play_gap_ticks,
     space_plays_v4,
 )
+from .cluster_self_play import build_resident_engine_v4
 from .deck_pool import DeckPoolManifestV4
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .policy_session import build_policy_session_v4, load_policy_v4
+from .ppo_runtime import ppo_environment_config_v4
+
+# One training engine exposes eight resident slots, and one opening block is eight games.
+RESIDENT_EVAL_LANES = 8
 
 _DELAYABLE = frozenset({ActionKind.PLAY_CARD, ActionKind.ACTIVATE_ABILITY})
 
@@ -75,6 +81,357 @@ def sample_deck_pair(match, deck_pool, rng, *, battle_level=None):
     return paired, (decks[0].deck_id, decks[1].deck_id)
 
 
+def _choose_commands(
+    sessions,
+    observations,
+    *,
+    a_owner,
+    case,
+    seed,
+    game_index,
+    actions,
+    last_landing,
+    first_play_tick,
+    opening_requests,
+    opening_overrides,
+    delay_a_ticks,
+    delay_b_ticks,
+    min_play_gap_ticks,
+):
+    """One decision for both owners. Mutates the per-match counters in place."""
+
+    commands = {}
+    for owner, session in enumerate(sessions):
+        observation = observations[owner]
+        chosen = ()
+        if observation.tick >= FIRST_POLICY_DECISION_TICK:
+            side = "a" if owner == a_owner else "b"
+            if case is None:
+                decision = session.decide(observation)
+            else:
+                force_owner = _frozen_opponent_opening_force_owner_v4(
+                    current_owners=(a_owner,),
+                    active_actions=tuple(actions),
+                    tick=int(observation.tick),
+                    after_seconds=case.force_b_seconds,
+                )
+                force = owner == force_owner
+                opening_requests[owner] += int(force)
+                with paired_cpu_rng(seed, side, observation.tick):
+                    decision = session.decide(observation, force_opening=force)
+                opening_overrides[owner] += int(decision.forced_opening)
+            chosen = decision.decoded.actions
+            delay = delay_a_ticks if owner == a_owner else delay_b_ticks
+            if delay:
+                # The model's plays land this many ticks after the decision, as taps do on a
+                # live client; BattleEnvV1 keeps the slot pending and its elixir reserved.
+                chosen = tuple(
+                    replace(action, execute_offset_ticks=delay) if action.kind in _DELAYABLE else action
+                    for action in chosen
+                )
+            chosen, last_landing[owner] = space_plays_v4(
+                tuple(chosen),
+                min_play_gap_ticks,
+                (
+                    f"{game_index}-{owner}-{observation.tick}"
+                    if case is None
+                    else f"{seed}-{side}-{observation.tick}"
+                ),
+                decision_tick=int(observation.tick),
+                last_landing_tick=last_landing[owner],
+            )
+            actions[owner] += sum(action.kind != ActionKind.WAIT for action in chosen)
+            if first_play_tick[owner] is None and any(action.kind != ActionKind.WAIT for action in chosen):
+                first_play_tick[owner] = int(observation.tick)
+        else:
+            session.tensorizer.tensorize(observation, validate=False)
+        commands[owner] = tuple(chosen) or (ActionV1.wait(owner, ticks=POLICY_DECISION_TICKS),)
+    return commands
+
+
+def _absorb_step(observations, first_card_tick, rejected):
+    for observation in observations.values():
+        for owner in (0, 1):
+            first_card_tick[owner] = _first_successful_card_tick_v4(
+                observation.events, owner=owner, current=first_card_tick[owner]
+            )
+        for event in observation.events:
+            if event.event_type == "action_rejected":
+                rejected.add(json.dumps(event.to_dict(), sort_keys=True))
+
+
+def _match_row(
+    *,
+    game_index,
+    seed,
+    a_owner,
+    pair_ids,
+    observations,
+    terminated,
+    truncated,
+    actions,
+    first_play_tick,
+    first_card_tick,
+    rejected,
+    case,
+    opening_requests,
+    opening_overrides,
+):
+    terminal = observations[0].terminal
+    winner = None if terminal.winner is None else ("a" if terminal.winner == a_owner else "b")
+    row = {
+        "game": game_index + 1,
+        "seed": seed,
+        "a_owner": a_owner,
+        "winner": winner,
+        "terminated": terminated,
+        "truncated": truncated,
+        "tick": observations[0].tick,
+        "terminal": terminal.to_dict(),
+        "actions_by_owner": list(actions),
+        "deck_ids": None if pair_ids is None else {"a": pair_ids[a_owner], "b": pair_ids[1 - a_owner]},
+        # Decision tick of each side's first card or ability (it lands after any delay).
+        "first_play_seconds": {
+            side: None if first_play_tick[owner] is None else first_play_tick[owner] / 20
+            for side, owner in (("a", a_owner), ("b", 1 - a_owner))
+        },
+        "rejected_actions": len(rejected),
+        "first_card_executed_seconds": {
+            side: None if first_card_tick[owner] is None else first_card_tick[owner] / 20
+            for side, owner in (("a", a_owner), ("b", 1 - a_owner))
+        },
+    }
+    if case is not None:
+        row.update(case.metadata())
+        row["match"] = asdict(case.match)
+        for key, values in (("opening_requests", opening_requests), ("opening_overrides", opening_overrides)):
+            row[key] = {"a": values[a_owner], "b": values[1 - a_owner]}
+    return row
+
+
+def _summary_payload(games, rows):
+    result = {
+        "requested": games,
+        "completed": len(rows),
+        "a_wins": sum(row["winner"] == "a" for row in rows),
+        "b_wins": sum(row["winner"] == "b" for row in rows),
+        "draws": sum(row["terminated"] and row["winner"] is None for row in rows),
+        "truncated": sum(row["truncated"] for row in rows),
+    }
+    for side in ("a", "b"):
+        firsts = sorted(
+            row["first_play_seconds"][side] for row in rows if row["first_play_seconds"][side] is not None
+        )
+        if firsts:
+            result[f"{side}_first_play_seconds_10_50_90"] = [
+                firsts[min(len(firsts) - 1, int(quantile * len(firsts)))] for quantile in (0.1, 0.5, 0.9)
+            ]
+    return result
+
+
+_RESET_OPTIONS = {
+    "render_mode": "headless",
+    "decision_ticks": POLICY_DECISION_TICKS,
+    "event_driven_decisions": False,
+    "allow_initial_remaining_runtime_rejections": True,
+}
+
+
+@dataclass
+class _ResidentLane:
+    index: int
+    env_id: int
+    environment: object
+    case: object
+    seed: int
+    a_owner: int
+    deck_ids: object
+    sessions: list
+    observations: dict
+    actions: list
+    last_landing: list
+    first_play_tick: list
+    first_card_tick: list
+    opening_requests: list
+    opening_overrides: list
+    rejected: set
+    active: bool = True
+    terminated: bool = False
+    truncated: bool = False
+
+
+def _evaluate_resident(
+    policies,
+    *,
+    schedule,
+    games,
+    output,
+    host,
+    port,
+    device,
+    sample,
+    delay_a_ticks,
+    delay_b_ticks,
+    min_play_gap_ticks,
+):
+    """Play a paired schedule on one engine's resident slots.
+
+    A block is eight games and a training engine has eight slots, so each wave
+    locksteps one block. Capture is the training compact format. Decisions,
+    forced openings, delays and the paired RNG stay on this side of the socket.
+    """
+
+    engine = build_resident_engine_v4(
+        0,
+        environment_config=ppo_environment_config_v4(),
+        host=host,
+        base_port=port,
+        lanes=RESIDENT_EVAL_LANES,
+        capture_mode="compact",
+    )
+    rows = []
+    open_sessions = []
+    try:
+        for native in engine.natives:
+            native.public_card_play_events_from_combat_ring = True
+        engine.prepare()
+        with (output / "matches.jsonl").open("w", encoding="utf-8", buffering=1) as log:
+            with ThreadPoolExecutor(max_workers=RESIDENT_EVAL_LANES, thread_name_prefix="eval-lane") as executor:
+                for wave_start in range(0, len(schedule), RESIDENT_EVAL_LANES):
+                    wave = tuple(schedule[wave_start : wave_start + RESIDENT_EVAL_LANES])
+                    engine.coordinator.close_session()
+                    lanes = []
+                    for offset, case in enumerate(wave):
+                        environment = engine.environments[offset]
+                        if torch.device(device).type == "cpu":
+                            torch.set_rng_state(
+                                torch.Generator(device="cpu").manual_seed(case.match.seed).get_state()
+                            )
+                        observations, _info = environment.reset(match_config=case.match, options=_RESET_OPTIONS)
+                        elixir = {
+                            owner: next(player.elixir_exact for player in obs.players if player.owner == owner)
+                            for owner, obs in observations.items()
+                        }
+                        sessions = [
+                            build_policy_session_v4(
+                                environment,
+                                policies[0 if owner == case.a_owner else 1].model,
+                                actor_owner=owner,
+                                device=device,
+                                sample=sample,
+                            )
+                            for owner in (0, 1)
+                        ]
+                        for owner, session in enumerate(sessions):
+                            session.start_episode(observations[owner], initial_elixir=elixir)
+                        open_sessions.extend(sessions)
+                        lanes.append(
+                            _ResidentLane(
+                                index=wave_start + offset,
+                                env_id=int(getattr(environment.native, "env_id", offset)),
+                                environment=environment,
+                                case=case,
+                                seed=case.match.seed,
+                                a_owner=case.a_owner,
+                                deck_ids=case.deck_ids,
+                                sessions=sessions,
+                                observations=observations,
+                                actions=[0, 0],
+                                last_landing=[None, None],
+                                first_play_tick=[None, None],
+                                first_card_tick=[None, None],
+                                opening_requests=[0, 0],
+                                opening_overrides=[0, 0],
+                                rejected=set(),
+                            )
+                        )
+                    engine.coordinator.start_session()
+                    while any(lane.active for lane in lanes):
+                        pending = []
+                        for lane in lanes:
+                            if not lane.active:
+                                continue
+                            pending.append((
+                                lane,
+                                _choose_commands(
+                                    lane.sessions,
+                                    lane.observations,
+                                    a_owner=lane.a_owner,
+                                    case=lane.case,
+                                    seed=lane.seed,
+                                    game_index=lane.index,
+                                    actions=lane.actions,
+                                    last_landing=lane.last_landing,
+                                    first_play_tick=lane.first_play_tick,
+                                    opening_requests=lane.opening_requests,
+                                    opening_overrides=lane.opening_overrides,
+                                    delay_a_ticks=delay_a_ticks,
+                                    delay_b_ticks=delay_b_ticks,
+                                    min_play_gap_ticks=min_play_gap_ticks,
+                                ),
+                            ))
+                        engine.coordinator.begin_round(tuple(lane.env_id for lane, _commands in pending))
+                        futures = {
+                            executor.submit(
+                                lane.environment.step,
+                                commands,
+                                record_trace=False,
+                                policy_features_only=True,
+                            ): lane
+                            for lane, commands in pending
+                        }
+                        stepped = []
+                        try:
+                            for future in as_completed(futures):
+                                stepped.append((futures[future], future.result()))
+                        except BaseException as error:
+                            engine.coordinator.abort_round(error)
+                            for future in futures:
+                                future.cancel()
+                            raise
+                        else:
+                            engine.coordinator.finish_round()
+                        for lane, (observations, _rewards, terms, truncs, _info) in stepped:
+                            lane.observations = observations
+                            _absorb_step(observations, lane.first_card_tick, lane.rejected)
+                            lane.terminated = bool(terms["__all__"])
+                            lane.truncated = bool(truncs["__all__"])
+                            if not (lane.terminated or lane.truncated):
+                                continue
+                            lane.active = False
+                            row = _match_row(
+                                game_index=lane.index,
+                                seed=lane.seed,
+                                a_owner=lane.a_owner,
+                                pair_ids=lane.deck_ids,
+                                observations=observations,
+                                terminated=lane.terminated,
+                                truncated=lane.truncated,
+                                actions=lane.actions,
+                                first_play_tick=lane.first_play_tick,
+                                first_card_tick=lane.first_card_tick,
+                                rejected=lane.rejected,
+                                case=lane.case,
+                                opening_requests=lane.opening_requests,
+                                opening_overrides=lane.opening_overrides,
+                            )
+                            rows.append(row)
+                            log.write(json.dumps(row) + "\n")
+                            print(json.dumps(row), flush=True)
+                            for session in lane.sessions:
+                                session.end_episode()
+                            for session in lane.sessions:
+                                open_sessions.remove(session)
+                    engine.coordinator.close_session()
+        result = _summary_payload(games, rows)
+        (output / "summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        return result
+    finally:
+        for session in open_sessions:
+            session.end_episode()
+        engine.close()
+
+
 def evaluate(
     checkpoint_a,
     checkpoint_b,
@@ -111,15 +468,6 @@ def evaluate(
     for policy, temperature in zip(policies, (gate_temperature_a, gate_temperature_b), strict=True):
         if temperature is not None:
             policy.model.set_ppo_gate_temperature(float(temperature))
-    bundle = production_semantic_bundle()
-    native = NativeClashEnv(host, port, timeout=30.0)
-    native.public_card_play_events_from_combat_ring = True
-    environment = BattleEnvV1(
-        native=native,
-        card_catalog=bundle.native_card_catalog,
-        semantic_subset_contract=bundle.semantic_subset_contract,
-        effect_catalog=RuntimeEffectCatalog.from_catalog(bundle.native_effect_catalog),
-    )
     identity = {
         "games": games,
         "sample": sample,
@@ -132,12 +480,36 @@ def evaluate(
         "deck_pool": None if deck_pool is None else {"decks": len(deck_pool.decks), "schema": deck_pool.schema},
         "battle_level": battle_level,
         "schedule": None if schedule is None else [asdict(case) for case in schedule],
+        "transport": "resident-compact" if schedule is not None else "json",
         "checkpoints": [
             {"path": str(p.checkpoint_path), "sha256": p.checkpoint_sha256, "checkpoint_id": p.checkpoint_id}
             for p in policies
         ],
     }
     (output / "identity.json").write_text(json.dumps(identity, indent=2), encoding="utf-8")
+    if schedule is not None:
+        return _evaluate_resident(
+            policies,
+            schedule=schedule,
+            games=games,
+            output=output,
+            host=host,
+            port=port,
+            device=device,
+            sample=sample,
+            delay_a_ticks=delay_a_ticks,
+            delay_b_ticks=delay_b_ticks,
+            min_play_gap_ticks=min_play_gap_ticks,
+        )
+    bundle = production_semantic_bundle()
+    native = NativeClashEnv(host, port, timeout=30.0)
+    native.public_card_play_events_from_combat_ring = True
+    environment = BattleEnvV1(
+        native=native,
+        card_catalog=bundle.native_card_catalog,
+        semantic_subset_contract=bundle.semantic_subset_contract,
+        effect_catalog=RuntimeEffectCatalog.from_catalog(bundle.native_effect_catalog),
+    )
     rows = []
     sessions = []
     try:
@@ -204,106 +576,48 @@ def evaluate(
                 rejected = set()
                 terminated = truncated = False
                 while not terminated and not truncated:
-                    commands = {}
-                    for owner, session in enumerate(sessions):
-                        observation = observations[owner]
-                        chosen = ()
-                        if observation.tick >= FIRST_POLICY_DECISION_TICK:
-                            side = "a" if owner == a_owner else "b"
-                            if case is None:
-                                decision = session.decide(observation)
-                            else:
-                                force_owner = _frozen_opponent_opening_force_owner_v4(
-                                    current_owners=(a_owner,), active_actions=tuple(actions),
-                                    tick=int(observation.tick), after_seconds=case.force_b_seconds,
-                                )
-                                force = owner == force_owner
-                                opening_requests[owner] += int(force)
-                                with paired_cpu_rng(current.seed, side, observation.tick):
-                                    decision = session.decide(observation, force_opening=force)
-                                opening_overrides[owner] += int(decision.forced_opening)
-                            chosen = decision.decoded.actions
-                            delay = delay_a_ticks if owner == a_owner else delay_b_ticks
-                            if delay:
-                                # The model's plays land this many ticks after the decision, as taps do on a
-                                # live client; BattleEnvV1 keeps the slot pending and its elixir reserved.
-                                chosen = tuple(
-                                    replace(a, execute_offset_ticks=delay) if a.kind in _DELAYABLE else a
-                                    for a in chosen
-                                )
-                            chosen, last_landing[owner] = space_plays_v4(
-                                tuple(chosen),
-                                min_play_gap_ticks,
-                                (f"{index}-{owner}-{observation.tick}" if case is None
-                                 else f"{current.seed}-{side}-{observation.tick}"),
-                                decision_tick=int(observation.tick),
-                                last_landing_tick=last_landing[owner],
-                            )
-                            actions[owner] += sum(a.kind != ActionKind.WAIT for a in chosen)
-                            if first_play_tick[owner] is None and any(a.kind != ActionKind.WAIT for a in chosen):
-                                first_play_tick[owner] = int(observation.tick)
-                        else:
-                            session.tensorizer.tensorize(observation, validate=False)
-                        commands[owner] = tuple(chosen) or (ActionV1.wait(owner, ticks=POLICY_DECISION_TICKS),)
+                    commands = _choose_commands(
+                        sessions,
+                        observations,
+                        a_owner=a_owner,
+                        case=case,
+                        seed=current.seed,
+                        game_index=index,
+                        actions=actions,
+                        last_landing=last_landing,
+                        first_play_tick=first_play_tick,
+                        opening_requests=opening_requests,
+                        opening_overrides=opening_overrides,
+                        delay_a_ticks=delay_a_ticks,
+                        delay_b_ticks=delay_b_ticks,
+                        min_play_gap_ticks=min_play_gap_ticks,
+                    )
                     observations, _, terms, truncs, _ = environment.step(commands, record_trace=False)
                     terminated, truncated = bool(terms["__all__"]), bool(truncs["__all__"])
-                    for observation in observations.values():
-                        for owner in (0, 1):
-                            first_card_tick[owner] = _first_successful_card_tick_v4(
-                                observation.events, owner=owner, current=first_card_tick[owner]
-                            )
-                        for event in observation.events:
-                            if event.event_type == "action_rejected":
-                                rejected.add(json.dumps(event.to_dict(), sort_keys=True))
-                terminal = observations[0].terminal
-                winner = None if terminal.winner is None else ("a" if terminal.winner == a_owner else "b")
-                row = {
-                    "game": index + 1,
-                    "seed": current.seed,
-                    "a_owner": a_owner,
-                    "winner": winner,
-                    "terminated": terminated,
-                    "truncated": truncated,
-                    "tick": observations[0].tick,
-                    "terminal": terminal.to_dict(),
-                    "actions_by_owner": actions,
-                    "deck_ids": None if pair_ids is None else {"a": pair_ids[a_owner], "b": pair_ids[1 - a_owner]},
-                    # Decision tick of each side's first card or ability (it lands after any delay).
-                    "first_play_seconds": {
-                        side: None if first_play_tick[owner] is None else first_play_tick[owner] / 20
-                        for side, owner in (("a", a_owner), ("b", 1 - a_owner))
-                    },
-                    "rejected_actions": len(rejected),
-                    "first_card_executed_seconds": {
-                        side: None if first_card_tick[owner] is None else first_card_tick[owner] / 20
-                        for side, owner in (("a", a_owner), ("b", 1 - a_owner))
-                    },
-                }
-                if case is not None:
-                    row.update(case.metadata())
-                    row["match"] = asdict(current)
-                    for key, values in (("opening_requests", opening_requests), ("opening_overrides", opening_overrides)):
-                        row[key] = {"a": values[a_owner], "b": values[1 - a_owner]}
+                    _absorb_step(observations, first_card_tick, rejected)
+                row = _match_row(
+                    game_index=index,
+                    seed=current.seed,
+                    a_owner=a_owner,
+                    pair_ids=pair_ids,
+                    observations=observations,
+                    terminated=terminated,
+                    truncated=truncated,
+                    actions=actions,
+                    first_play_tick=first_play_tick,
+                    first_card_tick=first_card_tick,
+                    rejected=rejected,
+                    case=case,
+                    opening_requests=opening_requests,
+                    opening_overrides=opening_overrides,
+                )
                 rows.append(row)
                 log.write(json.dumps(row) + "\n")
                 print(json.dumps(row), flush=True)
                 for session in sessions:
                     session.end_episode()
                 sessions = []
-        result = {
-            "requested": games,
-            "completed": len(rows),
-            "a_wins": sum(r["winner"] == "a" for r in rows),
-            "b_wins": sum(r["winner"] == "b" for r in rows),
-            "draws": sum(r["terminated"] and r["winner"] is None for r in rows),
-            "truncated": sum(r["truncated"] for r in rows),
-        }
-        for side in ("a", "b"):
-            firsts = sorted(r["first_play_seconds"][side] for r in rows if r["first_play_seconds"][side] is not None)
-            if firsts:
-                result[f"{side}_first_play_seconds_10_50_90"] = [
-                    firsts[min(len(firsts) - 1, int(q * len(firsts)))] for q in (0.1, 0.5, 0.9)
-                ]
+        result = _summary_payload(games, rows)
         (output / "summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
     finally:
