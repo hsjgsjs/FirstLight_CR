@@ -154,12 +154,30 @@ def _choose_commands(
     return commands
 
 
+def _forward_index_group(entries, indexes):
+    sessions = [entries[index][0] for index in indexes]
+    model = sessions[0].model
+    device = sessions[0].device
+    combined = concatenate_padded_tensor_records(tuple(entries[index][1] for index in indexes))
+    combined_input = combined.to_model_input(device)
+    state = concatenate_tensor_records(tuple(session.state for session in sessions)).to(device)
+    episode_start = torch.tensor(
+        [bool(entries[index][2]) for index in indexes], dtype=torch.bool, device=device
+    )
+    context = model.forward(combined_input, state, episode_start=episode_start, validate=False)
+    return [
+        (combined_input.narrow_batch(local, 1), context.narrow_batch(local, 1))
+        for local in range(len(indexes))
+    ]
+
+
 def forward_resident_contexts(entries):
     """One forward per model for every ready decision.
 
     ``entries`` are ``(session, host batch, first decision)``. The returned host
     row and context stay on the model device, because the action heads live there.
-    Sampling is still per row, under the paired generator.
+    Rows are forwarded a few at a time so a 22 GiB GPU is not asked for sixteen
+    spatial maps at once. Sampling is still per row, under the paired generator.
     """
 
     results = [None] * len(entries)
@@ -167,18 +185,22 @@ def forward_resident_contexts(entries):
     for index, (session, _host, _first) in enumerate(entries):
         grouped.setdefault(id(session.model), []).append(index)
     for indexes in grouped.values():
-        sessions = [entries[index][0] for index in indexes]
-        model = sessions[0].model
-        device = sessions[0].device
-        combined = concatenate_padded_tensor_records(tuple(entries[index][1] for index in indexes))
-        combined_input = combined.to_model_input(device)
-        state = concatenate_tensor_records(tuple(session.state for session in sessions)).to(device)
-        episode_start = torch.tensor(
-            [bool(entries[index][2]) for index in indexes], dtype=torch.bool, device=device
-        )
-        context = model.forward(combined_input, state, episode_start=episode_start, validate=False)
-        for local, index in enumerate(indexes):
-            results[index] = (combined_input.narrow_batch(local, 1), context.narrow_batch(local, 1))
+        chunk = min(4, len(indexes))
+        while True:
+            try:
+                produced = []
+                for start in range(0, len(indexes), chunk):
+                    produced.extend(_forward_index_group(entries, indexes[start : start + chunk]))
+                break
+            except torch.cuda.OutOfMemoryError as oom:
+                produced = []
+                if chunk == 1:
+                    raise
+                chunk = max(1, chunk // 2)
+                del oom
+                torch.cuda.empty_cache()
+        for index, row in zip(indexes, produced, strict=True):
+            results[index] = row
     return results
 
 
@@ -607,6 +629,9 @@ def evaluate(
     }
     (output / "identity.json").write_text(json.dumps(identity, indent=2), encoding="utf-8")
     if schedule is not None:
+        policies = _share_identical_policies(policies)
+        if torch.device(device).type == "cuda":
+            torch.cuda.empty_cache()
         return _evaluate_resident(
             policies,
             schedule=schedule,
