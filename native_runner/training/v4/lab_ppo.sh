@@ -497,6 +497,12 @@ early = [r["early_first_play_penalty_total"][o] for r, o in seats if "early_firs
 if early and any(early):
     print(f"  opened the game early: {sum(value > 0 for value in early) / len(early):.0%} of games, "
           f"mean penalty {statistics.mean(early):.3f}")
+# Only with --fixed-opponent-opening-force-after-seconds: fixed opponents made to open the game.
+frozen = [r for r in recent if r["policy_matchup"] == "current-history"]
+forced = [r["opening_forced_tick"] / 20 for r in frozen if r.get("opening_forced_owner") is not None]
+if forced:
+    print(f"  fixed opponents forced to open: {len(forced) / len(frozen):.0%} of their games, "
+          f"median at {statistics.median(forced):.0f}s")
 # Win rate against each frozen opponent, earliest games versus latest; self-play is always about 50%.
 fixed = [r for r in rows if r["policy_matchup"] == "current-history" and r.get("opponent_checkpoint_id")]
 for opponent in sorted({r["opponent_checkpoint_id"] for r in fixed}, key=lambda value: names.get(value, value)):

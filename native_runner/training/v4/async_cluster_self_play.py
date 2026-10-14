@@ -212,7 +212,7 @@ def _frozen_opponent_opening_force_owner_v4(
     current_owners: tuple[int, ...],
     active_actions: tuple[int, int],
     tick: int,
-    after_seconds: int | None,
+    after_seconds: float | None,
     policy_matchup: str | None = None,
     il_after_seconds: int | None = None,
 ) -> int | None:
@@ -235,6 +235,25 @@ def _frozen_opponent_opening_force_owner_v4(
     if active_actions[opponent_owner] > 0 or tick < after_seconds * TICKS_PER_SECOND:
         return None
     return opponent_owner
+
+
+def opening_force_seconds_v4(bounds: tuple[float, float] | None, key: object) -> float | None:
+    """The battle time, drawn uniformly from ``bounds`` and fixed per game by ``key``, to force an opening."""
+
+    if bounds is None:
+        return None
+    return random.Random(f"opening-force-{key}").uniform(*bounds)
+
+
+def parse_seconds_range(value: str) -> tuple[float, float]:
+    low, _, high = value.strip().partition("-")
+    try:
+        bounds = (float(low), float(high or low))
+    except ValueError:
+        raise ValueError("expected N or MIN-MAX seconds, e.g. 8-20") from None
+    if not 0.0 < bounds[0] <= bounds[1] <= 180.0:
+        raise ValueError("seconds must satisfy 0 < MIN <= MAX <= 180")
+    return bounds
 
 
 def _elixir_overflow_penalty_transition_v4(
@@ -643,7 +662,9 @@ class AsyncResidentEngineSpecV4:
     worker_switch_interval_ms: float = 5.0
     diagnostic_timing: bool = False
     segment_decision_steps: int | None = None
-    force_frozen_opponent_opening_after_seconds: int | None = None
+    # (min, max) battle seconds: a frozen opponent that has not played by a time drawn per game from this
+    # range is forced to play its first card then.
+    force_frozen_opponent_opening_after_seconds: tuple[float, float] | None = None
     force_il_opponent_opening_after_seconds: int | None = None
     execution_delay_ticks: tuple[int, int] | None = None
     # Minimum ticks, drawn from (min, max), between an owner's consecutive plays and abilities landing.
@@ -1002,10 +1023,8 @@ def _engine_worker(
     segment_decision_steps = spec.segment_decision_steps
     if segment_decision_steps is None or segment_decision_steps <= 0:
         raise ValueError("async segment decision steps must be positive")
-    if (
-        spec.force_frozen_opponent_opening_after_seconds is not None
-        and spec.force_frozen_opponent_opening_after_seconds <= 0
-    ):
+    force_bounds = spec.force_frozen_opponent_opening_after_seconds
+    if force_bounds is not None and not 0.0 < force_bounds[0] <= force_bounds[1]:
         raise ValueError("frozen-opponent opening timeout must be positive")
     if spec.force_il_opponent_opening_after_seconds is not None and spec.force_il_opponent_opening_after_seconds <= 0:
         raise ValueError("IL opening timeout must be positive")
@@ -1091,7 +1110,9 @@ def _engine_worker(
                     current_owners=runtime.assignment.matchup.current_owners,
                     active_actions=runtime.active_actions,
                     tick=int(runtime.observations[0].tick),
-                    after_seconds=(spec.force_frozen_opponent_opening_after_seconds),
+                    after_seconds=opening_force_seconds_v4(
+                        force_bounds, runtime.assignment.matchup.sequence
+                    ),
                     policy_matchup=runtime.assignment.matchup.policy_matchup,
                     il_after_seconds=(spec.force_il_opponent_opening_after_seconds),
                 )
