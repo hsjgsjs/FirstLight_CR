@@ -418,6 +418,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = _parse_args(argv)
     if not args.serial:
         raise SystemExit("set CR_ADB_SERIAL or pass --serial for the offline instance")
+    subprocess.run([args.adb, "connect", args.serial], capture_output=True)
+    subprocess.run([args.adb, "-s", args.serial, "root"], capture_output=True)
+    subprocess.run([args.adb, "-s", args.serial, "wait-for-device"], capture_output=True)
     device = Device(args.adb, args.serial)
     content_sha, fingerprint = device_fingerprint(device)
     if args.command == "discover":

@@ -1891,17 +1891,18 @@ class CRHarnessInterface:
     def _launch_overlay(self, *, owner: int | None = None) -> None:
         from .phone_touch import apply_touch_settings, phone_mode_enabled
 
-        if phone_mode_enabled():
-            # The phone's own touch screen is the controller.  Lock it to the
-            # human side and load the calibrated layout instead of a Windows
-            # overlay.
+        direct_touch = phone_mode_enabled() or setting("CR_DIRECT_TOUCH", "true").strip().casefold() in ("1", "true", "yes")
+        if direct_touch:
+            # The Android touch screen (phone, screen mirroring, or direct MuMu touch)
+            # is the controller.  Lock it to the human side and load the calibrated
+            # or auto-scaled layout instead of an intercepting Windows overlay.
             from .cr_native_env import NativeClashEnv
 
             try:
                 apply_touch_settings(NativeClashEnv(CONTROL_HOST, CONTROL_PORT, timeout=15.0), owner=owner)
             except Exception as error:
-                LOGGER.warning("phone touch settings failed: %s", error)
-                self._post(self._append_log, f"手机触控设置失败：{error}")
+                LOGGER.warning("touch settings failed: %s", error)
+                self._post(self._append_log, f"屏幕触控设置失败：{error}")
             return
         if self.overlay_process is None or self.overlay_process.poll() is not None:
             self.overlay_process, self.overlay_log = self._launch_python(
@@ -1918,8 +1919,9 @@ class CRHarnessInterface:
         self._set_busy(False)
         from .phone_touch import phone_mode_enabled
 
-        if phone_mode_enabled():
-            self._append_log("对局已在手机上启动：拖动或点选手牌到场地出牌；点自己场上的英雄/冠军释放技能。")
+        direct_touch = phone_mode_enabled() or setting("CR_DIRECT_TOUCH", "true").strip().casefold() in ("1", "true", "yes")
+        if direct_touch:
+            self._append_log("对局已启动（屏幕原生直触模式）：拖动或点选手牌到场地出牌；点自己场上的英雄/冠军释放技能。")
         else:
             self._append_log("对局已启动；请切到 MuMu，点击上方或下方手牌后再点击场地。")
 

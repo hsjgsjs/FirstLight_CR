@@ -530,8 +530,11 @@ def run(args: argparse.Namespace) -> None:
         while args.games == 0 or played < args.games:
             print("等待对局……（在手机上向 MuMu 账号发起友谊战）")
             last = wait_for_battle(control, last)
-            play_battle(model, args, layout, taps)
-            played += 1
+            try:
+                play_battle(model, args, layout, taps)
+                played += 1
+            except RunnerError as error:
+                print(f"对局未能正常开始或提前结束（{error}），继续等待下一局……")
     finally:
         try:
             control._request("live off")

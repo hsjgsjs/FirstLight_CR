@@ -182,6 +182,16 @@ def apply_touch_settings(env: NativeClashEnv, *, owner: int | None, path: Path =
     """Send the saved phone layout, the owner lock and ability taps to the probe."""
 
     layout = load_layout(path)
+    if layout is None:
+        try:
+            screen = screen_size()
+            if screen and screen != (1080, 1920):
+                scale = screen[0] / 1080
+                candidate = tuple(round(x * scale) for x in DEFAULT_LAYOUT)
+                validate_layout(candidate)
+                layout = candidate
+        except Exception:
+            pass
     if layout is not None:
         _require_ok(env.set_touch_layout(layout), "touch layout")
     _require_ok(env.set_touch_calibrating(False), "touch calibrate")
