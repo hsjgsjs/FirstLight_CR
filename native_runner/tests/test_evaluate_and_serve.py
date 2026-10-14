@@ -350,6 +350,40 @@ def test_forward_resident_contexts_batches_each_model():
     assert tuple(rows[0][0].hidden.shape) == (1, 2)
 
 
+def test_resident_inference_does_not_retain_recurrent_autograd_graphs():
+    import torch
+
+    from native_runner.training.v4.tensors import RecurrentPolicyStateV4
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 2)
+
+        def forward(self, batch, state, episode_start=None, validate=False):
+            return RecurrentPolicyStateV4(
+                hidden=self.linear(batch.hidden + state.hidden),
+                cell=self.linear(batch.cell + state.cell),
+            )
+
+    model = Model().eval()
+    batch = RecurrentPolicyStateV4(hidden=torch.ones(1, 2), cell=torch.ones(1, 2))
+    # More than four sessions exercises chunking as well as recurrent feedback.
+    sessions = [NS(model=model, state=batch, device=torch.device("cpu")) for _ in range(6)]
+    with torch.enable_grad():
+        for step in range(10):
+            rows = evaluate.forward_resident_contexts([
+                (session, batch, step == 0) for session in sessions
+            ])
+            for session, (_, context) in zip(sessions, rows, strict=True):
+                for tensor in (context.hidden, context.cell):
+                    assert not tensor.requires_grad
+                    assert tensor.grad_fn is None
+                session.state = context
+            assert torch.is_grad_enabled()
+    assert all(parameter.requires_grad for parameter in model.parameters())
+
+
 def test_duel_gives_each_engine_up_to_eight_cores():
     from native_runner.duel import duel_cpu_layout
 

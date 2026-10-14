@@ -185,12 +185,16 @@ def _forward_index_group(entries, indexes, device):
     ]
 
 
+@torch.inference_mode()
 def forward_resident_contexts(entries):
     """One forward per model for every ready decision.
 
     ``entries`` are ``(session, host batch, first decision)``. Only one model
     occupies the GPU at a time. A chunk that does not fit falls back to CPU,
     and that model stays on CPU so sampling uses the same device.
+
+    Disable autograd for the entire batch, including recurrent-state assembly.
+    eval() alone would retain a growing graph through each session's LSTM state.
     """
 
     results = [None] * len(entries)
