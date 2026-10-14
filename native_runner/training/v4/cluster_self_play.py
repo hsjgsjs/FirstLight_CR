@@ -103,6 +103,7 @@ class _MatchRuntimeV4:
     game_elixir_overflow_wasted: tuple[float, float] = (0.0, 0.0)
     game_elixir_overflow_cost_accrued: tuple[float, float] = (0.0, 0.0)
     game_elixir_overflow_penalty_total: tuple[float, float] = (0.0, 0.0)
+    early_first_play_penalty_total: tuple[float, float] = (0.0, 0.0)
     hog_deployments: tuple[int, int] = (0, 0)
     hog_deploy_reward_total: tuple[float, float] = (0.0, 0.0)
     first_hog_timing_reward_total: tuple[float, float] = (0.0, 0.0)
@@ -394,6 +395,7 @@ def _terminal_report(runtime: _MatchRuntimeV4) -> dict[str, object]:
         "first_elixir_overflow_tick": runtime.first_elixir_overflow_tick,
         "game_elixir_overflow_wasted": runtime.game_elixir_overflow_wasted,
         "game_elixir_overflow_penalty_total": runtime.game_elixir_overflow_penalty_total,
+        "early_first_play_penalty_total": runtime.early_first_play_penalty_total,
         "rejected_actions": runtime.rejected_actions,
         "rejection_details": tuple(runtime.rejection_details),
         "elapsed_seconds": time.perf_counter() - runtime.started,

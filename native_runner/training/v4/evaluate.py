@@ -34,6 +34,8 @@ def evaluate(
     delay_a_ticks=0,
     delay_b_ticks=0,
     min_play_gap_ticks=None,
+    gate_temperature_a=None,
+    gate_temperature_b=None,
 ):
     if games < 1:
         raise ValueError("games must be positive")
@@ -44,6 +46,11 @@ def evaluate(
     if torch.device(device).type == "cuda" and torch.device(device).index is not None:
         torch.cuda.set_device(torch.device(device))
     policies = [load_policy_v4(path, device=device) for path in (checkpoint_a, checkpoint_b)]
+    # Checkpoints carry the gate temperature of the update that saved them; --sample uses it unless overridden.
+    saved_gate_temperatures = [policy.model.ppo_gate_temperature for policy in policies]
+    for policy, temperature in zip(policies, (gate_temperature_a, gate_temperature_b), strict=True):
+        if temperature is not None:
+            policy.model.set_ppo_gate_temperature(float(temperature))
     bundle = production_semantic_bundle()
     native = NativeClashEnv(host, port, timeout=30.0)
     native.public_card_play_events_from_combat_ring = True
@@ -59,6 +66,8 @@ def evaluate(
         "delay_a_ticks": delay_a_ticks,
         "delay_b_ticks": delay_b_ticks,
         "min_play_gap_ticks": min_play_gap_ticks,
+        "saved_gate_temperatures": saved_gate_temperatures,
+        "gate_temperatures": [policy.model.ppo_gate_temperature for policy in policies],
         "match": asdict(match),
         "checkpoints": [
             {"path": str(p.checkpoint_path), "sha256": p.checkpoint_sha256, "checkpoint_id": p.checkpoint_id}
@@ -111,6 +120,7 @@ def evaluate(
                     session.start_episode(observations[owner], initial_elixir=initial_elixir)
                 actions = [0, 0]
                 last_landing = [None, None]
+                first_play_tick = [None, None]
                 rejected = set()
                 terminated = truncated = False
                 while not terminated and not truncated:
@@ -136,6 +146,8 @@ def evaluate(
                                 last_landing_tick=last_landing[owner],
                             )
                             actions[owner] += sum(a.kind != ActionKind.WAIT for a in chosen)
+                            if first_play_tick[owner] is None and any(a.kind != ActionKind.WAIT for a in chosen):
+                                first_play_tick[owner] = int(observation.tick)
                         else:
                             session.tensorizer.tensorize(observation, validate=False)
                         commands[owner] = tuple(chosen) or (ActionV1.wait(owner, ticks=POLICY_DECISION_TICKS),)
@@ -157,6 +169,11 @@ def evaluate(
                     "tick": observations[0].tick,
                     "terminal": terminal.to_dict(),
                     "actions_by_owner": actions,
+                    # Decision tick of each side's first card or ability (it lands after any delay).
+                    "first_play_seconds": {
+                        side: None if first_play_tick[owner] is None else first_play_tick[owner] / 20
+                        for side, owner in (("a", a_owner), ("b", 1 - a_owner))
+                    },
                     "rejected_actions": len(rejected),
                 }
                 rows.append(row)
@@ -173,6 +190,12 @@ def evaluate(
             "draws": sum(r["terminated"] and r["winner"] is None for r in rows),
             "truncated": sum(r["truncated"] for r in rows),
         }
+        for side in ("a", "b"):
+            firsts = sorted(r["first_play_seconds"][side] for r in rows if r["first_play_seconds"][side] is not None)
+            if firsts:
+                result[f"{side}_first_play_seconds_10_50_90"] = [
+                    firsts[min(len(firsts) - 1, int(q * len(firsts)))] for q in (0.1, 0.5, 0.9)
+                ]
         (output / "summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
     finally:
@@ -210,6 +233,12 @@ def main(argv=None):
         type=parse_play_gap_ticks,
         help="land each side's consecutive plays and abilities at least MIN-MAX ticks apart (4-8 = 200-400 ms)",
     )
+    parser.add_argument(
+        "--gate-temperature-a",
+        type=float,
+        help="with --sample, model A's act/wait temperature (default: the one saved in its checkpoint)",
+    )
+    parser.add_argument("--gate-temperature-b", type=float, help="the same for model B")
     args = parser.parse_args(argv)
     config = json.loads(args.match_config.read_text(encoding="utf-8")) if args.match_config else {}
     for key in ("owner0_account_id", "owner1_account_id"):
@@ -229,6 +258,8 @@ def main(argv=None):
         delay_a_ticks=args.delay_a_ticks,
         delay_b_ticks=args.delay_b_ticks,
         min_play_gap_ticks=args.min_play_gap_ticks,
+        gate_temperature_a=args.gate_temperature_a,
+        gate_temperature_b=args.gate_temperature_b,
     )
     return 0
 

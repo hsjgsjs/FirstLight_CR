@@ -228,6 +228,7 @@ python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --game
   - 圣水溢出惩罚 `--personal-elixir-overflow-penalty 0.01`，满格后多浪费 1 点就开始扣（`--personal-elixir-overflow-grace 1`）；
   - gate 温度在前 3000 次更新里从 0.5 降到 0.2，让模型前期多尝试早出牌，最后回到默认值。
 - **整局圣水浪费惩罚（可选）**：`--game-elixir-overflow-penalty C --game-elixir-overflow-grace G`。从学习者**第一张牌真正下出之后**开始，把整局满格浪费的圣水累加，超过 G 点后每多浪费 1 点扣 C。开局为了等对手而满格等待不算在内。上面那条按段计算的惩罚，每次圣水降到 10 以下就清零，所以一局里可以反复白白浪费；这一项补上了整局总量。参照：人类录像里胜方整局浪费的中位数约 2.3 点（`elixir_leaked`）。`status` 会显示「after the first card」这一行。已有的训练用 `options` 加上，下一次续训自动热启动。
+- **过早先手惩罚（可选）**：`--early-first-play-penalty C --early-first-play-free-seconds T`。学习者在对手还没有牌落地时抢先下出全场第一张牌，按出牌时间扣分：第一个决策点（4.5 秒）扣 C，线性降到 T 秒时为 0。对手已经先下牌时应对不扣。建议 C = 0.1、T = 14（开局 5 点圣水涨满的时间）。和满圣水惩罚一起，给开局留出 14–22 秒的自由区间。`status` 会显示先手被罚的比例。已有的训练用 `options` 加上，下一次续训自动热启动。
 - **GPU 数量看引擎数。** 引擎少时单卡更快；引擎多到单卡显存不够时用双卡。
 - **对手池快照间隔**改成 200 次更新一次。默认每 8 次一次，几天就会把硬盘写满。
 - **评测要看两件事**：一是双方都带延迟时，训练出的模型对 General 的胜率；二是每局出牌次数，以及第一张牌出得早不早。不只看胜率。
