@@ -893,6 +893,15 @@ def main() -> int:
         "--il-anchor-checkpoint", type=Path, help="frozen IL opponent checkpoint; defaults to --checkpoint"
     )
     parser.add_argument(
+        "--warm-start-optimizer",
+        action="store_true",
+        help=(
+            "also load the optimizer state saved in --checkpoint (a strict PPO checkpoint of an earlier run), "
+            "so a warm start with changed options does not restart Adam's moment estimates; the learning "
+            "rate stays --learning-rate. A checkpoint without optimizer state starts a fresh optimizer."
+        ),
+    )
+    parser.add_argument(
         "--execution-delay-ticks",
         type=parse_execution_delay_ticks,
         help=(
@@ -1243,7 +1252,17 @@ def main() -> int:
     current_model.set_ppo_location_head_fp32(True)
     optimizer = torch.optim.AdamW(current_model.parameters(), lr=args.learning_rate, eps=1e-5, weight_decay=0.0)
     if args.resume_checkpoint is None:
-        current_payload = load_actor_critic_checkpoint(args.checkpoint, current_model, map_location=device)
+        current_payload = load_actor_critic_checkpoint(
+            args.checkpoint,
+            current_model,
+            optimizer=optimizer if args.warm_start_optimizer else None,
+            map_location=device,
+        )
+        if args.warm_start_optimizer:
+            if current_payload.get("optimizer_state_dict") is None:
+                print("warm start: the checkpoint has no optimizer state; starting a fresh optimizer", flush=True)
+            for group in optimizer.param_groups:
+                group["lr"] = args.learning_rate
         _set_temperatures(
             current_model,
             gate_temperature=_gate_temperature_for_update(

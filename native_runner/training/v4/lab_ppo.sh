@@ -24,7 +24,7 @@
 # default to the sparring configuration in docs/lab_training_zh.md and CR_PPO_EXTRA_ARGS replaces them;
 # a resume reuses the options saved in runs/NAME/trainer-options.txt (CR_PPO_EXTRA_ARGS on a resume, or the
 # options command, replaces them; the changed options then take effect through a warm start: the newest
-# strict checkpoint's weights, a fresh optimizer and update count). Other settings:
+# strict checkpoint's weights and optimizer state, a fresh update count). Other settings:
 # CR_PPO_ENGINE_COUNT (8), CR_LAB_ENGINE_CPUS (0-7), CR_LAB_WORKER_CPUS (8-15), CR_LAB_CONTROL_CPUS (16-19), CR_LAB_TRAIN_GPUS
 # (0; nvidia-smi numbers, e.g. 0,1), CR_LAB_KEEP_CHECKPOINTS (3) and CR_LAB_CHECKPOINT_BUCKET (1000):
 # the newest few strict checkpoints are kept plus the first one in every bucket of that many updates.
@@ -252,7 +252,10 @@ run() {
   echo "$extra" >"$run_dir/trainer-options.txt"
   echo "$extra" >"$run_dir/options-$(basename "$stage").txt"
   log "training to update $updates on GPU $train_gpus into $stage${resume:+ from $resume}"
-  CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$train_gpus CR_PPO_EXTRA_ARGS=$extra \
+  # A warm start from this run's own checkpoint keeps its optimizer state (not saved as a run option).
+  local trainer_extra=$extra
+  [[ -z ${CR_LAB_WARM_START_OPTIMIZER:-} ]] || trainer_extra+=" --warm-start-optimizer"
+  CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$train_gpus CR_PPO_EXTRA_ARGS=$trainer_extra \
     bash "$script_dir/launch_ppo_multinode_training.sh" "$stage" "$run_dir/topology.json" "$updates" \
     "${CR_PPO_SEGMENT_SECONDS:-40}" "$resume" >>"$logs/trainer.log" 2>&1 &
   local trainer_pid=$!
@@ -360,6 +363,7 @@ case ${1:-} in
       echo "trainer options changed since $checkpoint; warm-starting a new stage from it with:"
       cat "$runs/$1/trainer-options.txt"
       export CR_PPO_CHECKPOINT=$checkpoint CR_PPO_EXTRA_ARGS="$(<"$runs/$1/trainer-options.txt")"
+      export CR_LAB_WARM_START_OPTIMIZER=1
       start "$1" "${2:-30000}"
     elif [[ -n $checkpoint ]]; then
       echo "resuming from $checkpoint"
