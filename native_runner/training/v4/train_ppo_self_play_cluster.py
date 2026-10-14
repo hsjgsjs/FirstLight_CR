@@ -927,6 +927,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--fixed-opponent-opening-force-after-seconds",
+        type=int,
+        help=(
+            "force a frozen opponent's (fixed checkpoint or league snapshot) first legal ACT after this battle "
+            "time if it has not acted, so the learner cannot profit from opponents that wait for minutes"
+        ),
+    )
+    parser.add_argument(
         "--self-play-percent", type=int, default=0, help="percent of games using current versus current"
     )
     parser.add_argument(
@@ -1054,6 +1062,11 @@ def main() -> int:
         raise ValueError("expert Hog gate supervision requires an expert BC manifest")
     if args.il_opening_force_after_seconds is not None and args.il_opening_force_after_seconds <= 0:
         raise ValueError("IL opening timeout must be positive")
+    if (
+        args.fixed_opponent_opening_force_after_seconds is not None
+        and args.fixed_opponent_opening_force_after_seconds <= 0
+    ):
+        raise ValueError("fixed-opponent opening force time must be positive")
     opening_force_config = (
         {"enabled": False}
         if args.il_opening_force_after_seconds is None
@@ -1412,6 +1425,10 @@ def main() -> int:
         resume_contract["game_elixir_overflow"] = list(game_elixir_overflow)
     if args.min_play_gap_ticks is not None:
         resume_contract["min_play_gap_ticks"] = list(args.min_play_gap_ticks)
+    if args.fixed_opponent_opening_force_after_seconds is not None:
+        resume_contract["fixed_opponent_opening_force_after_seconds"] = (
+            args.fixed_opponent_opening_force_after_seconds
+        )
     # Omit the optional key when disabled to preserve old no-BC strict resumes.
     if expert_bc_contract is not None:
         resume_contract["expert_bc"] = expert_bc_contract
@@ -1497,6 +1514,7 @@ def main() -> int:
             worker_host=engine_worker_hosts[engine_index],
             worker_port=engine_worker_ports[engine_index],
             force_il_opponent_opening_after_seconds=(args.il_opening_force_after_seconds),
+            force_frozen_opponent_opening_after_seconds=args.fixed_opponent_opening_force_after_seconds,
             execution_delay_ticks=args.execution_delay_ticks,
             game_elixir_overflow=game_elixir_overflow,
             min_play_gap_ticks=args.min_play_gap_ticks,
