@@ -518,6 +518,11 @@ def run(args: argparse.Namespace) -> None:
         print(f"注意：{args.layout} 还没校准（屏幕 {width}x{height}），点击位置可能不准。先用 shot 检查。")
     taps = None if args.dry_run else AdbTaps()
     model = load_policy_v4(args.checkpoint, device=args.device).model
+    # A training checkpoint keeps the act/wait temperature of the update that saved it (0.5 early in a run);
+    # sampling with it plays noticeably more randomly than the released models' 0.2.
+    if args.gate_temperature is not None:
+        model.set_ppo_gate_temperature(args.gate_temperature)
+    print(f"gate temperature {model.ppo_gate_temperature:g}")
     control = NativeClashEnv(CONTROL_HOST, CONTROL_PORT, timeout=10.0)
     control._request("live on")
     played, last = 0, None
@@ -639,6 +644,9 @@ def main(argv: Iterable[str] | None = None) -> int:
             command.add_argument("--dry-run", action="store_true", help="decide and log, but do not tap")
             command.add_argument("--deterministic", action="store_true",
                                  help="always take the most likely action (rarely plays; default samples)")
+            command.add_argument("--gate-temperature", type=float,
+                                 help="act/wait sampling temperature (default: the one saved in the checkpoint; "
+                                 "0.2 for the released models)")
     args = parser.parse_args(None if argv is None else list(argv))
     if args.command == "shot":
         shot(args)
