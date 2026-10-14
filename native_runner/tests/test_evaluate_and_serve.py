@@ -8,6 +8,13 @@ from native_runner.match_factory import MatchConfig
 from native_runner.training.v4 import evaluate, serve_policy
 
 
+
+class _Model(str):
+    """A checkpoint path standing in for a model; evaluate reads its saved gate temperature."""
+
+    ppo_gate_temperature = 0.2
+
+
 def test_evaluation_counts_complete_matches_and_alternates_models(monkeypatch, tmp_path):
     assignments, seeds, ended = [], [], []
     terminal = NS(winner=0, to_dict=lambda: {"winner": 0, "ended": True})
@@ -40,7 +47,9 @@ def test_evaluation_counts_complete_matches_and_alternates_models(monkeypatch, t
     monkeypatch.setattr(
         evaluate,
         "load_policy_v4",
-        lambda path, **k: NS(model=path, checkpoint_path=Path(path), checkpoint_sha256="hash", checkpoint_id=path),
+        lambda path, **k: NS(
+            model=_Model(path), checkpoint_path=Path(path), checkpoint_sha256="hash", checkpoint_id=path
+        ),
     )
     monkeypatch.setattr(
         evaluate,
@@ -86,7 +95,9 @@ def test_evaluation_delays_only_model_b_plays(monkeypatch, tmp_path):
     monkeypatch.setattr(
         evaluate,
         "load_policy_v4",
-        lambda path, **k: NS(model=path, checkpoint_path=Path(path), checkpoint_sha256="hash", checkpoint_id=path),
+        lambda path, **k: NS(
+            model=_Model(path), checkpoint_path=Path(path), checkpoint_sha256="hash", checkpoint_id=path
+        ),
     )
     monkeypatch.setattr(
         evaluate,

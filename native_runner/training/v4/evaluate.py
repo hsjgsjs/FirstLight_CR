@@ -3,7 +3,9 @@
 import argparse
 from dataclasses import asdict, replace
 import json
+import math
 from pathlib import Path
+import random
 
 import torch
 
@@ -13,11 +15,43 @@ from ...cr_native_env import DEFAULT_HOST, DEFAULT_PORT, NativeClashEnv
 from ...match_factory import MatchConfig
 from ...rich_telemetry_adapter import RuntimeEffectCatalog
 from .async_cluster_self_play import parse_play_gap_ticks, space_plays_v4
+from .deck_pool import DeckPoolManifestV4
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .policy_session import build_policy_session_v4, load_policy_v4
 
 _DELAYABLE = frozenset({ActionKind.PLAY_CARD, ActionKind.ACTIVATE_ABILITY})
+
+
+def sample_deck_pair(match, deck_pool, rng, *, battle_level=None):
+    """Two decks drawn by sqrt(uses) from the pool, card order shuffled as in PPO, on ``match``'s settings."""
+
+    decks = rng.choices(deck_pool.decks, weights=[math.sqrt(deck.uses) for deck in deck_pool.decks], k=2)
+    layouts = []
+    for deck in decks:
+        order = list(range(8))
+        rng.shuffle(order)
+        layouts.append(
+            (
+                tuple(deck.card_ids[i] for i in order),
+                tuple(deck.form_availability[i] for i in order),
+                deck.tower_troop_id,
+            )
+        )
+    levels = {}
+    if battle_level is not None:
+        levels = {"level_cap": battle_level, "minimum_card_level": battle_level, "king_tower_level": battle_level}
+    paired = replace(
+        match,
+        deck0=layouts[0][0],
+        deck1=layouts[1][0],
+        deck0_form_availability=layouts[0][1],
+        deck1_form_availability=layouts[1][1],
+        tower_troop0_id=layouts[0][2],
+        tower_troop1_id=layouts[1][2],
+        **levels,
+    )
+    return paired, (decks[0].deck_id, decks[1].deck_id)
 
 
 def evaluate(
@@ -36,6 +70,8 @@ def evaluate(
     min_play_gap_ticks=None,
     gate_temperature_a=None,
     gate_temperature_b=None,
+    deck_pool=None,
+    battle_level=None,
 ):
     if games < 1:
         raise ValueError("games must be positive")
@@ -69,6 +105,8 @@ def evaluate(
         "saved_gate_temperatures": saved_gate_temperatures,
         "gate_temperatures": [policy.model.ppo_gate_temperature for policy in policies],
         "match": asdict(match),
+        "deck_pool": None if deck_pool is None else {"decks": len(deck_pool.decks), "schema": deck_pool.schema},
+        "battle_level": battle_level,
         "checkpoints": [
             {"path": str(p.checkpoint_path), "sha256": p.checkpoint_sha256, "checkpoint_id": p.checkpoint_id}
             for p in policies
@@ -79,18 +117,25 @@ def evaluate(
     sessions = []
     try:
         with (output / "matches.jsonl").open("w", encoding="utf-8", buffering=1) as log:
+            # Without a deck pool, A keeps deck0 and only the side swaps. With one, every pair of games draws two
+            # decks and the second game hands each model the other deck (owner 1 plays deck1), so both models
+            # play both decks.
+            deck_rng = random.Random(match.seed)
+            pair, pair_ids = match, None
             for index in range(games):
                 a_owner = index % 2
-                current = replace(match, seed=match.seed + index)
-                if a_owner:
+                if deck_pool is not None and a_owner == 0:
+                    pair, pair_ids = sample_deck_pair(match, deck_pool, deck_rng, battle_level=battle_level)
+                current = replace(pair, seed=match.seed + index)
+                if a_owner and deck_pool is None:
                     current = replace(
                         current,
-                        deck0=match.deck1,
-                        deck1=match.deck0,
-                        deck0_form_availability=match.deck1_form_availability,
-                        deck1_form_availability=match.deck0_form_availability,
-                        tower_troop0_id=match.tower_troop1_id,
-                        tower_troop1_id=match.tower_troop0_id,
+                        deck0=pair.deck1,
+                        deck1=pair.deck0,
+                        deck0_form_availability=pair.deck1_form_availability,
+                        deck1_form_availability=pair.deck0_form_availability,
+                        tower_troop0_id=pair.tower_troop1_id,
+                        tower_troop1_id=pair.tower_troop0_id,
                     )
                 torch.manual_seed(current.seed)
                 observations, _ = environment.reset(
@@ -169,6 +214,7 @@ def evaluate(
                     "tick": observations[0].tick,
                     "terminal": terminal.to_dict(),
                     "actions_by_owner": actions,
+                    "deck_ids": None if pair_ids is None else {"a": pair_ids[a_owner], "b": pair_ids[1 - a_owner]},
                     # Decision tick of each side's first card or ability (it lands after any delay).
                     "first_play_seconds": {
                         side: None if first_play_tick[owner] is None else first_play_tick[owner] / 20
@@ -239,6 +285,13 @@ def main(argv=None):
         help="with --sample, model A's act/wait temperature (default: the one saved in its checkpoint)",
     )
     parser.add_argument("--gate-temperature-b", type=float, help="the same for model B")
+    parser.add_argument(
+        "--deck-pool",
+        type=Path,
+        help="deck-pool manifest (as for PPO): each pair of games draws two decks by sqrt(uses), one per side, "
+        "then swaps them; without it every game uses the match config's decks",
+    )
+    parser.add_argument("--battle-level", type=int, choices=(11, 16), help="card and King Tower level")
     args = parser.parse_args(argv)
     config = json.loads(args.match_config.read_text(encoding="utf-8")) if args.match_config else {}
     for key in ("owner0_account_id", "owner1_account_id"):
@@ -260,6 +313,8 @@ def main(argv=None):
         min_play_gap_ticks=args.min_play_gap_ticks,
         gate_temperature_a=args.gate_temperature_a,
         gate_temperature_b=args.gate_temperature_b,
+        deck_pool=None if args.deck_pool is None else DeckPoolManifestV4.load(args.deck_pool),
+        battle_level=args.battle_level,
     )
     return 0
 
