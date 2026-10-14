@@ -492,6 +492,11 @@ after = sorted(r["game_elixir_overflow_wasted"][o] for r, o in seats if any(r.ge
 if after:
     a = lambda p: after[min(len(after) - 1, int(p * len(after)))]
     print(f"  ... after the first card 10%/median/90% = {a(.1):.1f}/{a(.5):.1f}/{a(.9):.1f}")
+# Only tracked when --early-first-play-penalty is on: games the learner opened before the free time.
+early = [r["early_first_play_penalty_total"][o] for r, o in seats if "early_first_play_penalty_total" in r]
+if early and any(early):
+    print(f"  opened the game early: {sum(value > 0 for value in early) / len(early):.0%} of games, "
+          f"mean penalty {statistics.mean(early):.3f}")
 # Win rate against each frozen opponent, earliest games versus latest; self-play is always about 50%.
 fixed = [r for r in rows if r["policy_matchup"] == "current-history" and r.get("opponent_checkpoint_id")]
 for opponent in sorted({r["opponent_checkpoint_id"] for r in fixed}, key=lambda value: names.get(value, value)):

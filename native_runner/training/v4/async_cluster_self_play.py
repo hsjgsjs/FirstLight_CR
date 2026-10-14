@@ -33,7 +33,7 @@ from .cluster_self_play import (
     concatenate_padded_tensor_records_v4,
 )
 from .decoding import ShadowCandidateLegality, decode_action_sequence_v4
-from .expert import POLICY_DECISION_TICKS
+from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .policy_session import _fixed_cuda_graph_batch_v4
 from .matchmaking import POLICY_IL
 from .king_activation_reward import apply_fireball_king_activation_penalty_v4
@@ -651,6 +651,9 @@ class AsyncResidentEngineSpecV4:
     # (coefficient per elixir, grace elixir) for elixir wasted at full over the whole game after the
     # owner's first executed card; None disables it.  Opening waits before the first card are free.
     game_elixir_overflow: tuple[float, float] | None = None
+    # (penalty at the first decision, seconds after which it is zero) for opening a game with the first card
+    # before the opponent has landed one; None disables it.
+    early_first_play: tuple[float, float] | None = None
 
 
 def game_elixir_overflow_penalty_v4(
@@ -672,6 +675,23 @@ def game_elixir_overflow_penalty_v4(
     wasted += newly_wasted
     penalty = min(step_cap, max(0.0, coefficient * max(0.0, wasted - grace) - accrued))
     return wasted, accrued + penalty, penalty
+
+
+def early_first_play_penalty_v4(
+    *, tick: int, opponent_card_landed: bool, coefficient: float, free_seconds: float
+) -> float:
+    """Penalty for a game's first card when it opens the game before ``free_seconds``.
+
+    Answering a card the opponent already landed costs nothing. Otherwise the penalty falls linearly from
+    ``coefficient`` at the first policy decision to zero at ``free_seconds``, so no single moment is
+    singled out to play at.
+    """
+    if opponent_card_landed:
+        return 0.0
+    end = free_seconds * TICKS_PER_SECOND
+    if tick >= end:
+        return 0.0
+    return coefficient * min(1.0, (end - tick) / (end - FIRST_POLICY_DECISION_TICK))
 
 
 _DELAYABLE_KINDS = frozenset({ActionKind.PLAY_CARD, ActionKind.ACTIVATE_ABILITY})
@@ -1000,6 +1020,13 @@ def _engine_worker(
         all(math.isfinite(value) and value >= 0.0 for value in game_overflow) and game_overflow[0] > 0.0
     ):
         raise ValueError("game elixir overflow needs a positive coefficient and a nonnegative grace")
+    early_first_play = spec.early_first_play
+    if early_first_play is not None and not (
+        all(math.isfinite(value) for value in early_first_play)
+        and early_first_play[0] > 0.0
+        and early_first_play[1] * TICKS_PER_SECOND > FIRST_POLICY_DECISION_TICK
+    ):
+        raise ValueError("early first play needs a positive penalty and a free time after the first decision")
     validate_reward_parameters_v4(locals())
     segment_end_decision_steps = segment_decision_steps
     tensorize_seconds = 0.0
@@ -1157,6 +1184,9 @@ def _engine_worker(
         first_hog_step_penalty_by_match: dict[int, list[float]] = {
             index: [0.0, 0.0] for index, runtime in enumerate(runtimes) if runtime.active
         }
+        early_play_penalty_by_match: dict[int, list[float]] = {
+            index: [0.0, 0.0] for index, runtime in enumerate(runtimes) if runtime.active
+        }
         if action_rows is not None:
             if tuple(sorted(action_rows)) != tuple(sorted(expected_actions)):
                 raise RuntimeError("async engine received an incomplete action batch")
@@ -1241,6 +1271,23 @@ def _engine_worker(
                 action_tick = int(runtime.observations[0].tick)
                 nonwait_submitted = any(item.kind != ActionKind.WAIT for item in identified)
                 first_nonwait = list(runtime.first_nonwait_action_tick)
+                if (
+                    early_first_play is not None
+                    and nonwait_submitted
+                    and first_nonwait[owner] is None
+                    and owner in runtime.assignment.matchup.current_owners
+                ):
+                    # The opponent's card counts once it has landed, which is when this owner can see it.
+                    early_penalty = early_first_play_penalty_v4(
+                        tick=action_tick,
+                        opponent_card_landed=runtime.first_successful_card_tick[1 - owner] is not None,
+                        coefficient=early_first_play[0],
+                        free_seconds=early_first_play[1],
+                    )
+                    early_play_penalty_by_match[match_index][owner] = early_penalty
+                    early_totals = list(runtime.early_first_play_penalty_total)
+                    early_totals[owner] += early_penalty
+                    runtime.early_first_play_penalty_total = (early_totals[0], early_totals[1])
                 if nonwait_submitted and first_nonwait[owner] is None:
                     first_nonwait[owner] = action_tick
                 runtime.first_nonwait_action_tick = (first_nonwait[0], first_nonwait[1])
@@ -1562,6 +1609,7 @@ def _engine_worker(
             runtime.first_hog_deadline_penalty_total = (first_hog_deadline_totals[0], first_hog_deadline_totals[1])
             runtime.first_hog_deploy_tick = (hog_first_ticks[0], hog_first_ticks[1])
             for owner in runtime.assignment.matchup.current_owners:
+                adjusted_reward[owner] = float(adjusted_reward[owner]) - early_play_penalty_by_match[match_index][owner]
                 updates.append(
                     (
                         match_index * 2 + owner,
