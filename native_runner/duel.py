@@ -227,8 +227,34 @@ def wait_evaluations(workers, engine, total):
             if all(code is not None for code in codes):
                 return 0
             if engine is not None and engine.poll() is not None:
-                raise RuntimeError("模拟引擎在评测中退出，详见 engine.log")
+                code = engine.returncode
+                if code < 0:
+                    try:
+                        reason = signal.Signals(-code).name
+                    except ValueError:
+                        reason = str(-code)
+                    detail = f"被信号 {reason} 终止（退出码 {code}）"
+                else:
+                    detail = f"启动脚本退出码 {code}"
+                raise RuntimeError(f"模拟引擎在评测中退出：{detail}；详见引擎诊断日志")
             time.sleep(1)
+
+
+def engine_diagnostics(output, engine):
+    """Persist the observed exit status before cleanup can change process state."""
+    code = None if engine is None else engine.poll()
+    node = output / "engine"
+    paths = [output / "engine.log", node / "engine-cluster-failed.json"]
+    paths.extend(sorted(node.glob("engine-logs-*/*.log")))
+    present = [path for path in paths if path.is_file()]
+    (output / "engine-diagnostics.json").write_text(json.dumps({
+        "returncode_before_cleanup": code,
+        "signal": -code if code is not None and code < 0 else None,
+        "logs": [str(path) for path in present],
+    }, indent=2), encoding="utf-8")
+    for path in present:
+        say(f"引擎诊断：{path}")
+        tail(path)
 
 
 def combine_results(workers, results, options):
@@ -480,11 +506,12 @@ def run(args):
                     if worker["process"].poll() not in (None, 0):
                         tail(worker["log"])
                 error = "评测未全部完成，请查看 evaluate*.log 和已保存的逐局记录"
+                engine_diagnostics(output, engine)
         except KeyboardInterrupt:
             code, error = 130, "已停止，已完成对局的记录会保留"
         except (OSError, ValueError, RuntimeError) as exc:
             code, error = 1, str(exc)
-            tail(output / "engine.log")
+            engine_diagnostics(output, engine)
         finally:
             # Ignore repeated terminal signals while terminating our own child groups.
             for sig in previous_handlers:
