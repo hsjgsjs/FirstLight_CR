@@ -21,7 +21,12 @@ import torch
 import torch.distributed as dist
 
 from ...match_factory import NATIVE_GAMEPLAY_END_TICK
-from .async_cluster_self_play import AsyncResidentEngineSpecV4, collect_async_cluster_wave_v4, parse_play_gap_ticks
+from .async_cluster_self_play import (
+    AsyncResidentEngineSpecV4,
+    collect_async_cluster_wave_v4,
+    parse_play_gap_ticks,
+    parse_seconds_range,
+)
 from .checkpoint import CHECKPOINT_SCHEMA_V4, load_actor_critic_checkpoint, save_actor_critic_checkpoint
 from .cluster_self_play import ClusterCollectionV4, ClusterMatchAssignmentV4
 from .deck_pool import DeckIdentityV4, DeckPoolManifestV4
@@ -928,10 +933,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--fixed-opponent-opening-force-after-seconds",
-        type=int,
+        type=parse_seconds_range,
         help=(
-            "force a frozen opponent's (fixed checkpoint or league snapshot) first legal ACT after this battle "
-            "time if it has not acted, so the learner cannot profit from opponents that wait for minutes"
+            "force a frozen opponent's (fixed checkpoint or league snapshot) first legal ACT if it has not acted "
+            "by a battle time drawn per game from MIN-MAX seconds (or a single N), so opponents open games "
+            "like people do and the learner cannot profit from ones that wait for minutes"
         ),
     )
     parser.add_argument(
@@ -1077,11 +1083,6 @@ def main() -> int:
         raise ValueError("expert Hog gate supervision requires an expert BC manifest")
     if args.il_opening_force_after_seconds is not None and args.il_opening_force_after_seconds <= 0:
         raise ValueError("IL opening timeout must be positive")
-    if (
-        args.fixed_opponent_opening_force_after_seconds is not None
-        and args.fixed_opponent_opening_force_after_seconds <= 0
-    ):
-        raise ValueError("fixed-opponent opening force time must be positive")
     opening_force_config = (
         {"enabled": False}
         if args.il_opening_force_after_seconds is None
@@ -1455,7 +1456,7 @@ def main() -> int:
     if early_first_play is not None:
         resume_contract["early_first_play"] = list(early_first_play)
     if args.fixed_opponent_opening_force_after_seconds is not None:
-        resume_contract["fixed_opponent_opening_force_after_seconds"] = (
+        resume_contract["fixed_opponent_opening_force_after_seconds"] = list(
             args.fixed_opponent_opening_force_after_seconds
         )
     # Omit the optional key when disabled to preserve old no-BC strict resumes.
