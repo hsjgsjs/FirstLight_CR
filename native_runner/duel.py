@@ -4,6 +4,7 @@ import argparse
 from contextlib import ExitStack
 from datetime import datetime
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -268,6 +269,70 @@ def combine_results(workers, results, options):
     return summary
 
 
+
+def evaluation_key(options):
+    """Identify a study by model/data contents and gameplay settings, not run size."""
+    key = {k: v for k, v in options.items()
+           if k not in {"blocks", "engines", "cpu_threads", "max_score_drop", "block_start"}}
+    for name in PATH_KEYS:
+        if key.get(name) is not None:
+            digest = hashlib.sha256()
+            with Path(key[name]).open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            key[name] = digest.hexdigest()
+    return key
+
+
+def completed_history(parent, options, key):
+    """Recover completed blocks from durable match records, including older runs."""
+    completed = set()
+    for run in sorted(parent.glob("duel-*")):
+        settings = run / "settings.json"
+        if not settings.is_file():
+            continue
+        try:
+            saved = json.loads(settings.read_text(encoding="utf-8"))
+            marker = run / "study.json"
+            if marker.is_file():
+                if json.loads(marker.read_text(encoding="utf-8")) != key:
+                    continue
+            else:
+                # Legacy logs store checkpoint digests in identity.json. Auxiliary
+                # data files have no historical digest, so don't guess their identity.
+                if any(saved.get(k) is not None for k in ("match_config", "deck_pool")):
+                    continue
+                ignored = PATH_KEYS | {"blocks", "engines", "cpu_threads", "max_score_drop", "block_start"}
+                if {k: v for k, v in saved.items() if k not in ignored} != {
+                    k: v for k, v in options.items() if k not in ignored
+                }:
+                    continue
+                identities = list((run / "results").glob("identity.json"))
+                identities += list((run / "results").glob("shard-*/identity.json"))
+                if not identities or any(
+                    [p["sha256"] for p in json.loads(path.read_text())["checkpoints"]]
+                    != [key["checkpoint_a"], key["checkpoint_b"]] for path in identities
+                ):
+                    continue
+            paths = list((run / "results").glob("shard-*/matches.jsonl"))
+            if not paths:
+                paths = list((run / "results").glob("matches.jsonl"))
+            grouped = {}
+            for path in paths:
+                for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
+                    if not line.endswith("\n"):
+                        break
+                    row = json.loads(line)
+                    grouped.setdefault(row["block"], []).append(row)
+            expected = {(condition, variant) for condition in ("natural", "forced") for variant in range(4)}
+            for block, rows in grouped.items():
+                if (len(rows) == 8 and {(r["condition"], r["variant"]) for r in rows} == expected
+                        and all(r["terminated"] and not r["truncated"] for r in rows)):
+                    completed.add(block)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            say(f"无法识别历史记录 {run.name}，未计入续跑：{exc}")
+    return completed
+
 def duel_cpu_layout(available, engines, configured_threads):
     """Cores for each duel guest, and PyTorch threads for the evaluator.
 
@@ -291,7 +356,6 @@ def run(args):
     load_env()
     options = read_options(args.config.expanduser().resolve(), args)
     engine_count = min(options["engines"], options["blocks"])
-    partitions = split_blocks(options["blocks"], engine_count)
     if args.startup_timeout < 1:
         raise ValueError("启动等待时间必须大于零")
     host, port, console = "127.0.0.1", None, None
@@ -312,7 +376,7 @@ def run(args):
         if engine_count > available_cpus:
             raise ValueError(f"本机可用 CPU 为 {available_cpus} 个，请把 engines 调到这个数以内")
     with ExitStack() as stack:
-        if not args.existing_engine:
+        if sys.platform == "linux":
             import fcntl
 
             lock = stack.enter_context(open(f"/tmp/firstlight-duel-{os.getuid()}.lock", "a"))
@@ -320,10 +384,24 @@ def run(args):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RuntimeError("已有一个自动对弈任务正在运行，请等它结束后再启动") from None
+        if not args.existing_engine:
             port, console = choose_ports(engine_count)
         parent = ROOT / "evaluations"
         parent.mkdir(exist_ok=True)
+        key = evaluation_key(options)
+        completed = completed_history(parent, options, key)
+        block_start = args.block_start
+        if block_start is None:
+            block_start = max(completed, default=-1) + 1
+        if block_start < 0:
+            raise ValueError("--block-start 必须为非负整数")
+        options["block_start"] = block_start
+        partitions = [(block_start + start, count)
+                      for start, count in split_blocks(options["blocks"], engine_count)]
+        say(f"已找到同配置完整历史组 {len(completed)} 个；本次新增 {options['blocks']} 组，"
+            f"从第 {block_start + 1} 组开始（种子 {options['seed'] + block_start}）。")
         output = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("duel-%Y%m%d-%H%M%S-"), dir=parent))
+        (output / "study.json").write_text(json.dumps(key, sort_keys=True), encoding="utf-8")
         results = output / "results"
         if engine_count > 1:
             results.mkdir()
@@ -454,6 +532,7 @@ def main(argv=None):
     parser.add_argument("--checkpoint-a", help="本次使用的参考模型；不修改保存的配置")
     parser.add_argument("--checkpoint-b", help="本次使用的被测对手；不修改保存的配置")
     parser.add_argument("--blocks", type=int, help="本次组数，每组 8 局")
+    parser.add_argument("--block-start", type=int, help="手动指定起始组索引（从 0 起）；默认接在历史完整组之后。设为 0 可重跑")
     parser.add_argument("--engines", type=int, help="并行引擎数，默认读取本机配置（初始为 1）")
     parser.add_argument("--opening-seconds", help="本次 B 的开局超时，例如 8-20 或 12")
     parser.add_argument("--existing-engine", help="使用已有空闲引擎 HOST:PORT，不启动或关闭该引擎")
