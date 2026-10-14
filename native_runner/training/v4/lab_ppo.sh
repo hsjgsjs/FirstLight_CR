@@ -37,6 +37,8 @@ done
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repository_root=$(cd -- "$script_dir/../../.." && pwd)
+# Relative paths (CR_PPO_CHECKPOINT in launch-env, trainer options) mean the repository root, also under cron.
+cd "$repository_root"
 source "${repository_root}/native_runner/local_config.sh"
 python=${CR_AI_PYTHON:-python}
 runs=$repository_root/runs
