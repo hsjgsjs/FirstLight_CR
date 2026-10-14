@@ -1,0 +1,16 @@
+{
+  "checkpoint_a": "checkpoints/General/checkpoint-step-00000460.pt",
+  "checkpoint_b": "checkpoints/General/checkpoint-step-00000460.pt",
+  "opening_seconds": "8-20",
+  "blocks": 20,
+  "seed": 1,
+  "battle_level": 11,
+  "cpu_threads": 1,
+  "match_config": null,
+  "deck_pool": null,
+  "deterministic": false,
+  "gate_temperature": null,
+  "delay_ticks": 0,
+  "min_play_gap_ticks": null,
+  "max_score_drop": 0.05
+}

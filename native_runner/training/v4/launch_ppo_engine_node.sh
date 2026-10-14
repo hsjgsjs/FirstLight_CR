@@ -31,6 +31,12 @@ probe_installer=$script_dir/install_probe_idle_guests.py
 engine_configurator=${CR_PPO_ENGINE_CONFIGURATOR:-$script_dir/configure_emulator_engine_guests.py}
 pulse_compat=${CR_EMULATOR_COMPAT:?Set CR_EMULATOR_COMPAT in .env}
 endpoint_proxy=$script_dir/tcp_endpoint_proxy.py
+guest_prefix=${CR_PPO_GUEST_PREFIX:-crppo}
+loopback_only=${CR_PPO_LOOPBACK_ONLY:-0}
+if [[ ! $guest_prefix =~ ^[a-zA-Z][a-zA-Z0-9_]*$ || ! $loopback_only =~ ^[01]$ ]]; then
+  echo "invalid guest prefix or loopback-only setting" >&2
+  exit 91
+fi
 
 if [[ ! ${SLURM_JOB_ID:-} ]]; then
   echo "engine node must run inside a Slurm allocation" >&2
@@ -180,8 +186,8 @@ if [[ -e $ready ]]; then
   echo "refusing to overwrite existing readiness artifact: $ready" >&2
   exit 95
 fi
-if pgrep -f "[q]emu-system-.*-avd crppo_${global_start}_" >/dev/null; then
-  echo "refusing to overlap an existing crppo emulator cluster" >&2
+if pgrep -f "[q]emu-system-.*-avd ${guest_prefix}_${global_start}_" >/dev/null; then
+  echo "refusing to overlap an existing $guest_prefix emulator cluster" >&2
   exit 96
 fi
 
@@ -198,6 +204,7 @@ fi
 
 launcher_pids=()
 proxy_pid=
+cached_apk=
 cleanup() {
   status=$?
   trap - EXIT INT TERM
@@ -212,6 +219,7 @@ cleanup() {
     wait "$pid" >/dev/null 2>&1 || true
   done
   [[ ! $proxy_pid ]] || wait "$proxy_pid" >/dev/null 2>&1 || true
+  [[ ! $cached_apk ]] || rm -f -- "$cached_apk"
   if [[ $status -ne 0 ]]; then
     printf '{"ok":false,"exit_code":%d,"timestamp":"%s"}\n' \
       "$status" "$(date -Is)" >"$artifact/engine-cluster-failed.json"
@@ -225,7 +233,7 @@ echo "engine_cpu_pools=${engine_cpu_pools[*]} control_cpus=$control_cpus"
 rm -f "$stop_file"
 
 for index in $(seq 0 $((guest_count - 1))); do
-  name=crppo_${global_start}_$index
+  name=${guest_prefix}_${global_start}_$index
   avd_dir=$avd_home/$name.avd
   emu_dir=$run/emu$index
   mkdir -p "$avd_dir" "$emu_dir"
@@ -248,7 +256,7 @@ done
 
 ulimit -n 32768
 for index in $(seq 0 $((guest_count - 1))); do
-  name=crppo_${global_start}_$index
+  name=${guest_prefix}_${global_start}_$index
   port=${ports[$index]}
   pool=${engine_cpu_pools[$index]}
   emu_dir=$run/emu$index
@@ -387,22 +395,24 @@ fi
 # ADB host forwards bind loopback.  One raw-byte asyncio proxy exposes all
 # endpoints on this node's private cluster address without a subprocess per
 # connection or ncat's small-message-oriented sh-exec path.
-"$python" "$endpoint_proxy" \
-  --bind-host "$host_short" \
-  --listen-base "$((base_port + global_start))" \
-  --target-base "$((base_port + global_start))" \
-  --count "$engine_count" \
-  >"$logs/endpoint-proxy.log" 2>&1 </dev/null &
-proxy_pid=$!
-sleep 1
-if ! kill -0 "$proxy_pid" 2>/dev/null; then
-  echo "the engine endpoint proxy failed to start" >&2
-  sed -n '1,80p' "$logs/endpoint-proxy.log" >&2 || true
-  exit 99
-fi
-if ! grep -q '"ready": true' "$logs/endpoint-proxy.log"; then
-  echo "the engine endpoint proxy did not report readiness" >&2
-  exit 99
+if [[ $loopback_only == 0 ]]; then
+  "$python" "$endpoint_proxy" \
+    --bind-host "$host_short" \
+    --listen-base "$((base_port + global_start))" \
+    --target-base "$((base_port + global_start))" \
+    --count "$engine_count" \
+    >"$logs/endpoint-proxy.log" 2>&1 </dev/null &
+  proxy_pid=$!
+  sleep 1
+  if ! kill -0 "$proxy_pid" 2>/dev/null; then
+    echo "the engine endpoint proxy failed to start" >&2
+    sed -n '1,80p' "$logs/endpoint-proxy.log" >&2 || true
+    exit 99
+  fi
+  if ! grep -q '"ready": true' "$logs/endpoint-proxy.log"; then
+    echo "the engine endpoint proxy did not report readiness" >&2
+    exit 99
+  fi
 fi
 
 "$python" - \
@@ -429,7 +439,7 @@ guests = [guest for report in reports for guest in report["guests"]]
 endpoints = [row for guest in guests for row in guest["endpoints"]]
 ports = sorted(int(row["host_port"]) for row in endpoints)
 pids = {(guest["serial"], int(row["status"]["pid"])) for guest in guests for row in guest["endpoints"]}
-host = socket.gethostname().split(".", 1)[0]
+host = "127.0.0.1" if os.environ.get("CR_PPO_LOOPBACK_ONLY") == "1" else socket.gethostname().split(".", 1)[0]
 expected_ports = list(
     range(base_port + global_start, base_port + global_start + engine_count)
 )
@@ -490,7 +500,7 @@ while [[ ! -e $stop_file ]]; do
       exit 99
     fi
   done
-  if ! kill -0 "$proxy_pid" 2>/dev/null; then
+  if [[ -n $proxy_pid ]] && ! kill -0 "$proxy_pid" 2>/dev/null; then
     echo "the engine endpoint proxy exited after readiness" >&2
     exit 99
   fi
