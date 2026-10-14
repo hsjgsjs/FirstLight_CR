@@ -110,6 +110,8 @@ Copy-Item .env.example .env
 
 用 `--games` 设置对局数，`--match-config` 指定卡组与等级，`--seed` 设置起始种子。结果文件和指标见[模型评测](checkpoints/README.md#evaluation--模型评测)。接入自己的 actor 循环可使用 [JSON 行策略服务](docs/policy_service.md)。
 
+评估“强制固定对手早出牌”是否削弱对手，可使用独立的 [CPU 配对对弈入口](docs/opening_evaluation_zh.md)：同一组种子和卡组分别运行自然/强制条件，覆盖换边与交换卡组，输出配对得分变化及区间。
+
 ## 文档
 
 | 指南 | 内容 |

@@ -1,7 +1,9 @@
 """Evaluate two checkpoints in complete, sequential offline native matches."""
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import asdict, replace
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -14,13 +16,32 @@ from ...contracts import ActionKind, ActionV1
 from ...cr_native_env import DEFAULT_HOST, DEFAULT_PORT, NativeClashEnv
 from ...match_factory import MatchConfig
 from ...rich_telemetry_adapter import RuntimeEffectCatalog
-from .async_cluster_self_play import parse_play_gap_ticks, space_plays_v4
+from .async_cluster_self_play import (
+    _first_successful_card_tick_v4,
+    _frozen_opponent_opening_force_owner_v4,
+    parse_play_gap_ticks,
+    space_plays_v4,
+)
 from .deck_pool import DeckPoolManifestV4
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .policy_session import build_policy_session_v4, load_policy_v4
 
 _DELAYABLE = frozenset({ActionKind.PLAY_CARD, ActionKind.ACTIVATE_ABILITY})
+
+
+@contextmanager
+def paired_cpu_rng(seed, side, tick):
+    """Independent model/decision draws, shared across the paired conditions.
+
+    Resetting per decision prevents an extra forced sample on B from shifting A's
+    stream or either model's later draws. Only the CPU generator is touched.
+    """
+    key = f"evaluation-{seed}-{side}-{tick}".encode()
+    value = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "little")
+    with torch.random.fork_rng(devices=[]):
+        torch.set_rng_state(torch.Generator(device="cpu").manual_seed(value).get_state())
+        yield
 
 
 def sample_deck_pair(match, deck_pool, rng, *, battle_level=None):
@@ -72,11 +93,14 @@ def evaluate(
     gate_temperature_b=None,
     deck_pool=None,
     battle_level=None,
+    schedule=None,
 ):
     if games < 1:
         raise ValueError("games must be positive")
     if not (0 <= delay_a_ticks <= 0xFFFF and 0 <= delay_b_ticks <= 0xFFFF):
         raise ValueError("delay ticks must be in [0, 65535]")
+    if schedule is not None and (len(schedule) != games or torch.device(device).type != "cpu"):
+        raise ValueError("a paired schedule requires CPU inference and exactly games cases")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if torch.device(device).type == "cuda" and torch.device(device).index is not None:
@@ -107,6 +131,7 @@ def evaluate(
         "match": asdict(match),
         "deck_pool": None if deck_pool is None else {"decks": len(deck_pool.decks), "schema": deck_pool.schema},
         "battle_level": battle_level,
+        "schedule": None if schedule is None else [asdict(case) for case in schedule],
         "checkpoints": [
             {"path": str(p.checkpoint_path), "sha256": p.checkpoint_sha256, "checkpoint_id": p.checkpoint_id}
             for p in policies
@@ -123,21 +148,28 @@ def evaluate(
             deck_rng = random.Random(match.seed)
             pair, pair_ids = match, None
             for index in range(games):
-                a_owner = index % 2
-                if deck_pool is not None and a_owner == 0:
-                    pair, pair_ids = sample_deck_pair(match, deck_pool, deck_rng, battle_level=battle_level)
-                current = replace(pair, seed=match.seed + index)
-                if a_owner and deck_pool is None:
-                    current = replace(
-                        current,
-                        deck0=pair.deck1,
-                        deck1=pair.deck0,
-                        deck0_form_availability=pair.deck1_form_availability,
-                        deck1_form_availability=pair.deck0_form_availability,
-                        tower_troop0_id=pair.tower_troop1_id,
-                        tower_troop1_id=pair.tower_troop0_id,
-                    )
-                torch.manual_seed(current.seed)
+                case = None if schedule is None else schedule[index]
+                if case is not None:
+                    current, a_owner, pair_ids = case.match, case.a_owner, case.deck_ids
+                else:
+                    a_owner = index % 2
+                    if deck_pool is not None and a_owner == 0:
+                        pair, pair_ids = sample_deck_pair(match, deck_pool, deck_rng, battle_level=battle_level)
+                    current = replace(pair, seed=match.seed + index)
+                    if a_owner and deck_pool is None:
+                        current = replace(
+                            current,
+                            deck0=pair.deck1,
+                            deck1=pair.deck0,
+                            deck0_form_availability=pair.deck1_form_availability,
+                            deck1_form_availability=pair.deck0_form_availability,
+                            tower_troop0_id=pair.tower_troop1_id,
+                            tower_troop1_id=pair.tower_troop0_id,
+                        )
+                if torch.device(device).type == "cpu":
+                    torch.set_rng_state(torch.Generator(device="cpu").manual_seed(current.seed).get_state())
+                else:
+                    torch.manual_seed(current.seed)
                 observations, _ = environment.reset(
                     match_config=current,
                     options={
@@ -166,6 +198,9 @@ def evaluate(
                 actions = [0, 0]
                 last_landing = [None, None]
                 first_play_tick = [None, None]
+                first_card_tick = [None, None]
+                opening_requests = [0, 0]
+                opening_overrides = [0, 0]
                 rejected = set()
                 terminated = truncated = False
                 while not terminated and not truncated:
@@ -174,7 +209,20 @@ def evaluate(
                         observation = observations[owner]
                         chosen = ()
                         if observation.tick >= FIRST_POLICY_DECISION_TICK:
-                            chosen = session.decide(observation).decoded.actions
+                            side = "a" if owner == a_owner else "b"
+                            if case is None:
+                                decision = session.decide(observation)
+                            else:
+                                force_owner = _frozen_opponent_opening_force_owner_v4(
+                                    current_owners=(a_owner,), active_actions=tuple(actions),
+                                    tick=int(observation.tick), after_seconds=case.force_b_seconds,
+                                )
+                                force = owner == force_owner
+                                opening_requests[owner] += int(force)
+                                with paired_cpu_rng(current.seed, side, observation.tick):
+                                    decision = session.decide(observation, force_opening=force)
+                                opening_overrides[owner] += int(decision.forced_opening)
+                            chosen = decision.decoded.actions
                             delay = delay_a_ticks if owner == a_owner else delay_b_ticks
                             if delay:
                                 # The model's plays land this many ticks after the decision, as taps do on a
@@ -186,7 +234,8 @@ def evaluate(
                             chosen, last_landing[owner] = space_plays_v4(
                                 tuple(chosen),
                                 min_play_gap_ticks,
-                                f"{index}-{owner}-{observation.tick}",
+                                (f"{index}-{owner}-{observation.tick}" if case is None
+                                 else f"{current.seed}-{side}-{observation.tick}"),
                                 decision_tick=int(observation.tick),
                                 last_landing_tick=last_landing[owner],
                             )
@@ -199,6 +248,10 @@ def evaluate(
                     observations, _, terms, truncs, _ = environment.step(commands, record_trace=False)
                     terminated, truncated = bool(terms["__all__"]), bool(truncs["__all__"])
                     for observation in observations.values():
+                        for owner in (0, 1):
+                            first_card_tick[owner] = _first_successful_card_tick_v4(
+                                observation.events, owner=owner, current=first_card_tick[owner]
+                            )
                         for event in observation.events:
                             if event.event_type == "action_rejected":
                                 rejected.add(json.dumps(event.to_dict(), sort_keys=True))
@@ -221,7 +274,16 @@ def evaluate(
                         for side, owner in (("a", a_owner), ("b", 1 - a_owner))
                     },
                     "rejected_actions": len(rejected),
+                    "first_card_executed_seconds": {
+                        side: None if first_card_tick[owner] is None else first_card_tick[owner] / 20
+                        for side, owner in (("a", a_owner), ("b", 1 - a_owner))
+                    },
                 }
+                if case is not None:
+                    row.update(case.metadata())
+                    row["match"] = asdict(current)
+                    for key, values in (("opening_requests", opening_requests), ("opening_overrides", opening_overrides)):
+                        row[key] = {"a": values[a_owner], "b": values[1 - a_owner]}
                 rows.append(row)
                 log.write(json.dumps(row) + "\n")
                 print(json.dumps(row), flush=True)

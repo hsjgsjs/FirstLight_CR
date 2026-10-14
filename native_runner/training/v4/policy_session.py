@@ -23,6 +23,7 @@ from .tensorizer import UniversalObservationTensorizerV4
 from .tensors import (
     ActiveEffectSetV4,
     CANDIDATE_DEPLOY,
+    GATE_WAIT,
     PolicyOutputV4,
     RelationEdgesV4,
     RecurrentPolicyStateV4,
@@ -48,6 +49,7 @@ class LoadedPolicyV4:
 class PolicyDecisionV4:
     decoded: DecodedActionSequenceV4
     inference_ms: float
+    forced_opening: bool = False
 
 
 def _copy_tensor_record_(target: object, source: object) -> None:
@@ -290,7 +292,9 @@ class PolicySessionV4:
         self._first_decision = True
 
     @torch.inference_mode()
-    def decide(self, observation: ObservationV1, *, force_act: bool = False) -> PolicyDecisionV4:
+    def decide(
+        self, observation: ObservationV1, *, force_act: bool = False, force_opening: bool = False
+    ) -> PolicyDecisionV4:
         if not self._episode_started or self.state is None:
             raise RuntimeError("start_episode must run before offline V4 inference")
         if observation.owner != self.actor_owner:
@@ -322,6 +326,20 @@ class PolicySessionV4:
                 output = self.model.act(
                     model_batch, self.state, episode_start=episode_start, validate=self.validate_tensors
                 )
+        # Training's frozen-opponent timeout preserves natural ACT decisions and
+        # only resamples WAIT, keeping the full legal candidate set. The UI's
+        # manual force_act option above intentionally has different semantics.
+        forced_opening = False
+        if force_opening and not force_act and int(output.actions.gate[0]) == GATE_WAIT:
+            legal = ShadowCandidateLegality(host_batch.candidates, self.tensorizer.config).candidate_mask()
+            if bool(legal.any().item()):
+                model_batch = host_batch.to_model_input(self.device)
+                context = self.model.forward(
+                    model_batch, self.state, episode_start=episode_start, validate=self.validate_tensors
+                )
+                select = self.model.sample_after_preselected_act if self.sample else self.model.act_after_preselected_act
+                output = select(model_batch, context, validate=self.validate_tensors)
+                forced_opening = True
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         inference_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
@@ -349,7 +367,7 @@ class PolicySessionV4:
         self.tensorizer.record_action(output.actions, host_batch, row=0, validate=False)
         self.state = output.next_state
         self._first_decision = False
-        return PolicyDecisionV4(decoded=decoded, inference_ms=inference_ms)
+        return PolicyDecisionV4(decoded=decoded, inference_ms=inference_ms, forced_opening=forced_opening)
 
 
 def build_policy_session_v4(
