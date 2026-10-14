@@ -332,6 +332,12 @@ case ${1:-} in
     end_minute=$((10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]}))
     drain_minute=$(((end_minute - 12 + 1440) % 1440))
     command -v crontab >/dev/null || { echo "crontab is not installed" >&2; exit 1; }
+    if [[ -z $(newest_checkpoint "$runs/$name") && ! -s $runs/$name/trainer-options.txt ]]; then
+      echo "runs/$name has no checkpoint or saved options, so the daily resume would fail; runs with checkpoints:" >&2
+      { find "$runs" -path '*/train-*/checkpoints/update-*.pt' 2>/dev/null || true; } \
+        | sed "s|^$runs/||; s|/.*||" | sort -u | sed 's/^/  /' >&2
+      exit 1
+    fi
     script=$script_dir/lab_ppo.sh
     # By default keep checking all day, until the checkpoint-aware stop begins.
     retry_minutes=${5:-$(((drain_minute - begin_minute + 1440) % 1440 - 15))}
