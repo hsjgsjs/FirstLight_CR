@@ -131,37 +131,47 @@ for value in values:
 PY
 )
 # CR_PPO_ENGINE_CPU_SHARING=1 lets guests time-share the allocated CPUs (pools wrap around them) when there
-# are more engines than CPUs; each guest still gets one vCPU per engine.
+# are more engines than CPUs. CR_PPO_CORES_PER_ENGINE defaults to 1 so training keeps one vCPU per engine;
+# duel raises it so one engine's eight matches are not stuck on a single core.
+cores_per_engine=${CR_PPO_CORES_PER_ENGINE:-1}
 cpu_sharing=${CR_PPO_ENGINE_CPU_SHARING:-0}
+if ((cores_per_engine < 1 || cores_per_engine > 32)); then
+  echo "CR_PPO_CORES_PER_ENGINE must be 1..32" >&2
+  exit 91
+fi
+cpu_slots=$((engine_count * cores_per_engine))
 shared_cpus=$((${#allocated_cpus[@]} - cpu_offset))
-if ((cpu_offset + engine_count > ${#allocated_cpus[@]})) && [[ $cpu_sharing != 1 || $shared_cpus -lt $max_guest_engines ]]; then
-  echo "CPU offset $cpu_offset plus $engine_count engines exceeds ${#allocated_cpus[@]} CPUs" \
+if ((cpu_offset + cpu_slots > ${#allocated_cpus[@]})) && [[ $cpu_sharing != 1 || $shared_cpus -lt $((max_guest_engines * cores_per_engine)) ]]; then
+  echo "CPU offset $cpu_offset plus $cpu_slots cores exceeds ${#allocated_cpus[@]} CPUs" \
     "(set CR_PPO_ENGINE_CPU_SHARING=1 to share CPUs between guests)" >&2
   exit 94
 fi
 
 engine_cpu_pools=()
+guest_vcpus=()
 cpu_cursor=0
 for ((guest=0; guest<guest_count; guest++)); do
   count=${guest_engines[$guest]}
-  if ((cpu_offset + engine_count > ${#allocated_cpus[@]})); then
+  width=$((count * cores_per_engine))
+  guest_vcpus+=("$width")
+  if ((cpu_offset + cpu_slots > ${#allocated_cpus[@]})); then
     members=()
-    for ((slot=0; slot<count; slot++)); do
+    for ((slot=0; slot<width; slot++)); do
       members+=("${allocated_cpus[cpu_offset + (cpu_cursor + slot) % shared_cpus]}")
     done
     pool=$(IFS=,; echo "${members[*]}")
   else
-    pool=$(IFS=,; echo "${allocated_cpus[*]:cpu_offset+cpu_cursor:count}")
+    pool=$(IFS=,; echo "${allocated_cpus[*]:cpu_offset+cpu_cursor:width}")
   fi
   engine_cpu_pools+=("$pool")
-  cpu_cursor=$((cpu_cursor + count))
+  cpu_cursor=$((cpu_cursor + width))
 done
-if [[ $cpu_cursor -ne $engine_count ]]; then
-  echo "guest engine topology uses $cpu_cursor CPUs, expected $engine_count" >&2
+if [[ $cpu_cursor -ne $cpu_slots ]]; then
+  echo "guest engine topology uses $cpu_cursor CPUs, expected $cpu_slots" >&2
   exit 94
 fi
 control_cpus=$(
-  selected_end=$((cpu_offset + engine_count))
+  selected_end=$((cpu_offset + cpu_slots))
   ((selected_end <= ${#allocated_cpus[@]})) || selected_end=${#allocated_cpus[@]}
   values=("${allocated_cpus[@]:0:cpu_offset}" "${allocated_cpus[@]:selected_end}")
   IFS=,
@@ -241,7 +251,7 @@ for index in $(seq 0 $((guest_count - 1))); do
   sed -i \
     -e "s/^avd.id=.*/avd.id=$name/" \
     -e "s/^avd.name=.*/avd.name=$name/" \
-    -e "s/^hw.cpu.ncore=.*/hw.cpu.ncore=${guest_engines[$index]}/" \
+    -e "s/^hw.cpu.ncore=.*/hw.cpu.ncore=${guest_vcpus[$index]}/" \
     -e "s/^hw.ramSize=.*/hw.ramSize=${guest_memory_mb[$index]}M/" \
     "$avd_dir/config.ini"
   cp --reflink=auto --sparse=always "$source_avd/cache.img" "$avd_dir/cache.img"
@@ -272,7 +282,7 @@ for index in $(seq 0 $((guest_count - 1))); do
       -no-snapshot \
       -gpu swiftshader_indirect \
       -accel on \
-      -cores "${guest_engines[$index]}" \
+      -cores "${guest_vcpus[$index]}" \
       -memory "${guest_memory_mb[$index]}" \
       -data "$emu_dir/userdata-qemu.img" \
       -initdata "$initdata" \

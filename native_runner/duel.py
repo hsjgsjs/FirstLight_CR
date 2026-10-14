@@ -268,6 +268,25 @@ def combine_results(workers, results, options):
     return summary
 
 
+def duel_cpu_layout(available, engines, configured_threads):
+    """Cores for each duel guest, and PyTorch threads for the evaluator.
+
+    A guest runs eight matches. One vCPU makes that block take many minutes, so
+    each engine gets up to eight host cores. Training leaves this at one core by
+    not setting CR_PPO_CORES_PER_ENGINE. Evaluator threads follow the same width
+    unless the saved config already asked for more.
+    """
+
+    if isinstance(available, bool) or isinstance(engines, bool) or isinstance(configured_threads, bool):
+        raise ValueError("CPU layout arguments must be integers")
+    if not isinstance(available, int) or not isinstance(engines, int) or not isinstance(configured_threads, int):
+        raise ValueError("CPU layout arguments must be integers")
+    if engines < 1 or available < engines or configured_threads < 1:
+        raise ValueError(f"本机可用 CPU 为 {available} 个，请把 engines 调到这个数以内")
+    per_engine = min(8, available // engines)
+    return per_engine, max(configured_threads, per_engine)
+
+
 def run(args):
     load_env()
     options = read_options(args.config.expanduser().resolve(), args)
@@ -276,6 +295,11 @@ def run(args):
     if args.startup_timeout < 1:
         raise ValueError("启动等待时间必须大于零")
     host, port, console = "127.0.0.1", None, None
+    available_cpus = os.cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        available_cpus = len(os.sched_getaffinity(0))
+    per_engine, eval_threads = duel_cpu_layout(available_cpus, engine_count, options["cpu_threads"])
+    options["cpu_threads"] = eval_threads
     if args.existing_engine:
         if options["engines"] != 1:
             raise ValueError("--existing-engine 只接受一个引擎，请同时设置 --engines 1")
@@ -285,7 +309,6 @@ def run(args):
         host, port = host.strip("[]"), int(value)
     else:
         check_engine_settings()
-        available_cpus = len(os.sched_getaffinity(0))
         if engine_count > available_cpus:
             raise ValueError(f"本机可用 CPU 为 {available_cpus} 个，请把 engines 调到这个数以内")
     with ExitStack() as stack:
@@ -308,7 +331,10 @@ def run(args):
         node.mkdir()
         (parent / "duel-latest.txt").write_text(str(output) + "\n", encoding="utf-8")
         (output / "settings.json").write_text(json.dumps(options, indent=2), encoding="utf-8")
-        say(f"结果目录：{output}\n配置：{args.config}\n共 {options['blocks']} 组，每组 8 局，使用 {engine_count} 个引擎。")
+        say(
+            f"结果目录：{output}\n配置：{args.config}\n"
+            f"共 {options['blocks']} 组，每组 8 局，使用 {engine_count} 个引擎，每个引擎 {per_engine} 个核。"
+        )
         eval_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         engine_env_base = {**eval_env, "CUDA_VISIBLE_DEVICES": ""}
         engine = evaluation = None
@@ -342,6 +368,7 @@ def run(args):
                     **engine_env_base, "CR_AI_ROOT": str(ROOT), "CR_AI_PYTHON": sys.executable,
                     "CR_PPO_GUEST_PREFIX": f"crduel_{os.getuid()}", "CR_PPO_LOOPBACK_ONLY": "1",
                     "CR_PPO_ENGINES_PER_GUEST": "1", "CR_PPO_CPU_OFFSET": "0",
+                    "CR_PPO_CORES_PER_ENGINE": str(per_engine),
                     "CR_EMULATOR_COMPAT": os.environ.get("CR_EMULATOR_COMPAT") or str(compat),
                     "SLURM_JOB_ID": os.environ.get("SLURM_JOB_ID") or f"duel-{os.getpid()}",
                     "TMPDIR": str(runtime),

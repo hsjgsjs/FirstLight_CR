@@ -350,6 +350,17 @@ def test_forward_resident_contexts_batches_each_model():
     assert tuple(rows[0][0].hidden.shape) == (1, 2)
 
 
+def test_duel_gives_each_engine_up_to_eight_cores():
+    from native_runner.duel import duel_cpu_layout
+
+    assert duel_cpu_layout(16, 1, 1) == (8, 8)
+    assert duel_cpu_layout(4, 1, 1) == (4, 4)
+    assert duel_cpu_layout(16, 4, 1) == (4, 4)
+    assert duel_cpu_layout(32, 1, 16) == (8, 16)
+    with pytest.raises(ValueError):
+        duel_cpu_layout(2, 4, 1)
+
+
 def json_transport(path):
     import json
     return json.loads((path / "identity.json").read_text(encoding="utf-8"))["transport"]
