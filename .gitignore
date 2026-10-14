@@ -50,10 +50,5 @@ Thumbs.db
 .DS_Store
 .idea/
 
-# Curated public checkpoints (listed in checkpoints/manifest.json).
-!/checkpoints/2_6hog_expert/hog26-specialist1.pt
-!/checkpoints/2_6hog_expert/hog26-specialist2.pt
-!/checkpoints/active IL/checkpoint-step-00000030.pt
-!/checkpoints/General/checkpoint-step-00000460.pt
-!/checkpoints/IL/checkpoint-step-00029396.pt
+# Checkpoints stay local. This branch does not publish *.pt weights.
 /checkpoints/**/*.tmp
