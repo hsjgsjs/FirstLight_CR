@@ -154,10 +154,24 @@ def _choose_commands(
     return commands
 
 
-def _forward_index_group(entries, indexes):
+def _module_device(model):
+    try:
+        return next(model.parameters()).device
+    except (AttributeError, StopIteration):
+        return None
+
+
+def _move_module(model, device):
+    current = _module_device(model)
+    if current is None or current == torch.device(device):
+        return
+    model.to(device)
+
+
+def _forward_index_group(entries, indexes, device):
     sessions = [entries[index][0] for index in indexes]
     model = sessions[0].model
-    device = sessions[0].device
+    _move_module(model, device)
     combined = concatenate_padded_tensor_records(tuple(entries[index][1] for index in indexes))
     combined_input = combined.to_model_input(device)
     state = concatenate_tensor_records(tuple(session.state for session in sessions)).to(device)
@@ -174,31 +188,48 @@ def _forward_index_group(entries, indexes):
 def forward_resident_contexts(entries):
     """One forward per model for every ready decision.
 
-    ``entries`` are ``(session, host batch, first decision)``. The returned host
-    row and context stay on the model device, because the action heads live there.
-    Rows are forwarded a few at a time so a 22 GiB GPU is not asked for sixteen
-    spatial maps at once. Sampling is still per row, under the paired generator.
+    ``entries`` are ``(session, host batch, first decision)``. Only one model
+    occupies the GPU at a time. A chunk that does not fit falls back to CPU,
+    and that model stays on CPU so sampling uses the same device.
     """
 
     results = [None] * len(entries)
     grouped: dict[int, list[int]] = {}
     for index, (session, _host, _first) in enumerate(entries):
         grouped.setdefault(id(session.model), []).append(index)
+    parked = []
     for indexes in grouped.values():
+        sessions = [entries[index][0] for index in indexes]
+        model = sessions[0].model
+        for other in parked:
+            if other is not model:
+                _move_module(other, "cpu")
+        parked[:] = [model]
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        preferred = torch.device(sessions[0].device)
         chunk = min(4, len(indexes))
         while True:
             try:
                 produced = []
                 for start in range(0, len(indexes), chunk):
-                    produced.extend(_forward_index_group(entries, indexes[start : start + chunk]))
+                    produced.extend(_forward_index_group(entries, indexes[start : start + chunk], preferred))
                 break
             except torch.cuda.OutOfMemoryError as oom:
                 produced = []
+                del oom
+                torch.cuda.empty_cache()
+                if preferred.type == "cuda":
+                    preferred = torch.device("cpu")
+                    for session in sessions:
+                        session.device = preferred
+                    _move_module(sessions[0].model, preferred)
+                    torch.cuda.empty_cache()
+                    chunk = min(4, len(indexes))
+                    continue
                 if chunk == 1:
                     raise
                 chunk = max(1, chunk // 2)
-                del oom
-                torch.cuda.empty_cache()
         for index, row in zip(indexes, produced, strict=True):
             results[index] = row
     return results
@@ -603,7 +634,10 @@ def evaluate(
     output.mkdir(parents=True, exist_ok=True)
     if torch.device(device).type == "cuda" and torch.device(device).index is not None:
         torch.cuda.set_device(torch.device(device))
-    policies = [load_policy_v4(path, device=device) for path in (checkpoint_a, checkpoint_b)]
+    # Scheduled duels load on CPU and move one model onto the GPU at a time.
+    # Two fp32 copies already fill a 22 GiB card before any activation is allocated.
+    load_device = "cpu" if schedule is not None and torch.device(device).type == "cuda" else device
+    policies = [load_policy_v4(path, device=load_device) for path in (checkpoint_a, checkpoint_b)]
     # Checkpoints carry the gate temperature of the update that saved them; --sample uses it unless overridden.
     saved_gate_temperatures = [policy.model.ppo_gate_temperature for policy in policies]
     for policy, temperature in zip(policies, (gate_temperature_a, gate_temperature_b), strict=True):
