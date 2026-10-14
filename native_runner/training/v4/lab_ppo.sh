@@ -3,7 +3,11 @@
 #
 #   lab_ppo.sh start NAME [UPDATES]   start a fresh run in runs/NAME (logs in runs/NAME/logs; the trainer
 #                                     writes metrics and checkpoints to a new runs/NAME/train-* per start)
-#   lab_ppo.sh resume NAME [UPDATES]  continue runs/NAME from its newest strict checkpoint
+#   lab_ppo.sh resume NAME [UPDATES]  continue runs/NAME from its newest strict checkpoint; if its trainer options
+#                                     changed since that checkpoint (see options), warm-start a new stage from it
+#   lab_ppo.sh options NAME [--FLAG [VALUE...]]... [--unset --FLAG]...   show runs/NAME's trainer options, or
+#                                     set, replace (every occurrence of a repeatable flag) or remove some;
+#                                     the next resume, by hand or by the schedule, uses them
 #   lab_ppo.sh status [NAME]          processes, latest metrics, checkpoints and free disk
 #   lab_ppo.sh load [NAME]            live CPU (per core group) and GPU use, and where updates spend time
 #   lab_ppo.sh stop [NAME MINUTES]    stop the run and clean up engines, workers and /dev/shm; with NAME and
@@ -18,7 +22,9 @@
 #
 # UPDATES is the total update count to stop at (default 30000, more than a week). The trainer options
 # default to the sparring configuration in docs/lab_training_zh.md and CR_PPO_EXTRA_ARGS replaces them;
-# a resume reuses the options saved in runs/NAME/trainer-options.txt. Other settings:
+# a resume reuses the options saved in runs/NAME/trainer-options.txt (CR_PPO_EXTRA_ARGS on a resume, or the
+# options command, replaces them; the changed options then take effect through a warm start: the newest
+# strict checkpoint's weights, a fresh optimizer and update count). Other settings:
 # CR_PPO_ENGINE_COUNT (8), CR_LAB_ENGINE_CPUS (0-7), CR_LAB_WORKER_CPUS (8-15), CR_LAB_CONTROL_CPUS (16-19), CR_LAB_TRAIN_GPUS
 # (0; nvidia-smi numbers, e.g. 0,1), CR_LAB_KEEP_CHECKPOINTS (3) and CR_LAB_CHECKPOINT_BUCKET (1000):
 # the newest few strict checkpoints are kept plus the first one in every bucket of that many updates.
@@ -127,6 +133,56 @@ newest_checkpoint() {
   { find "$1" -path '*/train-*/checkpoints/update-*.pt' 2>/dev/null || true; } | sort | tail -n 1
 }
 
+# The options a stage trained with; stages from before this record were the current options.
+stage_options() {
+  local file=$1/options-$(basename "$2").txt
+  if [[ -f $file ]]; then cat "$file"; else cat "$1/trainer-options.txt"; fi
+}
+
+# Keep what the newest stage trained with before its options change, so the next resume can tell.
+remember_stage_options() {
+  local stage
+  stage=$(newest_checkpoint "$1")
+  [[ -n $stage ]] || return 0
+  stage=$(dirname "$(dirname "$stage")")
+  [[ -f $1/options-$(basename "$stage").txt ]] || cp "$1/trainer-options.txt" "$1/options-$(basename "$stage").txt"
+}
+
+edit_options() {
+  local run_dir=$1 joined
+  shift
+  [[ -s $run_dir/trainer-options.txt ]] || { echo "$run_dir has no trainer options; start the run first" >&2; exit 1; }
+  local -a current new=() drop=() kept=()
+  read -ra current <"$run_dir/trainer-options.txt"
+  while (($#)); do
+    if [[ $1 == --unset ]]; then
+      [[ ${2:-} == --* ]] || { echo "usage: --unset --FLAG" >&2; exit 2; }
+      drop+=("$2")
+      shift 2
+    elif [[ $1 == --* ]]; then
+      drop+=("$1")
+      new+=("$1")
+      shift
+      while (($#)) && [[ $1 != --* ]]; do new+=("$1"); shift; done
+    else
+      echo "expected --FLAG, got '$1'" >&2
+      exit 2
+    fi
+  done
+  local token skipping=0
+  for token in "${current[@]}"; do
+    if [[ $token == --* ]]; then
+      skipping=0
+      [[ " ${drop[*]} " != *" $token "* ]] || skipping=1
+    fi
+    ((skipping)) || kept+=("$token")
+  done
+  remember_stage_options "$run_dir"
+  joined="${kept[*]} ${new[*]}"
+  joined=${joined# }
+  echo "${joined% }" >"$run_dir/trainer-options.txt"
+}
+
 wait_for() {
   local description=$1 seconds=$2 pid=$3
   shift 3
@@ -194,6 +250,7 @@ run() {
   fi
   extra=${extra:-$(default_extra_args)}
   echo "$extra" >"$run_dir/trainer-options.txt"
+  echo "$extra" >"$run_dir/options-$(basename "$stage").txt"
   log "training to update $updates on GPU $train_gpus into $stage${resume:+ from $resume}"
   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$train_gpus CR_PPO_EXTRA_ARGS=$extra \
     bash "$script_dir/launch_ppo_multinode_training.sh" "$stage" "$run_dir/topology.json" "$updates" \
@@ -294,7 +351,17 @@ case ${1:-} in
     shift
     checkpoint=$(newest_checkpoint "$runs/${1:?usage: lab_ppo.sh resume NAME [UPDATES]}")
     load_launch_env "$runs/$1"
-    if [[ -n $checkpoint ]]; then
+    if [[ $explicit_vars == *" CR_PPO_EXTRA_ARGS "* && -s $runs/$1/trainer-options.txt ]]; then
+      remember_stage_options "$runs/$1"
+      echo "$CR_PPO_EXTRA_ARGS" >"$runs/$1/trainer-options.txt"
+    fi
+    if [[ -n $checkpoint ]] && [[ $(stage_options "$runs/$1" "$(dirname "$(dirname "$checkpoint")")") \
+      != "$(cat "$runs/$1/trainer-options.txt" 2>/dev/null)" ]]; then
+      echo "trainer options changed since $checkpoint; warm-starting a new stage from it with:"
+      cat "$runs/$1/trainer-options.txt"
+      export CR_PPO_CHECKPOINT=$checkpoint CR_PPO_EXTRA_ARGS="$(<"$runs/$1/trainer-options.txt")"
+      start "$1" "${2:-30000}"
+    elif [[ -n $checkpoint ]]; then
       echo "resuming from $checkpoint"
       start "$1" "${2:-30000}" "$checkpoint"
     elif [[ -s $runs/$1/trainer-options.txt && -f ${CR_PPO_CHECKPOINT:-} ]]; then
@@ -354,6 +421,15 @@ case ${1:-} in
     } | crontab -
     echo "scheduled $name daily: resume at $begin, retry for $retry_minutes minutes, stop by $end (log: $log_file)"
     crontab -l | grep "# lab_ppo schedule"
+    ;;
+  options)
+    name=${2:?usage: lab_ppo.sh options NAME [--FLAG [VALUE...]]... [--unset --FLAG]...}
+    if (($# > 2)); then
+      edit_options "$runs/$name" "${@:3}"
+      echo "saved; the next resume of $name warm-starts from its newest checkpoint with these options"
+      [[ -z $(supervisor_pids) ]] || echo "(the running trainer keeps its options until it is stopped)"
+    fi
+    tr ' ' '\n' <"$runs/$name/trainer-options.txt" | awk '/^--/ {if (line) print line; line = $0; next} {line = line " " $0} END {print line}'
     ;;
   ensure)
     name=${2:?usage: lab_ppo.sh ensure NAME}
