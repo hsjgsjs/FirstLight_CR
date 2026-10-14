@@ -103,7 +103,7 @@ def validate_reward_parameters_v4(parameters: Mapping[str, object]) -> None:
         if any(not math.isfinite(parameters[name]) or parameters[name] < 0.0 for name in names):
             raise ValueError(message)
 
-    require_finite(("fireball_king_activation_penalty",), "fireball activation penalty must be finite and nonnegative")
+    require_finite(("spell_king_activation_penalty",), "spell activation penalty must be finite and nonnegative")
     require_finite(
         (
             "mutual_elixir_overflow_penalty",

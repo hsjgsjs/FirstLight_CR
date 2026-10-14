@@ -36,7 +36,7 @@ from .decoding import ShadowCandidateLegality, decode_action_sequence_v4
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .policy_session import _fixed_cuda_graph_batch_v4
 from .matchmaking import POLICY_IL
-from .king_activation_reward import apply_fireball_king_activation_penalty_v4
+from .king_activation_reward import apply_spell_king_activation_penalty_v4
 from .model import UniversalCardPolicyV4
 from .ppo import StoredRolloutV4
 from .ppo_runtime import ppo_environment_config_v4, validate_reward_parameters_v4
@@ -985,7 +985,7 @@ def _engine_worker(
     first_hog_missed_deadline_penalty: float = 0.0,
     first_hog_deferral_penalty: float = 0.0,
     first_hog_deferral_penalty_episode_cap: float = 0.0,
-    fireball_king_activation_penalty: float = 0.0,
+    spell_king_activation_penalty: float = 0.0,
 ) -> None:
     """Own one native endpoint and all stateful tensorizers on one CPU."""
 
@@ -1568,8 +1568,8 @@ def _engine_worker(
                 counts = list(runtime.rejected_actions)
                 counts[owner] += rejected
                 runtime.rejected_actions = (counts[0], counts[1])
-            apply_fireball_king_activation_penalty_v4(
-                runtime, before_observations, next_observations, adjusted_reward, fireball_king_activation_penalty
+            apply_spell_king_activation_penalty_v4(
+                runtime, before_observations, next_observations, adjusted_reward, spell_king_activation_penalty
             )
             hog_counts = list(runtime.hog_deployments)
             hog_totals = list(runtime.hog_deploy_reward_total)
@@ -1823,7 +1823,7 @@ def collect_async_cluster_wave_v4(
     first_hog_missed_deadline_penalty: float = 0.0,
     first_hog_deferral_penalty: float = 0.0,
     first_hog_deferral_penalty_episode_cap: float = 0.0,
-    fireball_king_activation_penalty: float = 0.0,
+    spell_king_activation_penalty: float = 0.0,
 ) -> ClusterCollectionV4:
     """Collect recurrent PPO segments from remote resident engines."""
 
@@ -2325,7 +2325,7 @@ def collect_async_cluster_wave_v4(
                     "assignments": by_engine[spec.engine_index],
                     "gamma_per_decision": gamma_per_decision,
                     "shaping_beta": shaping_beta,
-                    "fireball_king_activation_penalty": fireball_king_activation_penalty,
+                    "spell_king_activation_penalty": spell_king_activation_penalty,
                     "hog_deploy_reward": hog_deploy_reward,
                     "hog_deploy_reward_episode_cap": hog_deploy_reward_episode_cap,
                     "hog_deploy_opening_reward": hog_deploy_opening_reward,

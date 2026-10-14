@@ -117,10 +117,10 @@ class _MatchRuntimeV4:
     seen_hog_deployments: set[tuple[int, str]] = field(default_factory=set)
     seen_king_activation_owners: set[int] = field(default_factory=set)
     sleeping_enemy_king_damage_count: tuple[int, int] = (0, 0)
-    king_activation_not_attributed_to_fireball: tuple[int, int] = (0, 0)
-    fireball_king_activations: tuple[int, int] = (0, 0)
-    fireball_king_activation_penalty_total: tuple[float, float] = (0.0, 0.0)
-    fireball_king_activation_details: list[dict[str, object]] = field(default_factory=list)
+    king_activation_not_attributed_to_spell: tuple[int, int] = (0, 0)
+    spell_king_activations: tuple[int, int] = (0, 0)
+    spell_king_activation_penalty_total: tuple[float, float] = (0.0, 0.0)
+    spell_king_activation_details: list[dict[str, object]] = field(default_factory=list)
 
 
 class RetryResidentNativeClashEnv(ResidentNativeClashEnv):
@@ -365,10 +365,10 @@ def _terminal_report(runtime: _MatchRuntimeV4) -> dict[str, object]:
         ),
         "hog_deployments": runtime.hog_deployments,
         "sleeping_enemy_king_damage_count": runtime.sleeping_enemy_king_damage_count,
-        "king_activation_not_attributed_to_fireball": runtime.king_activation_not_attributed_to_fireball,
-        "fireball_king_activations": runtime.fireball_king_activations,
-        "fireball_king_activation_penalty_total": runtime.fireball_king_activation_penalty_total,
-        "fireball_king_activation_details": runtime.fireball_king_activation_details,
+        "king_activation_not_attributed_to_spell": runtime.king_activation_not_attributed_to_spell,
+        "spell_king_activations": runtime.spell_king_activations,
+        "spell_king_activation_penalty_total": runtime.spell_king_activation_penalty_total,
+        "spell_king_activation_details": runtime.spell_king_activation_details,
         "hog_deploy_reward_total": runtime.hog_deploy_reward_total,
         "first_hog_timing_reward_total": runtime.first_hog_timing_reward_total,
         "first_hog_deferral_penalty_total": (runtime.first_hog_deferral_penalty_total),

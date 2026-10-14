@@ -346,15 +346,15 @@ def _batch_wandb_metrics(
     king_owners = [
         (report, int(owner))
         for report in reports
-        if "fireball_king_activations" in report
+        if "spell_king_activations" in report
         for owner in report["current_owners"]
     ]
     if king_owners:
         for field_name in (
-            "fireball_king_activations",
-            "fireball_king_activation_penalty_total",
+            "spell_king_activations",
+            "spell_king_activation_penalty_total",
             "sleeping_enemy_king_damage_count",
-            "king_activation_not_attributed_to_fireball",
+            "king_activation_not_attributed_to_spell",
         ):
             result[f"batch_performance/{field_name}_mean"] = sum(
                 report[field_name][owner] for report, owner in king_owners
@@ -1038,7 +1038,11 @@ def main() -> int:
     parser.add_argument("--elixir-overflow-step-penalty-cap", type=float, default=0.1)
     parser.add_argument("--clip-range", type=float, default=0.1)
     parser.add_argument("--hog-deploy-reward", type=float, default=0.0)
-    parser.add_argument("--fireball-king-activation-penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--spell-king-activation-penalty", "--fireball-king-activation-penalty",
+        dest="spell_king_activation_penalty", type=float, default=0.0,
+        help="one-time penalty for any spell waking an enemy King while both Princess Towers survive",
+    )
     parser.add_argument("--hog-deploy-reward-episode-cap", type=float, default=0.1)
     parser.add_argument(
         "--hog-deploy-opening-reward",
@@ -1389,8 +1393,8 @@ def main() -> int:
         "shaping_beta": args.shaping_beta,
         "hog_deploy_reward": args.hog_deploy_reward,
         **(
-            {"fireball_king_activation_penalty": args.fireball_king_activation_penalty}
-            if args.fireball_king_activation_penalty
+            {"spell_king_activation_penalty": args.spell_king_activation_penalty}
+            if args.spell_king_activation_penalty
             else {}
         ),
         "hog_deploy_reward_episode_cap": args.hog_deploy_reward_episode_cap,
@@ -1672,7 +1676,7 @@ def main() -> int:
                     historical,
                     gamma_per_decision=args.gamma,
                     shaping_beta=args.shaping_beta,
-                    fireball_king_activation_penalty=args.fireball_king_activation_penalty,
+                    spell_king_activation_penalty=args.spell_king_activation_penalty,
                     hog_deploy_reward=args.hog_deploy_reward,
                     hog_deploy_reward_episode_cap=args.hog_deploy_reward_episode_cap,
                     hog_deploy_opening_reward=args.hog_deploy_opening_reward,
