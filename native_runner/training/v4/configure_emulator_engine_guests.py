@@ -220,8 +220,11 @@ def relax_power_check(serial: str) -> None:
 def configure_guest_once(serial: str, host_base: int, engines: int) -> dict[str, Any]:
     root_identity = wait_root(serial)
     nproc_text = adb(serial, "shell", "nproc").stdout.strip()
-    if int(nproc_text) != engines:
-        raise RuntimeError(f"{serial} exposes {nproc_text} CPUs, expected {engines}")
+    # Training asks for one vCPU per engine. A duel guest asks for more, and the
+    # emulator sometimes exposes fewer than that request. Pinning only needs one
+    # CPU per engine process.
+    if int(nproc_text) < engines:
+        raise RuntimeError(f"{serial} exposes {nproc_text} CPUs, need at least {engines}")
     package_path = adb(serial, "shell", "pm", "path", PACKAGE).stdout.strip()
     if not package_path:
         raise RuntimeError(f"{serial} does not contain {PACKAGE}")

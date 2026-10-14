@@ -251,9 +251,12 @@ for index in $(seq 0 $((guest_count - 1))); do
   sed -i \
     -e "s/^avd.id=.*/avd.id=$name/" \
     -e "s/^avd.name=.*/avd.name=$name/" \
-    -e "s/^hw.cpu.ncore=.*/hw.cpu.ncore=${guest_vcpus[$index]}/" \
-    -e "s/^hw.ramSize=.*/hw.ramSize=${guest_memory_mb[$index]}M/" \
+    -e "s/^hw.cpu.ncore[[:space:]]*=.*/hw.cpu.ncore=${guest_vcpus[$index]}/" \
+    -e "s/^hw.ramSize[[:space:]]*=.*/hw.ramSize=${guest_memory_mb[$index]}M/" \
     "$avd_dir/config.ini"
+  if ! grep -q "^hw.cpu.ncore=${guest_vcpus[$index]}$" "$avd_dir/config.ini"; then
+    echo "hw.cpu.ncore=${guest_vcpus[$index]}" >>"$avd_dir/config.ini"
+  fi
   cp --reflink=auto --sparse=always "$source_avd/cache.img" "$avd_dir/cache.img"
   # Emulator 37 builds a missing -data image from the system image's blank userdata and
   # ignores -initdata, so the clone is seeded here. Writable partitions live beside -data;
@@ -302,9 +305,14 @@ while ((${#pending[@]})); do
     boot=$("$adb" -s "$serial" shell getprop sys.boot_completed </dev/null 2>/dev/null | tr -d '\r' || true)
     if [[ $state == device && $boot == 1 ]]; then
       guest_nproc=$("$adb" -s "$serial" shell nproc | tr -d '\r')
-      if [[ $guest_nproc != "${guest_engines[$index]}" ]]; then
-        echo "$serial exposes $guest_nproc CPUs, expected ${guest_engines[$index]}" >&2
+      # One engine is pinned to one vCPU. Extra cores are for the other matches in a duel
+      # guest; the emulator may also expose fewer cores than requested.
+      if ((guest_nproc < ${guest_engines[$index]})); then
+        echo "$serial exposes $guest_nproc CPUs, need at least ${guest_engines[$index]}" >&2
         exit 97
+      fi
+      if ((guest_nproc != ${guest_vcpus[$index]})); then
+        echo "$(date -Is) CPU_COUNT serial=$serial guest_cpus=$guest_nproc requested=${guest_vcpus[$index]}" >&2
       fi
       echo "$(date -Is) BOOT_READY index=$index serial=$serial host_cpus=${engine_cpu_pools[$index]}"
     else
