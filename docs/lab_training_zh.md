@@ -108,7 +108,7 @@ bash native_runner/training/v4/lab_ppo.sh resume spar-week1         # 中断后�
 
 - **启动前**会先清理上次残留的模拟器、worker、训练器和 `/dev/shm/firstlight-ppo-local-*`；**退出时**（训练结束、`stop`、出错）也会自动清理。只动自己账号下、名字是 `crppo_*` 的模拟器，不碰别人的。
 - **默认单卡**（GPU 0），CPU 按 `CR_LAB_ENGINE_CPUS` / `CR_LAB_WORKER_CPUS` / `CR_LAB_CONTROL_CPUS` 分配（默认值见脚本开头，按自己的核数调整）。有第二块卡时，可以在训练中途拿来评测。改用双卡：`CR_LAB_TRAIN_GPUS=0,1`；双卡之间通信出问题时再加 `NCCL_P2P_DISABLE=1`。
-- **训练参数**默认是第 6 节的对练配置，实际用的参数存在 `runs/名字/trainer-options.txt`，续训时会自动沿用。要换参数就设 `CR_PPO_EXTRA_ARGS`（会整体替换默认参数），并且换一个新名字开训。
+- **训练参数**默认是第 6 节的对练配置，实际用的参数存在 `runs/名字/trainer-options.txt`，续训时会自动沿用。要换参数用 `options`（见下面「中途改参数」），不用换名字。
 - **检查点**：每打完一批对局存一个完整检查点（约 48 MB，大约每 8 次更新一个）。脚本只保留最新 3 个，再加每 1000 次更新的第一个，一周大约 1–2 GB。对手池快照每 200 次更新一个。
 - 剩余硬盘不足 5 GB 时，`supervisor.log` 里会出现警告。
 - **`status` 怎么看进步**：
@@ -140,16 +140,21 @@ tail runs/schedule.log                                                      # �
 
 ### 中途改参数
 
-- **续训时可以改**：总更新次数 `UPDATES`、`CR_PPO_INFERENCE_BATCH_WAIT_MS`。
-- **续训时不能改**：奖励、对手、延迟、gate 温度、引擎数、GPU 数，这些写在续训合同里。要改的话，就从最新检查点开一轮新的训练。模型权重全部保留，只是优化器状态和更新计数会重置：
+- **续训时可以直接改**：总更新次数 `UPDATES`、`CR_PPO_INFERENCE_BATCH_WAIT_MS`。
+- **训练参数**（奖励、对手、延迟、出牌间隔、gate 温度等）用 `options` 改，训练名不变，定时任务也不用动：
 
 ```bash
-bash native_runner/training/v4/lab_ppo.sh stop
-while IFS='=' read -r k v; do export "$k=$v"; done < runs/旧名字/launch-env   # 沿用旧训练的引擎数、CPU 和 GPU 设置
-export CR_PPO_CHECKPOINT=$PWD/$(ls runs/旧名字/train-*/checkpoints/update-*.pt | sort | tail -1)
-export CR_PPO_EXTRA_ARGS=$(sed 's/旧参数/新参数/' runs/旧名字/trainer-options.txt)
-bash native_runner/training/v4/lab_ppo.sh start 新名字   # 之后换一个新终端再做别的操作
+bash native_runner/training/v4/lab_ppo.sh options spar16-gw                                   # 查看当前参数，一行一个
+bash native_runner/training/v4/lab_ppo.sh options spar16-gw --min-play-gap-ticks 4-8          # 新增或替换一项
+bash native_runner/training/v4/lab_ppo.sh options spar16-gw --unset --game-elixir-overflow-grace   # 删除一项
 ```
+
+  - 可以一次写多项。可重复的参数（如 `--fixed-opponent-checkpoint`）会整体替换：要保留的那几个也要一起写上。
+  - 改完后的下一次续训（手动 `resume`，或者每天的定时启动）会发现参数和最新存档训练时用的不一样，自动**热启动**：用最新存档的模型权重开一个新的 `train-*` 阶段，优化器状态和更新计数重置。之后的续训就是普通续训。
+  - 正在跑的训练不受影响，要马上生效就先 `stop`，再 `resume`。
+  - 热启动后 gate 温度的退火会从头再来一遍（0.5 → 0.2，3000 次更新）。不想要的话，顺手改成固定值：`options 名字 --gate-temperature-start 0.2`。
+- 续训时带 `CR_PPO_EXTRA_ARGS="..."`，等于把参数整体换成这一串，效果同上。
+- **引擎数、GPU 数**存在 `runs/名字/launch-env`，改它们要在 `resume` 命令前带上新值，比如 `CR_PPO_ENGINE_COUNT=12 bash ... resume 名字`。
 
 ### 手动启动（排查问题时用）
 
@@ -217,12 +222,12 @@ python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --game
 
 - **做通用对练模型，不做专精。** 对练要什么卡组都能打、打法正常。
 - **训练时加入执行延迟。** 学习者和对手都加，延迟在 18–24 tick 之间随机。
-- **两张牌不能同时落地。** `--min-play-gap-ticks 4-8`：同一方连续两次出牌或技能，落地至少相隔随机 4–8 tick（1 tick = 50 ms，即 200–400 ms），和人手点两张牌的间隔一致。原来一次决策最多能出 2 张牌，而且同一 tick 落地；相邻两次决策各自抽延迟，也可能几乎同时落地。新开的训练默认带上；已有的训练要加它会改变续训检查的参数，只能热启动。评测器也有同名参数，对双方都生效。
+- **两张牌不能同时落地。** `--min-play-gap-ticks 4-8`：同一方连续两次出牌或技能，落地至少相隔随机 4–8 tick（1 tick = 50 ms，即 200–400 ms），和人手点两张牌的间隔一致。原来一次决策最多能出 2 张牌，而且同一 tick 落地；相邻两次决策各自抽延迟，也可能几乎同时落地。新开的训练默认带上；已有的训练用 `options 名字 --min-play-gap-ticks 4-8` 加上，下一次续训自动热启动。评测器也有同名参数，对双方都生效。
 - **对手**：自我对战 40%；固定对手 60%，从冻结的 General、Active IL、速猪专精 1 里均匀抽。原版 IL 占 0%（只作为锚点登记，不上场）。原版 IL 很被动，打它学到的是等对方犯错。
 - **开局要主动**（见下面的测试）：
   - 圣水溢出惩罚 `--personal-elixir-overflow-penalty 0.01`，满格后多浪费 1 点就开始扣（`--personal-elixir-overflow-grace 1`）；
   - gate 温度在前 3000 次更新里从 0.5 降到 0.2，让模型前期多尝试早出牌，最后回到默认值。
-- **整局圣水浪费惩罚（可选）**：`--game-elixir-overflow-penalty C --game-elixir-overflow-grace G`。从学习者**第一张牌真正下出之后**开始，把整局满格浪费的圣水累加，超过 G 点后每多浪费 1 点扣 C。开局为了等对手而满格等待不算在内。上面那条按段计算的惩罚，每次圣水降到 10 以下就清零，所以一局里可以反复白白浪费；这一项补上了整局总量。参照：人类录像里胜方整局浪费的中位数约 2.3 点（`elixir_leaked`）。`status` 会显示「after the first card」这一行。开启它会改变续训检查的参数，只能热启动。
+- **整局圣水浪费惩罚（可选）**：`--game-elixir-overflow-penalty C --game-elixir-overflow-grace G`。从学习者**第一张牌真正下出之后**开始，把整局满格浪费的圣水累加，超过 G 点后每多浪费 1 点扣 C。开局为了等对手而满格等待不算在内。上面那条按段计算的惩罚，每次圣水降到 10 以下就清零，所以一局里可以反复白白浪费；这一项补上了整局总量。参照：人类录像里胜方整局浪费的中位数约 2.3 点（`elixir_leaked`）。`status` 会显示「after the first card」这一行。已有的训练用 `options` 加上，下一次续训自动热启动。
 - **GPU 数量看引擎数。** 引擎少时单卡更快；引擎多到单卡显存不够时用双卡。
 - **对手池快照间隔**改成 200 次更新一次。默认每 8 次一次，几天就会把硬盘写满。
 - **评测要看两件事**：一是双方都带延迟时，训练出的模型对 General 的胜率；二是每局出牌次数，以及第一张牌出得早不早。不只看胜率。
