@@ -32,7 +32,7 @@ from .cluster_self_play import ClusterCollectionV4, ClusterMatchAssignmentV4
 from .deck_pool import DeckIdentityV4, DeckPoolManifestV4
 from .decoding import ShadowCandidateLegality
 from .distributed_ppo import distributed_ppo_update_v4
-from .ppo_expert_bc import HogExpertSamplerV4, distributed_expert_bc_update_v4, expert_bc_contract_v4
+from .ppo_expert_bc import load_expert_sampler_v4, distributed_expert_bc_update_v4, expert_bc_contract_v4
 from .factory import build_production_model_v4
 from .league import PolicyLeagueV4
 from .matchmaking import (
@@ -346,15 +346,15 @@ def _batch_wandb_metrics(
     king_owners = [
         (report, int(owner))
         for report in reports
-        if "fireball_king_activations" in report
+        if "spell_king_activations" in report
         for owner in report["current_owners"]
     ]
     if king_owners:
         for field_name in (
-            "fireball_king_activations",
-            "fireball_king_activation_penalty_total",
+            "spell_king_activations",
+            "spell_king_activation_penalty_total",
             "sleeping_enemy_king_damage_count",
-            "king_activation_not_attributed_to_fireball",
+            "king_activation_not_attributed_to_spell",
         ):
             result[f"batch_performance/{field_name}_mean"] = sum(
                 report[field_name][owner] for report, owner in king_owners
@@ -920,7 +920,7 @@ def main() -> int:
         type=parse_play_gap_ticks,
         help=(
             "land each policy's consecutive card plays and abilities at least MIN-MAX ticks apart (drawn per "
-            "play; a tick is 50 ms, so 4-8 is 200-400 ms), as a human cannot tap two cards at once"
+            "play; a tick is 50 ms, so 8-12 is 400-600 ms), as a human cannot tap two cards at once"
         ),
     )
     parser.add_argument(
@@ -939,6 +939,10 @@ def main() -> int:
             "by a battle time drawn per game from MIN-MAX seconds (or a single N), so opponents open games "
             "like people do and the learner cannot profit from ones that wait for minutes"
         ),
+    )
+    parser.add_argument(
+        "--fixed-opponent-opening-natural-percent", type=int, default=0,
+        help="percent of frozen-opponent games exempt from opening timeouts (0-100)",
     )
     parser.add_argument(
         "--self-play-percent", type=int, default=0, help="percent of games using current versus current"
@@ -1038,7 +1042,11 @@ def main() -> int:
     parser.add_argument("--elixir-overflow-step-penalty-cap", type=float, default=0.1)
     parser.add_argument("--clip-range", type=float, default=0.1)
     parser.add_argument("--hog-deploy-reward", type=float, default=0.0)
-    parser.add_argument("--fireball-king-activation-penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--spell-king-activation-penalty", "--fireball-king-activation-penalty",
+        dest="spell_king_activation_penalty", type=float, default=0.0,
+        help="one-time penalty for any spell waking an enemy King while both Princess Towers survive",
+    )
     parser.add_argument("--hog-deploy-reward-episode-cap", type=float, default=0.1)
     parser.add_argument(
         "--hog-deploy-opening-reward",
@@ -1057,10 +1065,12 @@ def main() -> int:
     parser.add_argument("--lane-microbatch-size", type=int, default=96)
     parser.add_argument("--sequence-chunk-steps", type=int, default=48)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--expert-bc-manifest", type=Path)
+    parser.add_argument("--expert-bc-manifest", type=Path, help="audited general or legacy Hog expert train manifest")
     parser.add_argument("--expert-bc-coefficient", type=float, default=0.2)
     parser.add_argument("--expert-bc-records-per-rank", type=int, default=2)
     parser.add_argument("--expert-bc-window-steps", type=int, default=128)
+    parser.add_argument("--expert-bc-every-updates", type=int, default=1,
+                        help="one separate policy-only imitation step every N PPO updates")
     parser.add_argument("--expert-bc-hog-gate-weight", type=float, default=0.0)
     parser.add_argument("--expert-bc-hog-gate-scope", choices=("all", "proactive-first"), default="all")
     parser.add_argument("--expert-bc-hog-gate-gradient-scope", choices=("full", "gate-head-only"), default="full")
@@ -1071,10 +1081,12 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--validate", action="store_true")
     args = parser.parse_args()
+    if not 0 <= args.fixed_opponent_opening_natural_percent <= 100:
+        raise ValueError("fixed-opponent opening natural percent must be in [0, 100]")
     if (
         not math.isfinite(args.expert_bc_coefficient)
         or args.expert_bc_coefficient <= 0
-        or min(args.expert_bc_records_per_rank, args.expert_bc_window_steps) <= 0
+        or min(args.expert_bc_records_per_rank, args.expert_bc_window_steps, args.expert_bc_every_updates) <= 0
     ):
         raise ValueError("expert BC coefficient and dimensions must be positive")
     if not math.isfinite(args.expert_bc_hog_gate_weight) or args.expert_bc_hog_gate_weight < 0:
@@ -1343,7 +1355,7 @@ def main() -> int:
     expert_bc_sampler = (
         None
         if args.expert_bc_manifest is None
-        else HogExpertSamplerV4(
+        else load_expert_sampler_v4(
             args.expert_bc_manifest,
             seed=args.seed,
             records_per_rank=args.expert_bc_records_per_rank,
@@ -1359,6 +1371,7 @@ def main() -> int:
             hog_gate_weight=args.expert_bc_hog_gate_weight,
             hog_gate_scope=args.expert_bc_hog_gate_scope,
             hog_gate_gradient_scope=args.expert_bc_hog_gate_gradient_scope,
+            every_updates=args.expert_bc_every_updates,
         )
     )
     bc_identities = [None for _ in range(world_size)]
@@ -1389,8 +1402,8 @@ def main() -> int:
         "shaping_beta": args.shaping_beta,
         "hog_deploy_reward": args.hog_deploy_reward,
         **(
-            {"fireball_king_activation_penalty": args.fireball_king_activation_penalty}
-            if args.fireball_king_activation_penalty
+            {"spell_king_activation_penalty": args.spell_king_activation_penalty}
+            if args.spell_king_activation_penalty
             else {}
         ),
         "hog_deploy_reward_episode_cap": args.hog_deploy_reward_episode_cap,
@@ -1459,6 +1472,8 @@ def main() -> int:
         resume_contract["fixed_opponent_opening_force_after_seconds"] = list(
             args.fixed_opponent_opening_force_after_seconds
         )
+    if args.fixed_opponent_opening_natural_percent:
+        resume_contract["fixed_opponent_opening_natural_percent"] = args.fixed_opponent_opening_natural_percent
     # Omit the optional key when disabled to preserve old no-BC strict resumes.
     if expert_bc_contract is not None:
         resume_contract["expert_bc"] = expert_bc_contract
@@ -1545,6 +1560,7 @@ def main() -> int:
             worker_port=engine_worker_ports[engine_index],
             force_il_opponent_opening_after_seconds=(args.il_opening_force_after_seconds),
             force_frozen_opponent_opening_after_seconds=args.fixed_opponent_opening_force_after_seconds,
+            frozen_opponent_opening_natural_percent=args.fixed_opponent_opening_natural_percent,
             execution_delay_ticks=args.execution_delay_ticks,
             game_elixir_overflow=game_elixir_overflow,
             early_first_play=early_first_play,
@@ -1672,7 +1688,7 @@ def main() -> int:
                     historical,
                     gamma_per_decision=args.gamma,
                     shaping_beta=args.shaping_beta,
-                    fireball_king_activation_penalty=args.fireball_king_activation_penalty,
+                    spell_king_activation_penalty=args.spell_king_activation_penalty,
                     hog_deploy_reward=args.hog_deploy_reward,
                     hog_deploy_reward_episode_cap=args.hog_deploy_reward_episode_cap,
                     hog_deploy_opening_reward=args.hog_deploy_opening_reward,
@@ -1881,7 +1897,7 @@ def main() -> int:
                 validate=args.validate,
             )
             bc_metrics = {}
-            if expert_bc_sampler is not None:
+            if expert_bc_sampler is not None and update_step % args.expert_bc_every_updates == 0:
                 bc_metrics = distributed_expert_bc_update_v4(
                     current_model,
                     optimizer,

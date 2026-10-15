@@ -66,12 +66,16 @@ export CR_PPO_ENGINES_PER_GUEST=${CR_PPO_ENGINES_PER_GUEST:-4}
 default_extra_args() {
   # The path to Active IL contains a space, and the trainer options are split on whitespace.
   ln -sfn "$repository_root/checkpoints/active IL/checkpoint-step-00000030.pt" "$runs/active-il.pt"
-  echo "--execution-delay-ticks 18-24 --min-play-gap-ticks 4-8 --self-play-percent 40 --fixed-opponent-percent 60" \
+  echo "--execution-delay-ticks 18-24 --min-play-gap-ticks 8-12 --self-play-percent 40 --fixed-opponent-percent 60" \
     "--fixed-opponent-checkpoint checkpoints/General/checkpoint-step-00000460.pt" \
     "--fixed-opponent-checkpoint $runs/active-il.pt" \
     "--fixed-opponent-checkpoint checkpoints/2_6hog_expert/hog26-specialist1.pt" \
     "--il-anchor-checkpoint checkpoints/IL/checkpoint-step-00029396.pt" \
-    "--personal-elixir-overflow-penalty 0.01 --personal-elixir-overflow-grace 1" \
+    "--personal-elixir-overflow-penalty 0 --personal-elixir-overflow-grace 0" \
+    "--game-elixir-overflow-penalty 0.01 --game-elixir-overflow-grace 3" \
+    "--early-first-play-penalty 0 --early-first-play-free-seconds 6" \
+    "--fixed-opponent-opening-force-after-seconds 6-20 --spell-king-activation-penalty 0.1" \
+    "--fixed-opponent-opening-natural-percent 20" \
     "--gate-temperature-start 0.5 --gate-temperature-end 0.2 --gate-temperature-anneal-updates 3000" \
     "--snapshot-every 200"
 }
@@ -499,6 +503,11 @@ if early and any(early):
           f"mean penalty {statistics.mean(early):.3f}")
 # Only with --fixed-opponent-opening-force-after-seconds: fixed opponents made to open the game.
 frozen = [r for r in recent if r["policy_matchup"] == "current-history"]
+eligible = [r for r in frozen if "opening_force_exempt" in r
+            and (r["opening_force_exempt"] or r.get("opening_force_deadline_seconds") is not None)]
+if eligible:
+    print(f"  fixed opponents exempt from opening timeout: "
+          f"{sum(r['opening_force_exempt'] for r in eligible) / len(eligible):.0%} of their games")
 forced = [r["opening_forced_tick"] / 20 for r in frozen if r.get("opening_forced_owner") is not None]
 if forced:
     print(f"  fixed opponents forced to open: {len(forced) / len(frozen):.0%} of their games, "

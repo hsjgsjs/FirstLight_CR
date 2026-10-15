@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 import json
 import re
+import time
 from typing import Any
 
 from .cr_native_env import NativeClashEnv, RunnerError, decode_native_card_parameter
@@ -189,7 +190,14 @@ class LiveCaptureNative(_LiveNativeBase):
         command = "live observe-atomic"
         if self.floors is not None:
             command += " " + " ".join(str(int(value)) for value in self.floors())
-        return self._validate_atomic_result(self._request(command))
+        started = time.monotonic_ns()
+        result = self._request(command)
+        sink = getattr(self, "capture_sink", None)
+        if sink is not None:
+            # Preserve the raw response even if validation subsequently rejects
+            # it; failure evidence must not disappear from a valuable live game.
+            self.last_capture_id = sink(result, request_started_ns=started)
+        return self._validate_atomic_result(result)
 
 
 class LiveEpisode:

@@ -1,4 +1,4 @@
-"""Reward-only attribution of Fireball damage to a sleeping enemy King Tower.
+"""Reward-only attribution of spell damage to a sleeping enemy King Tower.
 
 Native combat facts are used only for reward; no oracle facts enter policy input.
 Tower.active means alive, NOT awake. Sleeping requires full HP, no activation
@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import math
 from typing import Any, Callable, Sequence
-
-FIREBALL_CARD_ID = 28_000_000
 
 
 def sleeping_king_damage_v4(before: Sequence[Any], after: Sequence[Any], owner: int):
@@ -34,7 +32,7 @@ def sleeping_king_damage_v4(before: Sequence[Any], after: Sequence[Any], owner: 
     return king
 
 
-def fireball_activation_evidence_v4(
+def spell_activation_evidence_v4(
     king: Any,
     events: Sequence[Any],
     *,
@@ -42,11 +40,12 @@ def fireball_activation_evidence_v4(
     before_tick: int,
     after_tick: int,
     canonical_tick: Callable[[int], int],
+    spell_card_ids: frozenset[int],
 ) -> dict[str, Any] | None:
-    """Use the first HP-loss event, not proximity or merely a Fireball cast.
+    """Use the first HP-loss event, not proximity or merely a spell cast.
 
     The splash center need not be the king: native damage attribution also covers
-    Fireballs aimed at an adjacent troop. If source attribution is unavailable,
+    spells aimed at an adjacent troop. If source attribution is unavailable,
     return None and let the caller record the unattributed transition.
     """
     for event in sorted(events, key=lambda e: (e.tick, e.sequence)):
@@ -76,13 +75,13 @@ def fireball_activation_evidence_v4(
                 (
                     s
                     for s in sources
-                    if s.present and s.validated and s.owner == owner and s.card_id == FIREBALL_CARD_ID
+                    if s.present and s.validated and s.owner == owner and s.card_id in spell_card_ids
                 ),
                 None,
             )
             card = None if source is None else source.card_id
             source_owner = None if source is None else source.owner
-        if card != FIREBALL_CARD_ID or source_owner != owner:
+        if card not in spell_card_ids or source_owner != owner:
             return None
         return {
             "owner": owner,
@@ -97,11 +96,11 @@ def fireball_activation_evidence_v4(
     return None
 
 
-def apply_fireball_king_activation_penalty_v4(
+def apply_spell_king_activation_penalty_v4(
     runtime: Any, before_observations: Any, after_observations: Any, adjusted_reward: list[float], coefficient: float
 ) -> None:
     if not math.isfinite(coefficient) or coefficient < 0:
-        raise ValueError("fireball activation penalty must be finite and nonnegative")
+        raise ValueError("spell activation penalty must be finite and nonnegative")
     if coefficient == 0:
         return
     for owner in runtime.assignment.matchup.current_owners:
@@ -116,24 +115,27 @@ def apply_fireball_king_activation_penalty_v4(
         env = runtime.environment
         snapshot = env._rich_snapshot_for(env.raw_observation)
         events = () if snapshot is None else snapshot.combat_events.events
-        evidence = fireball_activation_evidence_v4(
+        evidence = spell_activation_evidence_v4(
             king,
             events,
             owner=owner,
             before_tick=before.tick,
             after_tick=after.tick,
             canonical_tick=env._canonical_tick,
+            spell_card_ids=frozenset(
+                card_id for card_id, spec in env.card_specs.items() if spec.kind.value == "spell"
+            ),
         )
         if evidence is None:
-            missing = list(runtime.king_activation_not_attributed_to_fireball)
+            missing = list(runtime.king_activation_not_attributed_to_spell)
             missing[owner] += 1
-            runtime.king_activation_not_attributed_to_fireball = tuple(missing)
+            runtime.king_activation_not_attributed_to_spell = tuple(missing)
             continue
-        counts = list(runtime.fireball_king_activations)
-        totals = list(runtime.fireball_king_activation_penalty_total)
+        counts = list(runtime.spell_king_activations)
+        totals = list(runtime.spell_king_activation_penalty_total)
         counts[owner] += 1
         totals[owner] += coefficient
-        runtime.fireball_king_activations = tuple(counts)
-        runtime.fireball_king_activation_penalty_total = tuple(totals)
-        runtime.fireball_king_activation_details.append({**evidence, "penalty": coefficient})
+        runtime.spell_king_activations = tuple(counts)
+        runtime.spell_king_activation_penalty_total = tuple(totals)
+        runtime.spell_king_activation_details.append({**evidence, "penalty": coefficient})
         adjusted_reward[owner] -= coefficient

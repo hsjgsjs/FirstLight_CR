@@ -22,6 +22,7 @@ def test_interface_match_json_round_trips_through_cli(monkeypatch, tmp_path):
         assert restored == match
         assert options["actor_owner"] == 1
         assert options["sample"] is False
+        assert options["min_play_gap_ticks"] == (8, 12)
         assert not options["should_stop"]()
         options["on_ready"]({"mode": "native-render"})
         (artifacts / "stop").touch()
@@ -149,7 +150,7 @@ def test_model_inference_keeps_native_renderer_running(monkeypatch, tmp_path):
         calls.append("infer")
         return SimpleNamespace(decoded=SimpleNamespace(actions=()), inference_ms=1)
 
-    monkeypatch.setattr(offline_agent, "NativeClashEnv", lambda *_a, **_kw: native)
+    monkeypatch.setattr(offline_agent, "SpacedRenderNativeV4", lambda *_a, **_kw: native)
     monkeypatch.setattr(offline_agent, "BattleEnvV1", lambda **_kw: Environment())
     monkeypatch.setattr(
         offline_agent,

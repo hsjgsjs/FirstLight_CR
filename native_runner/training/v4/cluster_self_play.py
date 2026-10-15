@@ -86,6 +86,9 @@ class _MatchRuntimeV4:
     deck_average_elixir: tuple[float, float] = (0.0, 0.0)
     opening_forced_owner: int | None = None
     opening_forced_tick: int | None = None
+    opening_force_exempt: bool = False
+    opening_force_deadline_seconds: float | None = None
+    opening_force_planned: bool = False
     elixir_overflow_wasted: tuple[float, float] = (0.0, 0.0)
     elixir_overflow_penalty_total: tuple[float, float] = (0.0, 0.0)
     personal_elixir_overflow_wasted: tuple[float, float] = (0.0, 0.0)
@@ -117,10 +120,10 @@ class _MatchRuntimeV4:
     seen_hog_deployments: set[tuple[int, str]] = field(default_factory=set)
     seen_king_activation_owners: set[int] = field(default_factory=set)
     sleeping_enemy_king_damage_count: tuple[int, int] = (0, 0)
-    king_activation_not_attributed_to_fireball: tuple[int, int] = (0, 0)
-    fireball_king_activations: tuple[int, int] = (0, 0)
-    fireball_king_activation_penalty_total: tuple[float, float] = (0.0, 0.0)
-    fireball_king_activation_details: list[dict[str, object]] = field(default_factory=list)
+    king_activation_not_attributed_to_spell: tuple[int, int] = (0, 0)
+    spell_king_activations: tuple[int, int] = (0, 0)
+    spell_king_activation_penalty_total: tuple[float, float] = (0.0, 0.0)
+    spell_king_activation_details: list[dict[str, object]] = field(default_factory=list)
 
 
 class RetryResidentNativeClashEnv(ResidentNativeClashEnv):
@@ -365,10 +368,10 @@ def _terminal_report(runtime: _MatchRuntimeV4) -> dict[str, object]:
         ),
         "hog_deployments": runtime.hog_deployments,
         "sleeping_enemy_king_damage_count": runtime.sleeping_enemy_king_damage_count,
-        "king_activation_not_attributed_to_fireball": runtime.king_activation_not_attributed_to_fireball,
-        "fireball_king_activations": runtime.fireball_king_activations,
-        "fireball_king_activation_penalty_total": runtime.fireball_king_activation_penalty_total,
-        "fireball_king_activation_details": runtime.fireball_king_activation_details,
+        "king_activation_not_attributed_to_spell": runtime.king_activation_not_attributed_to_spell,
+        "spell_king_activations": runtime.spell_king_activations,
+        "spell_king_activation_penalty_total": runtime.spell_king_activation_penalty_total,
+        "spell_king_activation_details": runtime.spell_king_activation_details,
         "hog_deploy_reward_total": runtime.hog_deploy_reward_total,
         "first_hog_timing_reward_total": runtime.first_hog_timing_reward_total,
         "first_hog_deferral_penalty_total": (runtime.first_hog_deferral_penalty_total),
@@ -381,6 +384,8 @@ def _terminal_report(runtime: _MatchRuntimeV4) -> dict[str, object]:
         "deck_average_elixir": runtime.deck_average_elixir,
         "opening_forced_owner": runtime.opening_forced_owner,
         "opening_forced_tick": runtime.opening_forced_tick,
+        "opening_force_exempt": runtime.opening_force_exempt,
+        "opening_force_deadline_seconds": runtime.opening_force_deadline_seconds,
         "elixir_overflow_wasted": runtime.elixir_overflow_wasted,
         "elixir_overflow_penalty_total": (runtime.elixir_overflow_penalty_total),
         "personal_elixir_overflow_wasted": (runtime.personal_elixir_overflow_wasted),

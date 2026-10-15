@@ -80,8 +80,8 @@ def _run_worker(connection: RemoteWorkerConnection, request: Mapping[str, object
         float(request.get("first_hog_deferral_penalty", 0.0)),
         float(request.get("first_hog_deferral_penalty_episode_cap", 0.0)),
         **(
-            {"fireball_king_activation_penalty": float(request["fireball_king_activation_penalty"])}
-            if request.get("fireball_king_activation_penalty", 0.0)
+            {"spell_king_activation_penalty": float(request["spell_king_activation_penalty"])}
+            if request.get("spell_king_activation_penalty", 0.0)
             else {}
         ),
     )

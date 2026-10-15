@@ -67,7 +67,8 @@ def test_event_rings_are_trimmed_like_the_probe() -> None:
 class _Native(LiveTapNative):
     def __init__(self, tick: int) -> None:
         self.records: list[dict] = []
-        super().__init__("127.0.0.1", 1, layout=_layout(), taps=None, log=self.records.append)
+        super().__init__("127.0.0.1", 1, layout=_layout(), taps=None, log=self.records.append,
+                         min_play_gap_ticks=(8, 8))
         self.tick = tick
         self.seat = 1
         self.generation = 7

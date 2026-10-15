@@ -298,7 +298,7 @@ def _worker(
     infrastructure_retries: int,
     resume: bool,
 ) -> tuple[dict[str, object], ...]:
-    """Convert one engine endpoint's deterministic shard assignment."""
+    """Convert the pending shards assigned to one engine endpoint."""
 
     torch.set_num_threads(1)
     try:
@@ -409,17 +409,33 @@ def _worker(
     return tuple(summaries)
 
 
-def _partition_payloads(
-    payloads: Sequence[IndexedPayload], *, ports: Sequence[int], replays_per_shard: int
-) -> tuple[tuple[IndexedBatch, ...], ...]:
-    chunks = tuple(
-        (shard_index, tuple(payloads[start : start + replays_per_shard]))
-        for shard_index, start in enumerate(range(0, len(payloads), replays_per_shard))
-    )
+def _plan_cache_work(
+    payloads: Sequence[IndexedPayload],
+    *,
+    ports: Sequence[int],
+    replays_per_shard: int,
+    cache_root: Path,
+    partition_index: int,
+    resume: bool,
+) -> tuple[tuple[tuple[IndexedBatch, ...], ...], tuple[dict[str, object], ...]]:
+    """Keep shard identities stable while balancing only missing shards."""
+
     assignments: list[list[IndexedBatch]] = [[] for _ in ports]
-    for shard_index, chunk in chunks:
-        assignments[shard_index % len(ports)].append((shard_index, chunk))
-    return tuple(tuple(item) for item in assignments)
+    summaries: list[dict[str, object]] = []
+    pending_index = 0
+    for shard_index, start in enumerate(range(0, len(payloads), replays_per_shard)):
+        chunk = tuple(payloads[start : start + replays_per_shard])
+        shard_id = f"part-{partition_index:02d}-shard-{shard_index:06d}"
+        summary_path = cache_root / f"{shard_id}.cril.json"
+        existing = _load_resumable_summary(summary_path, expected_replays=len(chunk)) if resume else None
+        if existing is not None:
+            summary = dict(existing)
+            summary["summary_file"] = summary_path.name
+            summaries.append(summary)
+            continue
+        assignments[pending_index % len(ports)].append((shard_index, chunk))
+        pending_index += 1
+    return tuple(tuple(item) for item in assignments), tuple(summaries)
 
 
 def _source_stream(dataset_roots: Sequence[Path]) -> Iterable[tuple[int, Path, Mapping[str, Any], ReplayPreflightV4]]:
@@ -544,38 +560,63 @@ def main() -> None:
     }
     index_contract = dict(shard_contract)
     index_contract["selected_replays"] = labels
-    assignments = _partition_payloads(payloads, ports=ports, replays_per_shard=args.replays_per_shard)
+    assignments, resumed_summaries = _plan_cache_work(
+        payloads,
+        ports=ports,
+        replays_per_shard=args.replays_per_shard,
+        cache_root=cache_root,
+        partition_index=args.partition_index,
+        resume=args.resume,
+    )
     active = tuple(
         (index, port, batches) for index, (port, batches) in enumerate(zip(ports, assignments, strict=True)) if batches
     )
     started = time.perf_counter()
-    summaries: list[dict[str, object]] = []
+    summaries: list[dict[str, object]] = list(resumed_summaries)
+    print(
+        json.dumps(
+            {
+                "event": "cache-plan",
+                "partition": args.partition_index,
+                "resumed_shards": len(resumed_summaries),
+                "pending_shards": sum(len(batches) for batches in assignments),
+                "active_workers": len(active),
+                "workers": [
+                    {"worker": index, "port": port, "pending_shards": len(batches)}
+                    for index, port, batches in active
+                ],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     context = mp.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=len(active), mp_context=context) as executor:
-        futures = {
-            executor.submit(
-                _worker,
-                worker_index=index,
-                partition_index=args.partition_index,
-                host=args.host,
-                port=port,
-                batches=batches,
-                cache_root=cache_root,
-                contract=shard_contract,
-                gamma=args.gamma,
-                max_frames=None if args.max_frames == 0 else args.max_frames,
-                compression_level=args.compression_level,
-                verify_roundtrip=args.verify_roundtrip,
-                timeout=args.timeout,
-                resident_slots=args.resident_slots,
-                capture_mode=args.capture_mode,
-                infrastructure_retries=args.infrastructure_retries,
-                resume=args.resume,
-            ): port
-            for index, port, batches in active
-        }
-        for future in as_completed(futures):
-            summaries.extend(future.result())
+    if active:
+        with ProcessPoolExecutor(max_workers=len(active), mp_context=context) as executor:
+            futures = {
+                executor.submit(
+                    _worker,
+                    worker_index=index,
+                    partition_index=args.partition_index,
+                    host=args.host,
+                    port=port,
+                    batches=batches,
+                    cache_root=cache_root,
+                    contract=shard_contract,
+                    gamma=args.gamma,
+                    max_frames=None if args.max_frames == 0 else args.max_frames,
+                    compression_level=args.compression_level,
+                    verify_roundtrip=args.verify_roundtrip,
+                    timeout=args.timeout,
+                    resident_slots=args.resident_slots,
+                    capture_mode=args.capture_mode,
+                    infrastructure_retries=args.infrastructure_retries,
+                    resume=args.resume,
+                ): port
+                for index, port, batches in active
+            }
+            for future in as_completed(futures):
+                summaries.extend(future.result())
     summaries.sort(key=lambda item: str(item["shard_id"]))
     index = write_il_cache_index(index_path, summaries, contract=index_contract)
     elapsed = time.perf_counter() - started

@@ -4,6 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +73,95 @@ def test_cache_partition_counts_rejected_source_rows_before_partitioning(tmp_pat
     assert [row["replay_tag"] for row in labels] == ["empty", "empty-second"]
     assert [row["preflight_rejection_reason"] for row in labels] == [
         "no_expert_actions", "no_expert_actions",
+    ]
+
+
+def _write_resume_summary(root: Path, shard_index: int, replay_count: int) -> None:
+    shard_id = f"part-00-shard-{shard_index:06d}"
+    data_path = root / f"{shard_id}.cril.zst"
+    data_path.write_bytes(b"already-built")
+    data_path.with_suffix(".json").write_text(json.dumps({
+        "shard_id": shard_id,
+        "data_file": data_path.name,
+        "replay_results": replay_count,
+        "sequences": 2,
+        "owner_frames": 2,
+        "match_decision_frames": 1,
+        "compressed_bytes": 13,
+        "container_bytes": 20,
+    }))
+
+
+def test_cache_resume_spreads_one_failed_workers_shards_across_all_ports(tmp_path: Path) -> None:
+    payloads = tuple((i, {"replay_tag": str(i)}) for i in range(169))
+    missing = set(range(0, 43, 6))
+    for shard_index in range(43):
+        if shard_index not in missing:
+            _write_resume_summary(tmp_path, shard_index, min(4, 169 - shard_index * 4))
+
+    assignments, summaries = cache_builder._plan_cache_work(
+        payloads, ports=tuple(range(26789, 26795)), replays_per_shard=4,
+        cache_root=tmp_path, partition_index=0, resume=True,
+    )
+
+    assert [len(batches) for batches in assignments] == [2, 2, 1, 1, 1, 1]
+    pending = [batch for batches in assignments for batch in batches]
+    assert {index for index, _ in pending} == missing
+    assert len(pending) + len(summaries) == 43
+    for shard_index, chunk in pending:
+        assert chunk == payloads[shard_index * 4 : (shard_index + 1) * 4]
+    assert {int(str(row["shard_id"]).rsplit("-", 1)[1]) for row in summaries} == set(range(43)) - missing
+    assert all((tmp_path / str(row["summary_file"])).is_file() for row in summaries)
+
+
+def test_cache_fresh_plan_keeps_shard_ids_and_honors_no_resume(tmp_path: Path) -> None:
+    payloads = tuple((i, {}) for i in range(9))
+    _write_resume_summary(tmp_path, 0, 4)
+    assignments, summaries = cache_builder._plan_cache_work(
+        payloads, ports=(26789, 26790), replays_per_shard=4,
+        cache_root=tmp_path, partition_index=0, resume=False,
+    )
+    assert summaries == ()
+    assert assignments == (
+        ((0, payloads[:4]), (2, payloads[8:])),
+        ((1, payloads[4:8]),),
+    )
+
+
+def test_cache_resume_rejects_summary_without_data(tmp_path: Path) -> None:
+    _write_resume_summary(tmp_path, 0, 1)
+    (tmp_path / "part-00-shard-000000.cril.zst").unlink()
+    with pytest.raises(ValueError, match="incomplete existing cache shard"):
+        cache_builder._plan_cache_work(
+            ((0, {}),), ports=(26789,), replays_per_shard=4,
+            cache_root=tmp_path, partition_index=0, resume=True,
+        )
+
+
+def test_cache_resume_builds_index_without_engines_when_all_shards_exist(tmp_path: Path, monkeypatch) -> None:
+    payloads = tuple((i, {}) for i in range(5))
+    _write_resume_summary(tmp_path, 0, 4)
+    _write_resume_summary(tmp_path, 1, 1)
+    monkeypatch.setattr(sys, "argv", [
+        "cache_builder", str(tmp_path / "dataset"), str(tmp_path),
+        "--ports", "26789,26790,26791,26792,26793,26794", "--source-count", "0",
+    ])
+    monkeypatch.setattr(cache_builder, "_select_partition", lambda *_a, **_kw: (payloads, ()))
+    monkeypatch.setattr(cache_builder, "_dataset_snapshot", lambda _path: {})
+    monkeypatch.setattr(cache_builder, "_source_hashes", lambda: {})
+
+    def forbid_engine_start(*_args, **_kwargs):
+        raise AssertionError("completed caches must not start workers or contact engines")
+
+    monkeypatch.setattr(cache_builder, "ProcessPoolExecutor", forbid_engine_start)
+    monkeypatch.setattr(cache_builder, "NativeClashEnv", forbid_engine_start)
+    cache_builder.main()
+
+    index = load_il_cache_index(tmp_path / "index.json")
+    assert index["shard_count"] == 2
+    assert index["replay_results"] == 5
+    assert [row["shard_id"] for row in index["shards"]] == [
+        "part-00-shard-000000", "part-00-shard-000001",
     ]
 
 

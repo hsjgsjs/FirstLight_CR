@@ -31,6 +31,7 @@ from .cr_native_env import NativeClashEnv, RunnerError, _decode_observed_hand_ca
 from .live_diagnose import CONTROL_HOST, CONTROL_PORT, _adb
 from .live_match import LiveCaptureNative
 from .paths import WORKSPACE_ROOT
+from .play_timing import DEFAULT_PLAY_GAP_TICKS, PlayGapClock, parse_play_gap_ticks
 
 LIVE_ROOT = WORKSPACE_ROOT / "runs" / "live"
 LAYOUT_PATH = LIVE_ROOT / "layout.json"
@@ -174,6 +175,7 @@ class LiveTapNative(LiveCaptureNative):
         taps: AdbTaps | None,
         log: Callable[[dict[str, Any]], None],
         timeout: float = 10.0,
+        min_play_gap_ticks: tuple[int, int] = DEFAULT_PLAY_GAP_TICKS,
     ) -> None:
         super().__init__(host, port, timeout=timeout)
         self.layout = layout
@@ -183,6 +185,9 @@ class LiveTapNative(LiveCaptureNative):
         self.generation: int | None = None
         self.ordinary: Mapping[str, Any] | None = None
         self.capture_micros: int | None = None  # game-thread time of the probe's last capture
+        self.play_gap = PlayGapClock(min_play_gap_ticks, seed="live-taps")
+        self.capture_sink = None
+        self.last_capture_id = None
         self._slots: dict[int, tuple[int, int, int]] = {}  # handIndex -> (cardId, deckSlot, tick first seen)
         self._tapped: dict[int, tuple[int, int, int]] = {}  # handIndex -> (cardId, deckSlot, tap tick)
 
@@ -233,6 +238,23 @@ class LiveTapNative(LiveCaptureNative):
             return "dealt too recently to be touched"
         return None
 
+    def _wait_for_play_gap(self, owner: int, tick: int) -> int:
+        target = self.play_gap.next_tick(owner, tick)
+        deadline = time.monotonic() + max(5.0, (target - tick) * 0.05 + 2.0)
+        if tick < target:
+            self.log({"event": "play_gap_wait", "tick": tick, "until_tick": target, "owner": owner})
+        while tick < target:
+            status = self.observe()
+            if status["ended"]:
+                raise RunnerError("battle ended while waiting for the next tap")
+            tick = int(status["tick"])
+            if tick >= target:
+                break
+            if time.monotonic() >= deadline:
+                raise RunnerError("live battle clock stopped while waiting for the next tap")
+            time.sleep(0.01)
+        return tick
+
     def _play(self, action: Any) -> dict[str, Any]:
         assert self.seat is not None and action.owner == self.seat
         tick = self._tick()
@@ -258,16 +280,20 @@ class LiveTapNative(LiveCaptureNative):
             self.log({"event": "tap_skipped", "tick": tick, "slot": action.hand_index, "card": receipt["cardId"],
                       "reason": reason})
             return {**receipt, "terminalCanceled": True, "executeTick": tick}
+        tick = self._wait_for_play_gap(action.owner, tick)
+        receipt["queuedAtTick"] = tick
         card_point = tuple(round(v) for v in self.layout.hand[action.hand_index])
         tile_point = self.layout.world_point(action.x, action.y, self.seat)
         started = time.perf_counter()
         if self.taps is not None:
             self.taps.play(card_point, tile_point)
         after = self._tick()
+        self.play_gap.commit(action.owner, after)
         self._tapped[action.hand_index] = (receipt["cardId"], receipt["deckSlot"], after)
         self.log({"event": "tap", "tick": tick, "after_tick": after, "slot": action.hand_index,
                   "card": receipt["cardId"], "world": [action.x, action.y], "screen": [card_point, tile_point],
-                  "input_ms": round((time.perf_counter() - started) * 1000), "dry_run": self.taps is None})
+                  "input_ms": round((time.perf_counter() - started) * 1000), "dry_run": self.taps is None,
+                  "execute_tick_estimate": after + LAND_TICKS, "execution_attested": False})
         return {**receipt, "executeTick": after + LAND_TICKS}
 
     def queue_hand_action_next_tick(self, action: Any) -> dict[str, Any]:
@@ -278,11 +304,15 @@ class LiveTapNative(LiveCaptureNative):
 
     def queue_ability_action_at(self, action: Any, *, execute_in_ticks: int = 1) -> dict[str, Any]:
         tick = self._tick()
+        tick = self._wait_for_play_gap(action.owner, tick)
         point = tuple(round(v) for v in self.layout.ability)
         if self.taps is not None and tick >= FIRST_TOUCH_TICK:
             self.taps.tap(*point)
         after = self._tick()
-        self.log({"event": "ability_tap", "tick": tick, "screen": point, "dry_run": self.taps is None})
+        self.play_gap.commit(action.owner, after)
+        self.log({"event": "ability_tap", "tick": tick, "after_tick": after, "screen": point,
+                  "dry_run": self.taps is None, "execute_tick_estimate": after + LAND_TICKS,
+                  "execution_attested": False})
         return {
             "tick": tick,
             "owner": action.owner,
@@ -406,42 +436,100 @@ def play_battle(
     from .contracts import ActionKind, ActionV1
     from .live_match import LiveEpisode, is_contract_miss, learn_contract_miss, observe_forms
     from .training.v4.expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
+    from .live_recording import LiveBattleRecording
+    from .training.v4.deployment_timing import DeploymentTimingRecorder
 
     recorded = log_dir is not None
     log_dir = log_dir or LIVE_ROOT
     log_dir.mkdir(parents=True, exist_ok=True)
-    path = log_dir / f"{'replay-' if recorded else ''}{datetime.now():%Y%m%d-%H%M%S}.jsonl"
+    path = log_dir / f"{'replay-' if recorded else ''}{datetime.now():%Y%m%d-%H%M%S-%f}.jsonl"
     stream = path.open("w", encoding="utf-8", buffering=1)
+    recording = None
+    if getattr(args, "record", False):
+        from .local_config import setting
+        import hashlib
+        sources = (Path(__file__), Path(__file__).with_name("live_match.py"),
+                   Path(__file__).with_name("live_recording.py"))
+        recording = LiveBattleRecording(getattr(args, "record_dir", LIVE_ROOT / "recordings"), identity={
+            "checkpoint": args.checkpoint, "checkpoint_identity": getattr(args, "checkpoint_identity", None),
+            "layout": asdict(layout), "resolution": [layout.width, layout.height],
+            "dry_run": taps is None, "sample": not getattr(args, "deterministic", False),
+            "gate_temperature": getattr(model, "ppo_gate_temperature", None),
+            "min_play_gap_ticks": getattr(args, "min_play_gap_ticks", DEFAULT_PLAY_GAP_TICKS),
+            "adb_serial": setting("CR_ADB_SERIAL"),
+            "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
+        })
 
     def log(record: dict[str, Any]) -> None:
         stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if recording is not None:
+            recording.event(record)
+
+    def screenshot(name):
+        if recording is not None and getattr(args, "record_screenshots", False):
+            try:
+                png = subprocess.run([*_adb_prefix(), "exec-out", "screencap", "-p"],
+                                     capture_output=True, check=True, timeout=15).stdout
+                recording.screenshot(name, png)
+            except (OSError, subprocess.SubprocessError) as error:
+                log(dict(event="screenshot_failed", name=name, error=str(error)))
 
     factory = native_factory or (lambda **kw: LiveTapNative(CONTROL_HOST, CONTROL_PORT, **kw))
     native = factory(layout=layout, taps=taps, log=log)
-    first = native.observe_atomic()
-    seat = choose_seat(first, args.owner, args.account_id)
-    if not recorded:
-        remember_seat(first, seat)
+    if recording is not None:
+        native.capture_sink = recording.capture
+    native.play_gap = PlayGapClock(getattr(args, "min_play_gap_ticks", DEFAULT_PLAY_GAP_TICKS), seed="live-taps")
+    try:
+        first = native.observe_atomic()
+        seat = choose_seat(first, args.owner, args.account_id)
+        if recording is not None:
+            recording.update_identity(owner=seat, players=players_of(first), start_tick=first["tick"],
+                                      generation=first["generation"])
+            screenshot("start")
+        if not recorded:
+            remember_seat(first, seat)
+    except BaseException as error:
+        try:
+            if recording is not None:
+                recording.close({"result": "setup_failed", "error": str(error)})
+        finally:
+            stream.close()
+            native.close_transport()
+        raise
     native.seat = seat
     log({"event": "start", "tick": first["tick"], "seat": seat, "players": players_of(first),
-         "checkpoint": args.checkpoint, "layout": asdict(layout)})
+         "checkpoint": args.checkpoint, "layout": asdict(layout), "min_play_gap_ticks": native.play_gap.bounds})
     print(f"对局开始（tick {first['tick']}），模型操作 owner {seat}；日志 {path}")
     summary: dict[str, Any] = {"log": str(path), "decisions": 0, "taps": 0, "rebuilds": 0}
+    if recording is not None:
+        summary["recording"] = str(recording.path)
+        print(f"完整录制：{recording.path}")
+    timing = DeploymentTimingRecorder(log) if recording is not None else None
 
     def play(episode: LiveEpisode) -> None:
         env, observation = episode.env, episode.observation
         while True:
+            if recording is not None:
+                recording.submit("policy_frame", observation.to_dict(), tick=observation.tick,
+                                 capture_id=native.last_capture_id, recurrent_episode=summary["rebuilds"],
+                                 next_decision=summary["decisions"] + 1)
             commands = {o: (ActionV1.wait(o, ticks=POLICY_DECISION_TICKS),) for o in (0, 1)}
             if observation.tick >= FIRST_POLICY_DECISION_TICK:
                 decision = episode.session.decide(observation)
-                chosen = tuple(_rendered_action(a) for a in decision.decoded.actions)
+                chosen = tuple(replace(_rendered_action(a), action_id=(a.action_id or
+                               f"live-{summary['rebuilds']}-{summary['decisions'] + 1}-{i}"))
+                               for i, a in enumerate(decision.decoded.actions))
                 commands[seat] = chosen or commands[seat]
                 summary["decisions"] += 1
                 acting = [a for a in chosen if a.kind != ActionKind.WAIT]
                 summary["taps"] += len(acting)
                 log({"event": "decision", "tick": observation.tick, "inference_ms": round(decision.inference_ms, 1),
                      "capture_us": native.capture_micros,
+                     "decision_id": summary["decisions"], "capture_id": native.last_capture_id,
                      "actions": [a.to_dict() for a in chosen]})
+                if timing is not None:
+                    timing.submit(summary["decisions"], observation.tick,
+                                  [dict(kind=a.kind.value, cardId=a.card_id) for a in chosen])
                 for action in acting:
                     print(f"  tick {observation.tick}: {action.kind.value} card {action.card_id} -> {action.target_grid}")
             else:
@@ -456,8 +544,20 @@ def play_battle(
                 waits = {o: (ActionV1.wait(o, ticks=POLICY_DECISION_TICKS),) for o in (0, 1)}
                 observations, _rewards, terms, truncs, _info = env.step(waits, record_trace=False)
             observation = observations[seat]
+            if recording is not None:
+                log({"event": "step_result", "tick": observation.tick, "capture_id": native.last_capture_id,
+                     "decision_id": summary["decisions"], "recurrent_episode": summary["rebuilds"],
+                     "rewards": _rewards, "terminated": terms, "truncated": truncs,
+                     "terminal": observation.terminal.to_dict(),
+                     "events": [e.to_dict() for e in observation.events]})
+                timing.observe(env.deployment_timing_events(seat), observation.tick)
             if all(terms.values()) or all(truncs.values()):
                 summary["result"] = "terminated"
+                if recording is not None:
+                    summary["terminal"] = observation.terminal.to_dict()
+                    recording.submit("policy_frame", observation.to_dict(), tick=observation.tick,
+                                     capture_id=native.last_capture_id, recurrent_episode=summary["rebuilds"],
+                                     terminal=True)
                 return
 
     # The deck contract is read from the battle; a form it missed (a hero or an evolution the
@@ -491,11 +591,25 @@ def play_battle(
                 episode = None
     except (RunnerError, BattleEnvError) as error:
         summary["result"] = f"battle over or lost: {error}"
+    except BaseException as error:
+        summary["result"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "error"
+        summary["error"] = str(error)
+        raise
     finally:
-        if episode is not None:
-            episode.close()
-        log({"event": "end", **summary})
-        stream.close()
+        try:
+            if episode is not None:
+                episode.close()
+            if timing is not None:
+                timing.finish()
+            log({"event": "end", **summary})
+            screenshot("end")
+        finally:
+            try:
+                if recording is not None:
+                    recording.close(summary)
+            finally:
+                stream.close()
+                native.close_transport()
     print(f"对局结束：{summary}")
     return summary
 
@@ -513,6 +627,15 @@ class RecordedTapNative(LiveTapNative):
         self.full_rings = full_rings
         self.index = 0
         self.moved = False
+
+    def _wait_for_play_gap(self, owner: int, tick: int) -> int:
+        # Recorded time advances by captures, never by wall-clock sleep.
+        target = self.play_gap.next_tick(owner, tick)
+        while tick < target:
+            self.index += 1
+            self.moved = False
+            tick = self._tick()
+        return tick
 
     def _request(self, command: str, **_: Any) -> dict[str, Any]:
         from .live_match import trim_event_rings
@@ -563,7 +686,12 @@ def run(args: argparse.Namespace) -> None:
     if not layout.calibrated:
         print(f"注意：{args.layout} 还没校准（屏幕 {width}x{height}），点击位置可能不准。先用 shot 检查。")
     taps = None if args.dry_run else AdbTaps()
-    model = load_policy_v4(args.checkpoint, device=args.device).model
+    loaded = load_policy_v4(args.checkpoint, device=args.device)
+    model = loaded.model
+    args.checkpoint_identity = dict(path=str(loaded.checkpoint_path), sha256=loaded.checkpoint_sha256,
+                                    checkpoint_id=loaded.checkpoint_id, update=loaded.update_step)
+    # A training checkpoint keeps the act/wait temperature of the update that saved it (0.5 early in a run);
+    # sampling with it plays noticeably more randomly than the released models' 0.2.
     if getattr(args, "gate_temperature", None) is not None:
         model.set_ppo_gate_temperature(args.gate_temperature)
         print(f"门控温度已设定为: {model.ppo_gate_temperature}")
@@ -611,6 +739,7 @@ def run(args: argparse.Namespace) -> None:
             pass
         if taps is not None:
             taps.close()
+        control.close_transport()
 
 
 def shot(args: argparse.Namespace) -> Path:
@@ -714,6 +843,12 @@ def main(argv: Iterable[str] | None = None) -> int:
             command.add_argument("--device", default=None, help="cuda or cpu (default: cuda when available)")
             command.add_argument("--games", type=int, default=0, help="battles to play (0: until stopped)")
             command.add_argument("--dry-run", action="store_true", help="decide and log, but do not tap")
+            command.add_argument("--record", action="store_true", help="save all captures, policy observations and actions")
+            command.add_argument("--record-dir", type=Path, default=LIVE_ROOT / "recordings")
+            command.add_argument("--record-screenshots", action="store_true",
+                                 help="save start/end debug screenshots with --record (adds ADB latency)")
+            command.add_argument("--min-play-gap-ticks", type=parse_play_gap_ticks, default=DEFAULT_PLAY_GAP_TICKS,
+                                 help="minimum gap between plays/abilities, in game ticks (default: 8-12 = 0.4-0.6 s)")
             command.add_argument("--deterministic", action="store_true",
                                  help="always take the most likely action (rarely plays; default samples)")
             command.add_argument("--gate-temperature", type=float, default=None,
@@ -724,6 +859,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "shot":
         shot(args)
         return 0
+    if args.record_screenshots and not args.record:
+        parser.error("--record-screenshots requires --record")
     if args.device is None:
         import torch
 

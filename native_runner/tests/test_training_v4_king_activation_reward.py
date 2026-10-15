@@ -5,8 +5,8 @@ import pytest
 
 from native_runner.contracts import TowerStateV1
 from native_runner.training.v4.king_activation_reward import (
-    sleeping_king_damage_v4, fireball_activation_evidence_v4,
-    apply_fireball_king_activation_penalty_v4,
+    sleeping_king_damage_v4, spell_activation_evidence_v4,
+    apply_spell_king_activation_penalty_v4,
 )
 
 
@@ -32,15 +32,16 @@ def damage(king, owner, *, card=28000000, tick=405, pre=4000, post=3700):
 
 
 @pytest.mark.parametrize("owner", [0,1])
-def test_fireball_splash_on_sleeping_enemy_king_is_penalized(owner):
+@pytest.mark.parametrize("card", [28000000, 28000003, 28000009])
+def test_spell_splash_on_sleeping_enemy_king_is_penalized(owner, card):
     b=board(1-owner); a=(replace(b[0],hitpoints=3700),*b[1:])
     king=sleeping_king_damage_v4(b,a,owner)
     assert king==b[0]
     # No cast-position requirement: damaging a king while aiming at a nearby
     # Mother Witch has exactly the same causal Fireball hit event.
-    evidence=fireball_activation_evidence_v4(king,[damage(king,owner)],owner=owner,
-        before_tick=400,after_tick=405,canonical_tick=lambda t:t)
-    assert evidence['source_card_id']==28000000 and evidence['owner']==owner
+    evidence=spell_activation_evidence_v4(king,[damage(king,owner,card=card)],owner=owner,
+        before_tick=400,after_tick=405,canonical_tick=lambda t:t,spell_card_ids=frozenset((28000000,28000003,28000009)))
+    assert evidence['source_card_id']==card and evidence['owner']==owner
 
 
 @pytest.mark.parametrize("mode", ["already_damaged","already_activated","side_lost_before","side_lost_now","lethal","no_damage"])
@@ -56,7 +57,7 @@ def test_does_not_penalize_normal_attack_or_natural_activation(mode):
 
 
 @pytest.mark.parametrize("mode", ["other_card","wrong_owner","old_event","late_event","second_hit","wrong_tower"])
-def test_only_actual_first_fireball_hp_damage_is_attributed(mode):
+def test_only_actual_first_spell_hp_damage_is_attributed(mode):
     k=board()[0]; e=damage(k,0)
     if mode=='other_card':e=damage(k,0,card=26000021)
     if mode=='wrong_owner':e=damage(k,1)
@@ -64,24 +65,46 @@ def test_only_actual_first_fireball_hp_damage_is_attributed(mode):
     if mode=='late_event':e.tick=406
     if mode=='second_hit':e.pre_hp=3900
     if mode=='wrong_tower':e.target.position=(3500,25500)
-    assert fireball_activation_evidence_v4(k,[e],owner=0,before_tick=400,after_tick=405,canonical_tick=lambda t:t) is None
+    assert spell_activation_evidence_v4(k,[e],owner=0,before_tick=400,after_tick=405,canonical_tick=lambda t:t,spell_card_ids=frozenset((28000000,28000003,28000009))) is None
 
 
-def test_actual_reward_deduplicates_across_observations_and_segments():
-    b=board();a=(replace(b[0],hitpoints=3700),*b[1:]);ev=damage(b[0],0)
-    env=NS(raw_observation={},_rich_snapshot_for=lambda raw:NS(combat_events=NS(events=[ev])),_canonical_tick=lambda t:t)
+def test_spell_attribution_without_deployment_context():
+    king = board()[0]
+    event = damage(king, 0, card=28000003)
+    event.deployment_context = None
+    evidence = spell_activation_evidence_v4(
+        king, [event], owner=0, before_tick=400, after_tick=405,
+        canonical_tick=lambda t: t, spell_card_ids=frozenset((28000003,)),
+    )
+    assert evidence["source_card_id"] == 28000003
+
+
+def test_troop_first_hit_is_not_attributed_to_later_spell():
+    king = board()[0]
+    troop = damage(king, 0, card=26000021, tick=402)
+    spell = damage(king, 0, card=28000003, tick=405, pre=3700, post=3400)
+    assert spell_activation_evidence_v4(
+        king, [spell, troop], owner=0, before_tick=400, after_tick=405,
+        canonical_tick=lambda t: t, spell_card_ids=frozenset((28000003,)),
+    ) is None
+
+
+@pytest.mark.parametrize("card", [28000000, 28000003, 28000009])
+def test_actual_reward_deduplicates_across_observations_and_segments(card):
+    b=board();a=(replace(b[0],hitpoints=3700),*b[1:]);ev=damage(b[0],0,card=card)
+    env=NS(card_specs={card:NS(kind=NS(value="spell"))},raw_observation={},_rich_snapshot_for=lambda raw:NS(combat_events=NS(events=[ev])),_canonical_tick=lambda t:t,spell_card_ids=frozenset((28000000,28000003,28000009)))
     runtime=NS(assignment=NS(matchup=NS(current_owners=(0,))),environment=env,
         seen_king_activation_owners=set(),sleeping_enemy_king_damage_count=(0,0),
-        king_activation_not_attributed_to_fireball=(0,0),fireball_king_activations=(0,0),
-        fireball_king_activation_penalty_total=(0.,0.),fireball_king_activation_details=[])
+        king_activation_not_attributed_to_spell=(0,0),spell_king_activations=(0,0),
+        spell_king_activation_penalty_total=(0.,0.),spell_king_activation_details=[])
     before={0:NS(tick=400,towers=b)};after={0:NS(tick=405,towers=a)}
     reward=[.02,0.]
-    apply_fireball_king_activation_penalty_v4(runtime,before,after,reward,.5)
+    apply_spell_king_activation_penalty_v4(runtime,before,after,reward,.5)
     assert reward==pytest.approx([-.48,0.])
-    apply_fireball_king_activation_penalty_v4(runtime,before,after,reward,.5)
+    apply_spell_king_activation_penalty_v4(runtime,before,after,reward,.5)
     assert reward==pytest.approx([-.48,0.])
-    assert runtime.fireball_king_activations==(1,0)
-    assert runtime.fireball_king_activation_penalty_total==(.5,0.)
+    assert runtime.spell_king_activations==(1,0)
+    assert runtime.spell_king_activation_penalty_total==(.5,0.)
 
 
 def test_remote_worker_forwards_new_penalty(monkeypatch):
@@ -94,8 +117,8 @@ def test_remote_worker_forwards_new_penalty(monkeypatch):
         gamma_per_decision=.9997,shaping_beta=.15,mutual_elixir_overflow_penalty=.03,
         mutual_elixir_overflow_grace=2.,unilateral_elixir_overflow_penalty=.15,
         elixir_overflow_step_penalty_cap=2.4,policy_state_id='test',validate_tensors=False,
-        max_decision_steps=1204,fireball_king_activation_penalty=.5),-1)
-    assert got=={'fireball_king_activation_penalty':.5}
+        max_decision_steps=1204,spell_king_activation_penalty=.5),-1)
+    assert got=={'spell_king_activation_penalty':.5}
 
 
 def test_personal_four_times_and_unilateral_eight_times_before_cap():

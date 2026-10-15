@@ -20,6 +20,7 @@ from torch import Tensor
 
 from ...battle_env import TICKS_PER_SECOND, _elixir_generated_raw
 from ...contracts import ActionKind, ActionV1
+from ...play_timing import parse_play_gap_ticks
 from ...match_factory import NATIVE_GAMEPLAY_END_TICK
 from .cluster_self_play import (
     ClusterCollectionV4,
@@ -36,8 +37,13 @@ from .decoding import ShadowCandidateLegality, decode_action_sequence_v4
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .policy_session import _fixed_cuda_graph_batch_v4
 from .matchmaking import POLICY_IL
-from .king_activation_reward import apply_fireball_king_activation_penalty_v4
+from .king_activation_reward import apply_spell_king_activation_penalty_v4
 from .model import UniversalCardPolicyV4
+from .opening_schedule import (
+    frozen_opponent_opening_plan_v4,
+    opening_force_seconds_v4,
+    parse_seconds_range,
+)
 from .ppo import StoredRolloutV4
 from .ppo_runtime import ppo_environment_config_v4, validate_reward_parameters_v4
 from .remote_worker_transport import RemoteWorkerConnection, ReceivedRowPackedTensorRecord
@@ -235,25 +241,6 @@ def _frozen_opponent_opening_force_owner_v4(
     if active_actions[opponent_owner] > 0 or tick < after_seconds * TICKS_PER_SECOND:
         return None
     return opponent_owner
-
-
-def opening_force_seconds_v4(bounds: tuple[float, float] | None, key: object) -> float | None:
-    """The battle time, drawn uniformly from ``bounds`` and fixed per game by ``key``, to force an opening."""
-
-    if bounds is None:
-        return None
-    return random.Random(f"opening-force-{key}").uniform(*bounds)
-
-
-def parse_seconds_range(value: str) -> tuple[float, float]:
-    low, _, high = value.strip().partition("-")
-    try:
-        bounds = (float(low), float(high or low))
-    except ValueError:
-        raise ValueError("expected N or MIN-MAX seconds, e.g. 8-20") from None
-    if not 0.0 < bounds[0] <= bounds[1] <= 180.0:
-        raise ValueError("seconds must satisfy 0 < MIN <= MAX <= 180")
-    return bounds
 
 
 def _elixir_overflow_penalty_transition_v4(
@@ -666,6 +653,7 @@ class AsyncResidentEngineSpecV4:
     # range is forced to play its first card then.
     force_frozen_opponent_opening_after_seconds: tuple[float, float] | None = None
     force_il_opponent_opening_after_seconds: int | None = None
+    frozen_opponent_opening_natural_percent: int = 0
     execution_delay_ticks: tuple[int, int] | None = None
     # Minimum ticks, drawn from (min, max), between an owner's consecutive plays and abilities landing.
     min_play_gap_ticks: tuple[int, int] | None = None
@@ -765,17 +753,6 @@ def space_plays_v4(
             last_landing_tick = landing
         spaced.append(action)
     return tuple(spaced), last_landing_tick
-
-
-def parse_play_gap_ticks(value: str) -> tuple[int, int]:
-    low, _, high = value.strip().partition("-")
-    try:
-        bounds = (int(low), int(high or low))
-    except ValueError:
-        raise ValueError("play gap must be N or MIN-MAX ticks, e.g. 4-8") from None
-    if not 1 <= bounds[0] <= bounds[1] <= 200:
-        raise ValueError("play gap must be 1 <= MIN <= MAX <= 200 ticks")
-    return bounds
 
 
 @dataclass(frozen=True, slots=True)
@@ -985,7 +962,7 @@ def _engine_worker(
     first_hog_missed_deadline_penalty: float = 0.0,
     first_hog_deferral_penalty: float = 0.0,
     first_hog_deferral_penalty_episode_cap: float = 0.0,
-    fireball_king_activation_penalty: float = 0.0,
+    spell_king_activation_penalty: float = 0.0,
 ) -> None:
     """Own one native endpoint and all stateful tensorizers on one CPU."""
 
@@ -1024,6 +1001,9 @@ def _engine_worker(
     if segment_decision_steps is None or segment_decision_steps <= 0:
         raise ValueError("async segment decision steps must be positive")
     force_bounds = spec.force_frozen_opponent_opening_after_seconds
+    frozen_opponent_opening_plan_v4(
+        force_bounds, 0, natural_percent=spec.frozen_opponent_opening_natural_percent
+    )
     if force_bounds is not None and not 0.0 < force_bounds[0] <= force_bounds[1]:
         raise ValueError("frozen-opponent opening timeout must be positive")
     if spec.force_il_opponent_opening_after_seconds is not None and spec.force_il_opponent_opening_after_seconds <= 0:
@@ -1103,6 +1083,16 @@ def _engine_worker(
                 )
             ):
                 continue
+            if not runtime.opening_force_planned and len(runtime.assignment.matchup.current_owners) == 1:
+                runtime.opening_force_exempt, runtime.opening_force_deadline_seconds = frozen_opponent_opening_plan_v4(
+                    force_bounds, runtime.assignment.matchup.sequence,
+                    natural_percent=spec.frozen_opponent_opening_natural_percent,
+                    il_after_seconds=(
+                        spec.force_il_opponent_opening_after_seconds
+                        if runtime.assignment.matchup.policy_matchup == POLICY_IL else None
+                    ),
+                )
+                runtime.opening_force_planned = True
             force_owner = (
                 None
                 if include_segment_boundary
@@ -1110,11 +1100,7 @@ def _engine_worker(
                     current_owners=runtime.assignment.matchup.current_owners,
                     active_actions=runtime.active_actions,
                     tick=int(runtime.observations[0].tick),
-                    after_seconds=opening_force_seconds_v4(
-                        force_bounds, runtime.assignment.matchup.sequence
-                    ),
-                    policy_matchup=runtime.assignment.matchup.policy_matchup,
-                    il_after_seconds=(spec.force_il_opponent_opening_after_seconds),
+                    after_seconds=runtime.opening_force_deadline_seconds,
                 )
             )
             for owner in (0, 1):
@@ -1568,8 +1554,8 @@ def _engine_worker(
                 counts = list(runtime.rejected_actions)
                 counts[owner] += rejected
                 runtime.rejected_actions = (counts[0], counts[1])
-            apply_fireball_king_activation_penalty_v4(
-                runtime, before_observations, next_observations, adjusted_reward, fireball_king_activation_penalty
+            apply_spell_king_activation_penalty_v4(
+                runtime, before_observations, next_observations, adjusted_reward, spell_king_activation_penalty
             )
             hog_counts = list(runtime.hog_deployments)
             hog_totals = list(runtime.hog_deploy_reward_total)
@@ -1823,7 +1809,7 @@ def collect_async_cluster_wave_v4(
     first_hog_missed_deadline_penalty: float = 0.0,
     first_hog_deferral_penalty: float = 0.0,
     first_hog_deferral_penalty_episode_cap: float = 0.0,
-    fireball_king_activation_penalty: float = 0.0,
+    spell_king_activation_penalty: float = 0.0,
 ) -> ClusterCollectionV4:
     """Collect recurrent PPO segments from remote resident engines."""
 
@@ -2325,7 +2311,7 @@ def collect_async_cluster_wave_v4(
                     "assignments": by_engine[spec.engine_index],
                     "gamma_per_decision": gamma_per_decision,
                     "shaping_beta": shaping_beta,
-                    "fireball_king_activation_penalty": fireball_king_activation_penalty,
+                    "spell_king_activation_penalty": spell_king_activation_penalty,
                     "hog_deploy_reward": hog_deploy_reward,
                     "hog_deploy_reward_episode_cap": hog_deploy_reward_episode_cap,
                     "hog_deploy_opening_reward": hog_deploy_opening_reward,

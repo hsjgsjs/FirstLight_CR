@@ -14,6 +14,7 @@ import torch
 
 from ...battle_env import BattleEnvV1
 from ...contracts import ActionKind, ActionV1
+from ...play_timing import DEFAULT_PLAY_GAP_TICKS
 from ...cr_native_env import DEFAULT_HOST, DEFAULT_PORT, NativeClashEnv
 from ...match_factory import MatchConfig
 from ...rich_telemetry_adapter import RuntimeEffectCatalog
@@ -185,12 +186,16 @@ def _forward_index_group(entries, indexes, device):
     ]
 
 
+@torch.inference_mode()
 def forward_resident_contexts(entries):
     """One forward per model for every ready decision.
 
     ``entries`` are ``(session, host batch, first decision)``. Only one model
     occupies the GPU at a time. A chunk that does not fit falls back to CPU,
     and that model stays on CPU so sampling uses the same device.
+
+    Disable autograd for the entire batch, including recurrent-state assembly.
+    eval() alone would retain a growing graph through each session's LSTM state.
     """
 
     results = [None] * len(entries)
@@ -831,7 +836,8 @@ def main(argv=None):
     parser.add_argument(
         "--min-play-gap-ticks",
         type=parse_play_gap_ticks,
-        help="land each side's consecutive plays and abilities at least MIN-MAX ticks apart (4-8 = 200-400 ms)",
+        default=DEFAULT_PLAY_GAP_TICKS,
+        help="land each side's consecutive plays and abilities at least MIN-MAX ticks apart (default: 8-12 = 400-600 ms)",
     )
     parser.add_argument(
         "--gate-temperature-a",

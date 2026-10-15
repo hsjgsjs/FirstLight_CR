@@ -11,13 +11,15 @@ import torch
 
 from ...battle_env import BattleEnvV1
 from ...contracts import ActionKind, ActionV1
-from ...cr_native_env import DEFAULT_HOST, DEFAULT_PORT, NATIVE_RENDER_SPEEDS, NativeClashEnv, RunnerError
+from ...cr_native_env import DEFAULT_HOST, DEFAULT_PORT, NATIVE_RENDER_SPEEDS, RunnerError
+from ...play_timing import DEFAULT_PLAY_GAP_TICKS, parse_play_gap_ticks
 from ...match_factory import MatchConfig
 from ...rich_telemetry_adapter import RuntimeEffectCatalog
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .offline_agent import _rendered_action
 from .policy_session import build_policy_session_v4, load_policy_v4
+from .render_timing import SpacedRenderNativeV4
 
 
 def run_ai_duel(
@@ -28,6 +30,7 @@ def run_ai_duel(
     port: int = DEFAULT_PORT,
     device: str = "cpu",
     speed: float = 1.0,
+    min_play_gap_ticks: tuple[int, int] = DEFAULT_PLAY_GAP_TICKS,
     artifact_dir: Path,
 ) -> dict:
     if speed not in NATIVE_RENDER_SPEEDS:
@@ -45,7 +48,9 @@ def run_ai_duel(
         (artifact_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
         return result
     bundle = production_semantic_bundle()
-    native = NativeClashEnv(host, port, timeout=30.0)
+    native = SpacedRenderNativeV4(
+        host, port, timeout=30.0, min_play_gap_ticks=min_play_gap_ticks, timing_seed=match.seed,
+    )
     native.public_card_play_events_from_combat_ring = True
     environment = BattleEnvV1(
         native=native,
@@ -81,6 +86,7 @@ def run_ai_duel(
             session.start_episode(observations[owner], initial_elixir=initial_elixir)
         identity = {
             "mode": "native-render-ai-duel",
+            "min_play_gap_ticks": min_play_gap_ticks,
             "checkpoints": [
                 {"path": str(policy.checkpoint_path), "id": policy.checkpoint_id, "sha256": policy.checkpoint_sha256}
                 for policy in loaded
@@ -157,6 +163,7 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--min-play-gap-ticks", type=parse_play_gap_ticks, default=DEFAULT_PLAY_GAP_TICKS)
     parser.add_argument("--artifact-dir", type=Path, required=True)
     args = parser.parse_args(argv)
     config = json.loads(args.match_config.read_text(encoding="utf-8"))
@@ -171,6 +178,7 @@ def main(argv=None) -> int:
         port=args.port,
         device=args.device,
         speed=args.speed,
+        min_play_gap_ticks=args.min_play_gap_ticks,
         artifact_dir=args.artifact_dir,
     )
     print(json.dumps(result), flush=True)
