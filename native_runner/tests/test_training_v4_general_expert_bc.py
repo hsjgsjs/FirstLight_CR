@@ -18,7 +18,7 @@ from native_runner.training.v4.ppo_expert_bc import (
 from native_runner.training.v4.producer import ReplayProductionResultV4
 
 
-def _dataset(tmp_path, *, failed=False):
+def _dataset(tmp_path, *, failed=False, multiple_shards=False):
     batch = _batch(batch_size=1)
     batch.candidates.native_visible_card_id[batch.candidates.mask] = 26000000  # no Hog labels
     results, selections = [], []
@@ -47,10 +47,15 @@ def _dataset(tmp_path, *, failed=False):
         ]))
     root = tmp_path / "cache"
     root.mkdir()
-    data = root / "shard.cril.zst"
-    summary = write_il_cache_shard(data, results, shard_id="shard", contract={})
-    summary["summary_file"] = data.with_suffix(".json").name
-    write_il_cache_index(root / "index.json", [summary], contract={})
+    batches = (results[:2], results[2:]) if multiple_shards else (results,)
+    summaries = []
+    for i, batch_results in enumerate(batches):
+        shard_id = f"shard-{i}"
+        data = root / f"{shard_id}.cril.zst"
+        summary = write_il_cache_shard(data, batch_results, shard_id=shard_id, contract={})
+        summary["summary_file"] = data.with_suffix(".json").name
+        summaries.append(summary)
+    write_il_cache_index(root / "index.json", summaries, contract={})
     selection = tmp_path / "selection.jsonl"
     selection.write_text("\n".join(json.dumps(r) for r in selections))
     return root, selection
@@ -113,6 +118,45 @@ def test_audit_excludes_failed_and_missing_sides_and_detects_duplicate_cache(tmp
     shutil.copytree(root, other)
     with pytest.raises(ValueError, match="duplicate cache"):
         audit_selection(selection, [root, other])
+
+
+def test_parallel_audit_outputs_match_serial_bytes(tmp_path):
+    root, selection = _dataset(tmp_path, failed=True, multiple_shards=True)
+    with selection.open("a") as handle:
+        handle.write("\n" + json.dumps(dict(replay_tag="missing", learn=[dict(owner=0, outcome="win", weight=1)])))
+    serial = tmp_path / "serial"
+    parallel = tmp_path / "parallel"
+    serial_summary = build_manifests(selection, [root], serial, workers=1)
+    parallel_summary = build_manifests(selection, [root], parallel, workers=2)
+    assert serial_summary == parallel_summary
+    for name in ("train.json", "validation.json", "excluded.json", "summary.json"):
+        assert (serial / name).read_bytes() == (parallel / name).read_bytes()
+
+
+def test_parallel_audit_rejects_duplicate_owners(tmp_path):
+    import shutil
+    root, selection = _dataset(tmp_path, multiple_shards=True)
+    other = tmp_path / "duplicate"
+    shutil.copytree(root, other)
+    with pytest.raises(ValueError, match="duplicate cache"):
+        audit_selection(selection, [root, other], workers=2)
+
+
+def test_parallel_audit_propagates_checksum_failure_without_writing_manifest(tmp_path):
+    root, selection = _dataset(tmp_path, multiple_shards=True)
+    summary_path = sorted(root.glob("*.cril.json"))[0]
+    summary = json.loads(summary_path.read_text())
+    summary["compressed_sha256"] = "changed"
+    summary_path.write_text(json.dumps(summary))
+    output = tmp_path / "bad-manifest"
+    with pytest.raises(ValueError, match="compressed SHA-256 mismatch"):
+        build_manifests(selection, [root], output, workers=2)
+    assert not output.exists()
+
+
+def test_audit_rejects_nonpositive_worker_count_before_loading_cache(tmp_path):
+    with pytest.raises(ValueError, match="workers must be positive"):
+        audit_selection(tmp_path / "missing.jsonl", [], workers=0)
 
 
 def test_whole_game_split_is_order_independent():

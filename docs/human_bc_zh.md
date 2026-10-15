@@ -30,12 +30,15 @@ bash native_runner/training/v4/launch_cache_partition.sh \
   --selection /path/to/selected-dataset/selection.jsonl \
   --cache-root /path/to/expert-cache \
   --output runs/human-experts-v1 \
-  --validation-percent 10
+  --validation-percent 10 \
+  --workers 4
 
 cat runs/human-experts-v1/summary.json
 ```
 
 支持重复 `--cache-root`，以及直接传入 `index.json`。审计会校验缓存哈希、重建结果和实际监督标签，只保留有可信动作与 gate 标签、自然时间和循环序列起点的选定视角。镜像或重复缓存的同一视角会报错，避免不明确地选中一份缓存。
+
+`--workers 4` 使用四个进程并发处理不同分片，每个进程的 PyTorch CPU 线程数为 1，避免线程争抢。默认 `--workers 1` 为串行。先试 4，内存和磁盘有余量时可试 8；同时展开的分片数最多为 worker 数，因此进程增多也会增加 CPU 内存占用。解压、哈希和张量审计都在 CPU 上，不使用 GPU。进度日志会显示已完成分片数、耗时与 `shards_per_second`；并发与串行生成的训练/验证划分和清单内容一致。
 
 输出 `train.json`、`validation.json`、`summary.json` 和 `excluded.json`。默认只接纳完整重建成功的录像；失败、无有效动作和缺失缓存的视角会被排除并报告。默认不使用失败录像的前半段。如确有需要，可显式加入 `--allow-trusted-prefix`，仅接纳特定终局不一致/提前终局失败的已有可信前缀掩码，不接纳动作拒绝或其他错误。
 

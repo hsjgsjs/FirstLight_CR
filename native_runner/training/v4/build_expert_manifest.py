@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import closing
 import hashlib
 import json
 import math
+import multiprocessing
 from pathlib import Path
+import time
 
 
 SCHEMA = "v4-general-expert-selection.v1"
+_WORKER_SELECTION = None
+_WORKER_ALLOW_PREFIX = False
 
 
 def selected_sides(path):
@@ -98,68 +104,130 @@ def cache_indexes(roots):
     return sorted(paths)
 
 
-def audit_selection(selection, roots, *, allow_trusted_prefix=False):
-    # Keep imports lazy so --help and source/split planning need no torch.
-    from .cache import load_il_cache_index, load_il_cache_manifest, load_il_cache_shard
+def _audit_shard(path, wanted, *, allow_trusted_prefix):
+    """Return only small audited metadata; release tensors inside the worker."""
+    from .cache import load_il_cache_manifest, load_il_cache_shard
     from .ppo_expert_bc import cached_general_sequence_quality
+
+    manifest = load_il_cache_manifest(path)
+    matches = [
+        (n, seq) for n, seq in enumerate(manifest["sequences"])
+        if (seq["replay_tag"], seq["owner"]) in wanted
+    ]
+    seen, accepted, exclusions = set(), [], []
+    if not matches:
+        return seen, accepted, exclusions
+    results = {r["replay_tag"]: r for r in manifest["results"]}
+    shard = None
+    for n, seq in matches:
+        key = (seq["replay_tag"], seq["owner"])
+        if key in seen:
+            raise ValueError(f"ambiguous duplicate cache owner: {key}; supply only the intended cache roots")
+        seen.add(key)
+        result = results[seq["replay_tag"]]
+        status = cache_status(result, allow_trusted_prefix=allow_trusted_prefix)
+        if status == "excluded":
+            exclusions.append(dict(replay_tag=key[0], owner=key[1], reason=result.get("failure_reason")
+                                   or "cache not completed"))
+            continue
+        if shard is None:
+            shard = load_il_cache_shard(path, verify=True)
+        quality = cached_general_sequence_quality(shard, n)
+        if (
+            quality["cached_micro_actions"] <= 0 or quality["cached_gate_frames"] <= 0
+            or not quality["cached_episode_start"] or not quality["cached_natural_time"]
+        ):
+            exclusions.append(dict(replay_tag=key[0], owner=key[1], reason="no trusted actions/gates or episode start"))
+            continue
+        accepted.append(dict(
+            wanted[key], **quality, summary_path=str(path), sequence_index=n,
+            sequence_length=seq["length"], cache_status=status,
+            cache_compressed_sha256=shard.summary["compressed_sha256"],
+            first_untrusted_tick=result.get("first_untrusted_tick"),
+            simulated_end_tick=result.get("simulated_end_tick"),
+        ))
+    return seen, accepted, exclusions
+
+
+def _initialize_audit_worker(wanted, allow_trusted_prefix):
+    import torch
+
+    global _WORKER_SELECTION, _WORKER_ALLOW_PREFIX
+    _WORKER_SELECTION = wanted
+    _WORKER_ALLOW_PREFIX = allow_trusted_prefix
+    # Each process owns one shard; avoid workers * torch threads CPU contention.
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
+
+def _audit_worker(path):
+    return _audit_shard(path, _WORKER_SELECTION, allow_trusted_prefix=_WORKER_ALLOW_PREFIX)
+
+
+def _audit_results(paths, wanted, *, workers, allow_trusted_prefix):
+    if workers == 1:
+        for path in paths:
+            yield _audit_shard(path, wanted, allow_trusted_prefix=allow_trusted_prefix)
+        return
+    # Spawn avoids inheriting a parent's torch thread pool. Only `workers`
+    # futures are outstanding; completed jobs return metadata, never tensors.
+    with ProcessPoolExecutor(
+        max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+        initializer=_initialize_audit_worker, initargs=(wanted, allow_trusted_prefix),
+    ) as executor:
+        remaining = iter(paths[workers:])
+        pending = {executor.submit(_audit_worker, path) for path in paths[:workers]}
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                yield future.result()
+                path = next(remaining, None)
+                if path is not None:
+                    pending.add(executor.submit(_audit_worker, path))
+
+
+def audit_selection(selection, roots, *, allow_trusted_prefix=False, workers=1):
+    # Keep imports lazy so --help and source/split planning need no torch.
+    if workers <= 0:
+        raise ValueError("audit workers must be positive")
+    from .cache import load_il_cache_index
 
     wanted = selected_sides(selection)
     summaries = set()
     for index in cache_indexes(roots):
         for row in load_il_cache_index(index)["shards"]:
             summaries.add((index.parent / row["summary_file"]).resolve())
+    paths = sorted(summaries)
+    active_workers = min(workers, len(paths))
     seen, accepted, exclusions = set(), [], []
-    for i, path in enumerate(sorted(summaries)):
-        manifest = load_il_cache_manifest(path)
-        matches = [
-            (n, seq) for n, seq in enumerate(manifest["sequences"])
-            if (seq["replay_tag"], seq["owner"]) in wanted
-        ]
-        if not matches:
-            continue
-        results = {r["replay_tag"]: r for r in manifest["results"]}
-        shard = None
-        for n, seq in matches:
-            key = (seq["replay_tag"], seq["owner"])
-            if key in seen:
+    started = time.monotonic()
+    with closing(_audit_results(paths, wanted, workers=max(1, active_workers),
+                                allow_trusted_prefix=allow_trusted_prefix)) as results:
+        for completed, (keys, rows, rejected) in enumerate(results, start=1):
+            duplicates = keys & seen
+            if duplicates:
+                key = min(duplicates)
                 raise ValueError(f"ambiguous duplicate cache owner: {key}; supply only the intended cache roots")
-            seen.add(key)
-            result = results[seq["replay_tag"]]
-            status = cache_status(result, allow_trusted_prefix=allow_trusted_prefix)
-            if status == "excluded":
-                exclusions.append(dict(replay_tag=key[0], owner=key[1], reason=result.get("failure_reason")
-                                       or "cache not completed"))
-                continue
-            if shard is None:
-                shard = load_il_cache_shard(path, verify=True)
-            quality = cached_general_sequence_quality(shard, n)
-            if (
-                quality["cached_micro_actions"] <= 0 or quality["cached_gate_frames"] <= 0
-                or not quality["cached_episode_start"] or not quality["cached_natural_time"]
-            ):
-                exclusions.append(dict(replay_tag=key[0], owner=key[1], reason="no trusted actions/gates or episode start"))
-                continue
-            accepted.append(dict(
-                wanted[key], **quality, summary_path=str(path), sequence_index=n,
-                sequence_length=seq["length"], cache_status=status,
-                cache_compressed_sha256=shard.summary["compressed_sha256"],
-                first_untrusted_tick=result.get("first_untrusted_tick"),
-                simulated_end_tick=result.get("simulated_end_tick"),
-            ))
-        # Release this shard before inflating the next one.
-        shard = None
-        print(json.dumps(dict(event="expert_cache_audit", shard=i + 1, total_shards=len(summaries),
-                              accepted_sides=len(accepted), excluded_sides=len(exclusions))), flush=True)
+            seen.update(keys)
+            accepted.extend(rows)
+            exclusions.extend(rejected)
+            elapsed = time.monotonic() - started
+            print(json.dumps(dict(event="expert_cache_audit", shard=completed, total_shards=len(paths),
+                                  workers=active_workers, elapsed_seconds=round(elapsed, 2),
+                                  shards_per_second=round(completed / max(elapsed, 1e-9), 3),
+                                  accepted_sides=len(accepted), excluded_sides=len(exclusions))), flush=True)
     for tag, owner in sorted(set(wanted) - seen):
         exclusions.append(dict(replay_tag=tag, owner=owner, reason="selected owner missing from cache"))
-    return sorted(accepted, key=lambda row: (row["replay_tag"], row["owner"])), exclusions
+    return (sorted(accepted, key=lambda row: (row["replay_tag"], row["owner"])),
+            sorted(exclusions, key=lambda row: (row["replay_tag"], row["owner"])))
 
 
-def build_manifests(selection, roots, output, *, validation_percent=10, seed=20261015, allow_trusted_prefix=False):
+def build_manifests(selection, roots, output, *, validation_percent=10, seed=20261015,
+                    allow_trusted_prefix=False, workers=1):
     output = Path(output)
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise FileExistsError(f"manifest output must be empty: {output}")
-    rows, exclusions = audit_selection(selection, roots, allow_trusted_prefix=allow_trusted_prefix)
+    rows, exclusions = audit_selection(selection, roots, allow_trusted_prefix=allow_trusted_prefix, workers=workers)
     splits = split_games(rows, validation_percent=validation_percent, seed=seed)
     provenance = dict(
         selection_path=str(Path(selection).resolve()),
@@ -193,11 +261,13 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--validation-percent", type=float, default=10)
     parser.add_argument("--seed", type=int, default=20261015)
+    parser.add_argument("--workers", type=int, default=1,
+                        help="parallel shard audit processes (start with 4; each inflates one shard in CPU RAM)")
     parser.add_argument("--allow-trusted-prefix", action="store_true",
                         help="also use masked safe prefixes of narrowly classified reconstruction failures")
     args = parser.parse_args(argv)
     summary = build_manifests(args.selection, args.cache_root, args.output, validation_percent=args.validation_percent,
-                             seed=args.seed, allow_trusted_prefix=args.allow_trusted_prefix)
+                             seed=args.seed, allow_trusted_prefix=args.allow_trusted_prefix, workers=args.workers)
     print(json.dumps(dict(event="expert_manifest_complete", output=str(args.output), **summary), ensure_ascii=False),
           flush=True)
     return 0
