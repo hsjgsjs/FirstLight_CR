@@ -43,6 +43,8 @@ bash native_runner/training/v4/launch_stateful_il.sh \
 
 For a training run, remove `--max-groups 1` and use your dataset and tag selection. To resume an interrupted IL run, pass its saved training checkpoint with `--resume`. Check loss, completed groups, and saved checkpoints; the resulting model can be loaded in the console or evaluator.
 
+To add selected human demonstrations to an existing PPO model, use the audited general expert manifest and short matched trials described in [PPO + human replay trials (Chinese)](human_bc_zh.md). This retains WAIT supervision and separates imitation updates from on-policy PPO; the legacy Hog expert path remains supported.
+
 ## 4. Native trajectory playback
 
 To create a complete native trajectory, start an idle offline engine and run:

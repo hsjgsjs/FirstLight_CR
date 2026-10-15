@@ -95,6 +95,30 @@ def cached_sequence_quality(shard, index):
     )
 
 
+def cached_general_sequence_quality(shard, index):
+    """General experts need trusted actions, without any required card ID."""
+    descriptor = shard.descriptors[index]
+    start, stop = descriptor.offset, descriptor.offset + descriptor.length
+    active = (shard.actions.micro_action_count[start:stop] > 0) & shard.valid_mask[start:stop, 0]
+    return {
+        **cached_sequence_quality(shard, index),
+        "cached_action_frame_indices": torch.nonzero(active, as_tuple=False).flatten().tolist(),
+    }
+
+
+def general_window_mask(valid, action_rows, *, window_steps, rng):
+    """Opening and a uniform later time window, retaining WAIT supervision."""
+    selected = selected_window_mask(valid, [], window_steps=window_steps, rng=rng)
+    if not any(bool(selected[t, 0]) for t in action_rows):
+        # A long empty opening can otherwise yield a batch with no card labels.
+        # Keep its WAITs, adding ordinary context around one trusted action.
+        end = int(torch.nonzero(valid[:, 0], as_tuple=False)[-1]) + 1
+        center = rng.choice(action_rows)
+        start = max(0, min(end - window_steps, center - window_steps // 2))
+        selected[start : start + window_steps] |= valid[start : start + window_steps]
+    return selected
+
+
 def head_counts(sequence):
     valid = sequence.valid_mask
     gate_mask = valid if sequence.gate_loss_mask is None else sequence.gate_loss_mask
@@ -154,8 +178,13 @@ def hog_gate_nll_sum(sequence, evaluation, *, scope="all", metadata=None, frame_
 
 
 def expert_bc_contract_v4(
-    sampler, *, coefficient=0.2, hog_gate_weight=0.0, hog_gate_scope="all", hog_gate_gradient_scope="full"
+    sampler, *, coefficient=0.2, hog_gate_weight=0.0, hog_gate_scope="all", hog_gate_gradient_scope="full",
+    every_updates=1,
 ):
+    if every_updates <= 0:
+        raise ValueError("expert BC update interval must be positive")
+    if getattr(sampler, "general", False) and hog_gate_weight:
+        raise ValueError("general expert BC does not support Hog-specific gate supervision")
     if not math.isfinite(hog_gate_weight) or hog_gate_weight < 0:
         raise ValueError("expert Hog gate weight must be finite and nonnegative")
     if hog_gate_scope not in ("all", "proactive-first"):
@@ -163,6 +192,8 @@ def expert_bc_contract_v4(
     if hog_gate_gradient_scope not in ("full", "gate-head-only"):
         raise ValueError("unknown Hog gate auxiliary gradient scope")
     contract = {**sampler.contract(), "coefficient": coefficient}
+    if every_updates != 1:
+        contract["every_updates"] = every_updates
     # Preserve strict-resume compatibility for the unchanged, zero-weight path.
     if hog_gate_weight and hog_gate_scope == "all":
         contract.update(
@@ -251,12 +282,19 @@ class ExpertBatchItemV4:
 class HogExpertSamplerV4:
     """Stateless per-update sampling: strict resume does not need hidden RNG state."""
 
+    general = False
+    gate_act_weight = 8.0
+    quality = staticmethod(cached_sequence_quality)
+
     def __init__(self, manifest_path, *, seed, records_per_rank=2, window_steps=128):
         self.path = Path(manifest_path).resolve()
         raw = self.path.read_bytes()
         payload = json.loads(raw)
-        if payload.get("schema") != "v4-hog-expert-selection.v1" or payload.get("discard_tail_ticks") != 200:
+        schema = "v4-general-expert-selection.v1" if self.general else "v4-hog-expert-selection.v1"
+        if payload.get("schema") != schema or payload.get("discard_tail_ticks") != 200:
             raise ValueError("unsupported or unsafe expert manifest")
+        if self.general and payload.get("split") != "train":
+            raise ValueError("validation expert manifest must not be used for training")
         if payload.get("cache_labels_verified") is not True:
             raise ValueError("BC requires a manifest audited against actual cached labels")
         self.rows = payload["rows"]
@@ -273,7 +311,15 @@ class HogExpertSamplerV4:
             for r in self.rows
         ):
             raise ValueError("invalid expert quality selection")
-        if any(
+        if self.general:
+            if any(
+                r.get("source_split") != "train" or r.get("cached_micro_actions", 0) <= 0
+                or r.get("cached_gate_frames", 0) <= 0 or not r.get("cached_action_frame_indices")
+                or not r.get("cached_episode_start") or not r.get("cached_natural_time")
+                for r in self.rows
+            ):
+                raise ValueError("general expert lacks audited action labels or real recurrent start")
+        elif any(
             r.get("cached_hog_count", 0) <= 0 or not r.get("cached_episode_start") or not r.get("cached_natural_time")
             for r in self.rows
         ):
@@ -339,7 +385,8 @@ class HogExpertSamplerV4:
             raise ValueError("invalid update/rank")
         # All ranks draw the same global list, then take disjoint positions.
         # This does not perturb PPO/collector RNG state and resumes exactly.
-        rng = random.Random(f"hog-bc-v1:{self.seed}:{update}")
+        prefix = "general-bc-v1" if self.general else "hog-bc-v1"
+        rng = random.Random(f"{prefix}:{self.seed}:{update}")
         selected = rng.choices(
             self.rows, weights=[r["weight"] for r in self.rows], k=world_size * self.records_per_rank
         )
@@ -363,17 +410,23 @@ class HogExpertSamplerV4:
                 row["sequence_length"],
             ):
                 raise ValueError("expert owner/cache identity changed")
-            quality = cached_sequence_quality(shard, index)
+            quality = self.quality(shard, index)
             if any(quality.get(k) != row.get(k) for k in quality):
                 raise ValueError("cached expert labels changed after dataset audit")
             sequence = shard.sequence(index)
             if not bool(sequence.episode_start[0, 0]) or not sequence.natural_time:
                 raise ValueError("expert must start at its real recurrent episode boundary")
             hog_rows = hog_action_rows(sequence)
-            if not hog_rows:
+            if not self.general and not hog_rows:
                 raise ValueError(f"selected expert has no valid cached Hog labels: {row['replay_tag']}")
-            rng = random.Random(f"hog-bc-window:{self.seed}:{update}:{rank}:{i}")
-            selected = selected_window_mask(sequence.valid_mask, hog_rows, window_steps=self.window_steps, rng=rng)
+            prefix = "general-bc-window" if self.general else "hog-bc-window"
+            rng = random.Random(f"{prefix}:{self.seed}:{update}:{rank}:{i}")
+            selected = (
+                general_window_mask(sequence.valid_mask, quality["cached_action_frame_indices"],
+                                    window_steps=self.window_steps, rng=rng)
+                if self.general else
+                selected_window_mask(sequence.valid_mask, hog_rows, window_steps=self.window_steps, rng=rng)
+            )
             last = int(torch.nonzero(selected[:, 0], as_tuple=False)[-1]) + 1
             # Clip only after the last selected window. All earlier context is
             # preserved, including unsupervised waiting/defense frames.
@@ -393,6 +446,29 @@ class HogExpertSamplerV4:
                 )
             )
         return items
+
+
+class GeneralExpertSamplerV4(HogExpertSamplerV4):
+    """Audited multi-deck human demonstrations, with unbiased ACT/WAIT labels."""
+
+    general = True
+    gate_act_weight = 1.0
+    quality = staticmethod(cached_general_sequence_quality)
+
+    def contract(self):
+        return {
+            **super().contract(),
+            "schema": "v4-ppo-general-expert-bc.v1",
+            "sampling": "stateless-seed-update-rank; opening+uniform-later-time+action-context-if-empty",
+            "gate_act_weight": self.gate_act_weight,
+            "training_split_only": True,
+        }
+
+
+def load_expert_sampler_v4(manifest_path, **kwargs):
+    schema = json.loads(Path(manifest_path).read_bytes()).get("schema")
+    sampler = GeneralExpertSamplerV4 if schema == "v4-general-expert-selection.v1" else HogExpertSamplerV4
+    return sampler(manifest_path, **kwargs)
 
 
 def _reduce_actor_gradients(parameters):
@@ -478,7 +554,9 @@ def distributed_expert_bc_update_v4(
     before = None if rollout is None else _probe_log_probs(model, rollout, device=device, validate=validate)
     items = sampler.sample(update_step, rank, world_size)
     totals = _sum(sum((head_counts(x.sequence) for x in items)).to(device))
-    if bool(torch.any(totals <= 0)):
+    # Ability-only samples legitimately have no placement targets.
+    required = totals[[0, 1, 3, 4]] if getattr(sampler, "general", False) else totals
+    if bool(torch.any(required <= 0)):
         raise RuntimeError("expert batch lacks an action-head training population")
     hog_gate_count = None
     if hog_gate_weight:
@@ -523,7 +601,7 @@ def distributed_expert_bc_update_v4(
                         chunk,
                         evaluation,
                         weights=ILLossWeightsV4(value=0.0),
-                        gate_act_weight=8.0,
+                        gate_act_weight=getattr(sampler, "gate_act_weight", 8.0),
                         delay_neighbor_weight=0.2,
                     )
                     means = torch.stack([getattr(loss, k) for k in HEADS]).float()
@@ -595,6 +673,7 @@ def distributed_expert_bc_update_v4(
     metrics.update(
         bc_loss=float(losses.sum()),
         bc_coefficient=coefficient,
+        bc_gate_act_weight=getattr(sampler, "gate_act_weight", 8.0),
         bc_gradient_norm=float(grad_norm),
         bc_optimizer_steps=1,
         bc_expert_records=float(stats[0]),

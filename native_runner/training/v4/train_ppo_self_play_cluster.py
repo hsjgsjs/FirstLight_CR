@@ -32,7 +32,7 @@ from .cluster_self_play import ClusterCollectionV4, ClusterMatchAssignmentV4
 from .deck_pool import DeckIdentityV4, DeckPoolManifestV4
 from .decoding import ShadowCandidateLegality
 from .distributed_ppo import distributed_ppo_update_v4
-from .ppo_expert_bc import HogExpertSamplerV4, distributed_expert_bc_update_v4, expert_bc_contract_v4
+from .ppo_expert_bc import load_expert_sampler_v4, distributed_expert_bc_update_v4, expert_bc_contract_v4
 from .factory import build_production_model_v4
 from .league import PolicyLeagueV4
 from .matchmaking import (
@@ -1065,10 +1065,12 @@ def main() -> int:
     parser.add_argument("--lane-microbatch-size", type=int, default=96)
     parser.add_argument("--sequence-chunk-steps", type=int, default=48)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--expert-bc-manifest", type=Path)
+    parser.add_argument("--expert-bc-manifest", type=Path, help="audited general or legacy Hog expert train manifest")
     parser.add_argument("--expert-bc-coefficient", type=float, default=0.2)
     parser.add_argument("--expert-bc-records-per-rank", type=int, default=2)
     parser.add_argument("--expert-bc-window-steps", type=int, default=128)
+    parser.add_argument("--expert-bc-every-updates", type=int, default=1,
+                        help="one separate policy-only imitation step every N PPO updates")
     parser.add_argument("--expert-bc-hog-gate-weight", type=float, default=0.0)
     parser.add_argument("--expert-bc-hog-gate-scope", choices=("all", "proactive-first"), default="all")
     parser.add_argument("--expert-bc-hog-gate-gradient-scope", choices=("full", "gate-head-only"), default="full")
@@ -1084,7 +1086,7 @@ def main() -> int:
     if (
         not math.isfinite(args.expert_bc_coefficient)
         or args.expert_bc_coefficient <= 0
-        or min(args.expert_bc_records_per_rank, args.expert_bc_window_steps) <= 0
+        or min(args.expert_bc_records_per_rank, args.expert_bc_window_steps, args.expert_bc_every_updates) <= 0
     ):
         raise ValueError("expert BC coefficient and dimensions must be positive")
     if not math.isfinite(args.expert_bc_hog_gate_weight) or args.expert_bc_hog_gate_weight < 0:
@@ -1353,7 +1355,7 @@ def main() -> int:
     expert_bc_sampler = (
         None
         if args.expert_bc_manifest is None
-        else HogExpertSamplerV4(
+        else load_expert_sampler_v4(
             args.expert_bc_manifest,
             seed=args.seed,
             records_per_rank=args.expert_bc_records_per_rank,
@@ -1369,6 +1371,7 @@ def main() -> int:
             hog_gate_weight=args.expert_bc_hog_gate_weight,
             hog_gate_scope=args.expert_bc_hog_gate_scope,
             hog_gate_gradient_scope=args.expert_bc_hog_gate_gradient_scope,
+            every_updates=args.expert_bc_every_updates,
         )
     )
     bc_identities = [None for _ in range(world_size)]
@@ -1894,7 +1897,7 @@ def main() -> int:
                 validate=args.validate,
             )
             bc_metrics = {}
-            if expert_bc_sampler is not None:
+            if expert_bc_sampler is not None and update_step % args.expert_bc_every_updates == 0:
                 bc_metrics = distributed_expert_bc_update_v4(
                     current_model,
                     optimizer,
