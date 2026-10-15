@@ -1,4 +1,7 @@
-param([Parameter(ValueFromRemainingArguments = $true)][string[]]$ExtraArgs)
+param(
+    [switch]$NoAutoQueue,
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$ExtraArgs
+)
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -7,10 +10,11 @@ $repository = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $repository
 
 $python = Get-LocalSetting "CR_PYTHON"
-$checkpoint = "checkpoints/My/update-00000048.pt"
+$checkpoint = "checkpoints/My/update-00001208.pt"
+$autoQueueFlag = if ($NoAutoQueue) { @() } else { @("--auto-queue") }
 
 Write-Host "正在开启实战网络模式并转发控制端口..."
 & $python -m native_runner.live_diagnose start
 
-Write-Host "正在启动 AI 友谊战对战监听（权重：$checkpoint，门控温度：0.2）..."
-& $python -u -m native_runner.live_play run --checkpoint $checkpoint --gate-temperature 0.2 @ExtraArgs
+Write-Host "正在启动 AI 实际对战（权重：$checkpoint，门控温度：0.2，全自动挂机循环：$(-not $NoAutoQueue)）..."
+& $python -u -m native_runner.live_play run --checkpoint $checkpoint --gate-temperature 0.2 @autoQueueFlag @ExtraArgs

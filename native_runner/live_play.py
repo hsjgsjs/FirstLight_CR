@@ -26,6 +26,7 @@ import subprocess
 import time
 from typing import Any, Callable, Iterable, Mapping
 
+from .battle_env import BattleEnvError
 from .cr_native_env import NativeClashEnv, RunnerError, _decode_observed_hand_card, _observed_command_card_id
 from .live_diagnose import CONTROL_HOST, CONTROL_PORT, _adb
 from .live_match import LiveCaptureNative
@@ -333,9 +334,16 @@ def _rendered_action(action: Any) -> Any:
     return replace(action, execute_offset_ticks=1, metadata=metadata)
 
 
-def wait_for_battle(control: NativeClashEnv, skip_generation: int | None) -> int:
+def wait_for_battle(
+    control: NativeClashEnv,
+    skip_generation: int | None,
+    *,
+    periodic_action: Callable[[], None] | None = None,
+    periodic_interval_s: float = 18.0,
+) -> int:
     """The generation of a running battle (a new one when ``skip_generation`` is given)."""
 
+    last_periodic = time.monotonic()
     while True:
         first = control._request("live status")
         time.sleep(0.5)
@@ -344,7 +352,45 @@ def wait_for_battle(control: NativeClashEnv, skip_generation: int | None) -> int
         generation = int(second.get("generation", -1))
         if running and generation == int(first.get("generation", -2)) and generation != skip_generation:
             return generation
+        if periodic_action is not None and (time.monotonic() - last_periodic) >= periodic_interval_s:
+            periodic_action()
+            last_periodic = time.monotonic()
         time.sleep(1.0)
+
+
+def auto_return_to_lobby_and_queue(taps: AdbTaps | None, width: int, height: int, control: NativeClashEnv) -> None:
+    if taps is None:
+        return
+    # 结算界面底部的确定/OK按钮：实测中心 (720, 2322) -> (0.5000, 0.9070)
+    ok_x, ok_y = round(width * 0.5000), round(height * 0.9070)
+    # 底栏正中央的【对战 Tab】：实测中心 (720, 2400) -> (0.5000, 0.9375)
+    tab_x, tab_y = round(width * 0.5000), round(height * 0.9375)
+    # 大厅正中巨大的黄色【对战】按钮：实测中心 (720, 1955) -> (0.5000, 0.7637)
+    battle_x, battle_y = round(width * 0.5000), round(height * 0.7637)
+    # 弹窗确认按钮（如“宝箱位已满继续”）：(0.6500, 0.6000)
+    confirm_x, confirm_y = round(width * 0.6500), round(height * 0.6000)
+
+    print("【全自动】对局已结束，正在跳过结算画面返回大厅……")
+    time.sleep(3.5)
+
+    # 1. 连续点击赛后确定/OK按钮，跳过结算画面
+    for _ in range(4):
+        taps.tap(ok_x, ok_y)
+        time.sleep(0.8)
+
+    time.sleep(1.0)
+    # 2. 点击底栏中间的【对战Tab】，确保百分之百切回大厅主界面（避免误入竞技场/活动详情）
+    for _ in range(2):
+        taps.tap(tab_x, tab_y)
+        time.sleep(0.8)
+
+    time.sleep(1.5)
+    # 3. 点击大厅黄色「对战」按钮，开始匹配
+    print("【全自动】已到达大厅，点击「对战」按钮开始下一局匹配……")
+    taps.tap(battle_x, battle_y)
+    time.sleep(1.2)
+    # 4. 若有“宝箱位已满是否继续”确认框，轻点确认按钮
+    taps.tap(confirm_x, confirm_y)
 
 
 def play_battle(
@@ -443,7 +489,7 @@ def play_battle(
                 if episode is not None:
                     episode.close()
                 episode = None
-    except RunnerError as error:
+    except (RunnerError, BattleEnvError) as error:
         summary["result"] = f"battle over or lost: {error}"
     finally:
         if episode is not None:
@@ -518,23 +564,46 @@ def run(args: argparse.Namespace) -> None:
         print(f"注意：{args.layout} 还没校准（屏幕 {width}x{height}），点击位置可能不准。先用 shot 检查。")
     taps = None if args.dry_run else AdbTaps()
     model = load_policy_v4(args.checkpoint, device=args.device).model
-    # A training checkpoint keeps the act/wait temperature of the update that saved it (0.5 early in a run);
-    # sampling with it plays noticeably more randomly than the released models' 0.2.
-    if args.gate_temperature is not None:
+    if getattr(args, "gate_temperature", None) is not None:
         model.set_ppo_gate_temperature(args.gate_temperature)
-    print(f"gate temperature {model.ppo_gate_temperature:g}")
+        print(f"门控温度已设定为: {model.ppo_gate_temperature}")
     control = NativeClashEnv(CONTROL_HOST, CONTROL_PORT, timeout=10.0)
     control._request("live on")
     played, last = 0, None
+    auto_queue = getattr(args, "auto_queue", False)
+    tab_x, tab_y = round(width * 0.5000), round(height * 0.9375)
+    battle_x, battle_y = round(width * 0.5000), round(height * 0.7637)
+    confirm_x, confirm_y = round(width * 0.6500), round(height * 0.6000)
+
+    def maybe_requeue() -> None:
+        if auto_queue and taps is not None:
+            print("【全自动】检测到仍在匹配或等待中，重新切回大厅并点击「对战」……")
+            taps.tap(tab_x, tab_y)
+            time.sleep(0.8)
+            taps.tap(battle_x, battle_y)
+            time.sleep(1.0)
+            taps.tap(confirm_x, confirm_y)
+
+    if auto_queue and taps is not None:
+        print("【全自动模式已就绪】切回大厅并点击「对战」按钮，开始匹配……")
+        taps.tap(tab_x, tab_y)
+        time.sleep(0.8)
+        taps.tap(battle_x, battle_y)
+        time.sleep(1.0)
+        taps.tap(confirm_x, confirm_y)
+
     try:
         while args.games == 0 or played < args.games:
-            print("等待对局……（在手机上向 MuMu 账号发起友谊战）")
-            last = wait_for_battle(control, last)
+            prompt = "【全自动】等待匹配进入对局……" if auto_queue else "等待对局……（在手机上向 MuMu 账号发起友谊战或在模拟器点击对战）"
+            print(prompt)
+            last = wait_for_battle(control, last, periodic_action=maybe_requeue if auto_queue else None)
             try:
                 play_battle(model, args, layout, taps)
                 played += 1
-            except RunnerError as error:
+            except (RunnerError, BattleEnvError) as error:
                 print(f"对局未能正常开始或提前结束（{error}），继续等待下一局……")
+            if auto_queue and taps is not None:
+                auto_return_to_lobby_and_queue(taps, width, height, control)
     finally:
         try:
             control._request("live off")
@@ -647,9 +716,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             command.add_argument("--dry-run", action="store_true", help="decide and log, but do not tap")
             command.add_argument("--deterministic", action="store_true",
                                  help="always take the most likely action (rarely plays; default samples)")
-            command.add_argument("--gate-temperature", type=float,
-                                 help="act/wait sampling temperature (default: the one saved in the checkpoint; "
-                                 "0.2 for the released models)")
+            command.add_argument("--gate-temperature", type=float, default=None,
+                                 help="override model ppo_gate_temperature (e.g. 0.2)")
+            command.add_argument("--auto-queue", action="store_true",
+                                 help="automatically return to lobby and queue for matches")
     args = parser.parse_args(None if argv is None else list(argv))
     if args.command == "shot":
         shot(args)
