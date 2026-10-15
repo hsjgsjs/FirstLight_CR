@@ -38,3 +38,5 @@ Interactive play uses a continuously rendered battle and applies native deployme
 | Engine readiness and topology JSON | Connect allocated simulation workers to the trainer |
 
 Catalog ordering, observation/action versions, and card/form identities are part of model compatibility. When extending a game version or model representation, update the relevant contracts and verify both encoding and native execution. See [compatibility data](../native_runner/data/competitive/README.md).
+
+The proposed additions for pending commands, in-flight effect timing, and short-horizon prediction are documented in the [temporal reasoning design plan (Chinese)](temporal_reasoning_plan_zh.md). They are not implemented yet; the plan separates current code facts, hypotheses, checkpoint/cache migration, and validation.
