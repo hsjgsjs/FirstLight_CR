@@ -1,0 +1,22 @@
+{
+  "models": {
+    "General 460": "checkpoints/General/checkpoint-step-00000460.pt",
+    "Update 48": "checkpoints/my/update-00000048.pt",
+    "PPO 104": "checkpoints/my/update-00000104.pt",
+    "PPO 1208": "checkpoints/my/update-00001208.pt",
+    "BC 200": "checkpoints/my/update-00000200.pt"
+  },
+  "anchor": "General 460",
+  "deck_pool": null,
+  "match_config": null,
+  "battle_level": 16,
+  "delay_ticks": "18-24",
+  "min_play_gap_ticks": "4-8",
+  "sample": false,
+  "gate_temperature": null,
+  "seed": 1001,
+  "device": "cpu",
+  "cpu_threads": 10,
+  "lanes": 16,
+  "bootstrap_samples": 1000
+}

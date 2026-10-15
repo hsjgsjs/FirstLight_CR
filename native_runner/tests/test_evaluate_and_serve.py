@@ -204,10 +204,11 @@ def test_parallel_evaluation_gives_each_shard_one_gpu(monkeypatch, tmp_path):
     assert evaluate_parallel.shard_device("cpu") == ("cpu", None)
 
 
-def test_scheduled_evaluation_locksteps_one_block_on_resident_slots(monkeypatch, tmp_path):
+@pytest.mark.parametrize("lane_count", [8, 16])
+def test_scheduled_evaluation_locksteps_one_block_on_resident_slots(monkeypatch, tmp_path, lane_count):
     import json
 
-    from native_runner.training.v4.evaluation_protocol import balanced_cases
+    from native_runner.training.v4.evaluation_protocol import balanced_cases, natural_schedule
 
     built = []
     stepped = []
@@ -253,8 +254,8 @@ def test_scheduled_evaluation_locksteps_one_block_on_resident_slots(monkeypatch,
 
     class Engine:
         def __init__(self):
-            self.natives = tuple(NS() for _ in range(8))
-            self.environments = tuple(Environment() for _ in range(8))
+            self.natives = tuple(NS() for _ in range(lane_count))
+            self.environments = tuple(Environment() for _ in range(lane_count))
             self.coordinator = Coordinator()
 
         def prepare(self):
@@ -301,23 +302,44 @@ def test_scheduled_evaluation_locksteps_one_block_on_resident_slots(monkeypatch,
     monkeypatch.setattr(evaluate, "build_policy_session_v4", session)
     monkeypatch.setattr(evaluate, "forward_resident_contexts", forward)
     monkeypatch.setattr(evaluate, "NativeClashEnv", lambda *a, **k: (_ for _ in ()).throw(AssertionError("json path")))
-    schedule = balanced_cases(MatchConfig(seed=7), block=0, deadline_seconds=12.0)
+    schedule = (balanced_cases(MatchConfig(seed=7), block=0, deadline_seconds=12.0) if lane_count == 8
+                else natural_schedule(MatchConfig(seed=7), range(4)))
     result = evaluate.evaluate(
-        "a.pt", "b.pt", games=8, match=MatchConfig(seed=7), output=tmp_path, schedule=schedule,
+        "a.pt", "b.pt", games=lane_count, match=MatchConfig(seed=7), output=tmp_path, schedule=schedule,
+        resident_lanes=16 if lane_count == 16 else None,
     )
-    assert built[0]["capture_mode"] == "compact" and built[0]["lanes"] == 8
+    assert built[0]["capture_mode"] == "compact" and built[0]["lanes"] == lane_count
     assert built[0]["base_port"] == evaluate.DEFAULT_PORT
-    assert rounds == [tuple(range(8))]
-    assert forwards == [16]
-    assert stepped == [{"record_trace": False, "policy_features_only": True}] * 8
-    assert result["completed"] == 8 and result["a_wins"] + result["b_wins"] == 8
-    assert len((tmp_path / "matches.jsonl").read_text().splitlines()) == 8
+    assert rounds == [tuple(range(lane_count))]
+    assert forwards == [lane_count * 2]
+    assert stepped == [{"record_trace": False, "policy_features_only": True}] * lane_count
+    assert result["completed"] == lane_count and result["a_wins"] + result["b_wins"] == lane_count
+    assert len((tmp_path / "matches.jsonl").read_text().splitlines()) == lane_count
     assert json_transport(tmp_path) == "resident-compact"
     assert built[-1] == "closed"
-    assert len(ended) == 16
+    assert len(ended) == lane_count * 2
     rows = [json.loads(line) for line in (tmp_path / "matches.jsonl").read_text().splitlines()]
-    assert [row["opening_overrides"]["b"] for row in rows if row["condition"] == "forced"] == [1, 1, 1, 1]
-    assert [row["opening_overrides"]["b"] for row in rows if row["condition"] == "natural"] == [0, 0, 0, 0]
+    assert [row["opening_overrides"]["b"] for row in rows if row["condition"] == "forced"] == (
+        [1] * 4 if lane_count == 8 else [])
+    assert [row["opening_overrides"]["b"] for row in rows if row["condition"] == "natural"] == (
+        [0] * 4 if lane_count == 8 else [0] * 16)
+    timing = json.loads((tmp_path / "timing.json").read_text())
+    assert timing["elapsed_seconds"] >= timing["engine_step_wall_seconds"] >= 0
+
+
+def test_evaluation_range_delays_are_repeatable_and_preserve_waits():
+    plays = (ActionV1.play(0, 0, (3, 20), execute_offset_ticks=1), ActionV1.wait(0, ticks=5))
+    offsets = []
+    for tick in range(100):
+        key = f"1001-a-{tick}"
+        delayed = evaluate._execution_delay(plays, (18, 24), key)
+        assert delayed == evaluate._execution_delay(plays, (18, 24), key)
+        assert 18 <= delayed[0].execute_offset_ticks <= 24
+        assert delayed[1] == plays[1]
+        offsets.append(delayed[0].execute_offset_ticks)
+    assert len(set(offsets)) > 1
+    assert evaluate._execution_delay(plays, 0, "fixed") == plays
+    assert evaluate._execution_delay(plays, 21, "fixed")[0].execute_offset_ticks == 21
 
 
 def test_forward_resident_contexts_batches_each_model():

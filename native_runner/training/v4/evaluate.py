@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import random
+import time
 
 import torch
 
@@ -21,6 +22,7 @@ from ...rich_telemetry_adapter import RuntimeEffectCatalog
 from .async_cluster_self_play import (
     _first_successful_card_tick_v4,
     _frozen_opponent_opening_force_owner_v4,
+    apply_execution_delay_v4,
     parse_play_gap_ticks,
     space_plays_v4,
 )
@@ -36,6 +38,21 @@ from .tensors import concatenate_padded_tensor_records, concatenate_tensor_recor
 RESIDENT_EVAL_LANES = 8
 
 _DELAYABLE = frozenset({ActionKind.PLAY_CARD, ActionKind.ACTIVATE_ABILITY})
+
+
+def _delay_bounds(value):
+    bounds = (value, value) if isinstance(value, int) else tuple(value)
+    if (len(bounds) != 2 or any(isinstance(v, bool) or not isinstance(v, int) for v in bounds)
+            or not 0 <= bounds[0] <= bounds[1] <= 65535):
+        raise ValueError("delay ticks must be an integer or inclusive range in [0, 65535]")
+    return bounds
+
+
+def _execution_delay(actions, delay, key):
+    # Preserve zero's existing meaning: retain offsets decoded from the model.
+    if delay == 0:
+        return actions
+    return apply_execution_delay_v4(tuple(actions), _delay_bounds(delay), key)
 
 
 @contextmanager
@@ -128,13 +145,7 @@ def _choose_commands(
                 opening_overrides[owner] += int(decision.forced_opening)
             chosen = decision.decoded.actions
             delay = delay_a_ticks if owner == a_owner else delay_b_ticks
-            if delay:
-                # The model's plays land this many ticks after the decision, as taps do on a
-                # live client; BattleEnvV1 keeps the slot pending and its elixir reserved.
-                chosen = tuple(
-                    replace(action, execute_offset_ticks=delay) if action.kind in _DELAYABLE else action
-                    for action in chosen
-                )
+            chosen = _execution_delay(chosen, delay, f"{seed}-{side}-{observation.tick}")
             chosen, last_landing[owner] = space_plays_v4(
                 tuple(chosen),
                 min_play_gap_ticks,
@@ -268,11 +279,7 @@ def _commands_from_contexts(
             lane.opening_overrides[owner] += int(decision.forced_opening)
             chosen = decision.decoded.actions
             delay = delay_a_ticks if owner == lane.a_owner else delay_b_ticks
-            if delay:
-                chosen = tuple(
-                    replace(action, execute_offset_ticks=delay) if action.kind in _DELAYABLE else action
-                    for action in chosen
-                )
+            chosen = _execution_delay(chosen, delay, f"{lane.seed}-{side}-{observation.tick}")
             chosen, lane.last_landing[owner] = space_plays_v4(
                 tuple(chosen),
                 min_play_gap_ticks,
@@ -431,6 +438,7 @@ def _evaluate_resident(
     delay_a_ticks,
     delay_b_ticks,
     min_play_gap_ticks,
+    resident_lanes=None,
 ):
     """Play a paired schedule on one engine's resident slots.
 
@@ -439,13 +447,21 @@ def _evaluate_resident(
     forced openings, delays and the paired RNG stay on this side of the socket.
     """
 
+    lane_count = RESIDENT_EVAL_LANES if resident_lanes is None else resident_lanes
+    timing = {key: 0.0 for key in ("engine_reset_seconds", "tensorize_seconds", "inference_seconds",
+                                  "action_selection_seconds", "engine_step_wall_seconds")}
+    started = time.perf_counter()
+    def flush_timing():
+        timing["elapsed_seconds"] = time.perf_counter() - started
+        (output / "timing.json").write_text(json.dumps(timing, indent=2), encoding="utf-8")
+
     policies = _share_identical_policies(policies)
     engine = build_resident_engine_v4(
         0,
         environment_config=ppo_environment_config_v4(),
         host=host,
         base_port=port,
-        lanes=RESIDENT_EVAL_LANES,
+        lanes=lane_count,
         capture_mode="compact",
     )
     rows = []
@@ -455,11 +471,12 @@ def _evaluate_resident(
             native.public_card_play_events_from_combat_ring = True
         engine.prepare()
         with (output / "matches.jsonl").open("w", encoding="utf-8", buffering=1) as log:
-            with ThreadPoolExecutor(max_workers=RESIDENT_EVAL_LANES, thread_name_prefix="eval-lane") as executor:
-                for wave_start in range(0, len(schedule), RESIDENT_EVAL_LANES):
-                    wave = tuple(schedule[wave_start : wave_start + RESIDENT_EVAL_LANES])
+            with ThreadPoolExecutor(max_workers=lane_count, thread_name_prefix="eval-lane") as executor:
+                for wave_start in range(0, len(schedule), lane_count):
+                    wave = tuple(schedule[wave_start : wave_start + lane_count])
                     engine.coordinator.close_session()
                     lanes = []
+                    phase_started = time.perf_counter()
                     for offset, case in enumerate(wave):
                         environment = engine.environments[offset]
                         if torch.device(device).type == "cpu":
@@ -504,6 +521,7 @@ def _evaluate_resident(
                                 rejected=set(),
                             )
                         )
+                    timing["engine_reset_seconds"] += time.perf_counter() - phase_started
                     engine.coordinator.start_session()
                     while any(lane.active for lane in lanes):
                         entries = []
@@ -523,14 +541,21 @@ def _evaluate_resident(
                                 )
                                 force = owner == force_owner
                                 lane.opening_requests[owner] += int(force)
+                                phase_started = time.perf_counter()
                                 host_batch, first = session.prepare_host_batch(observation)
+                                timing["tensorize_seconds"] += time.perf_counter() - phase_started
                                 owners.append((lane, owner, force))
                                 entries.append((session, host_batch, first))
+                        phase_started = time.perf_counter()
                         forwarded = forward_resident_contexts(entries) if entries else []
+                        if torch.device(device).type == "cuda":
+                            torch.cuda.synchronize(device)
+                        timing["inference_seconds"] += time.perf_counter() - phase_started
                         by_lane = {}
                         for (lane, owner, force), forwarded_row in zip(owners, forwarded, strict=True):
                             host_batch, context = forwarded_row
                             by_lane.setdefault(lane.env_id, {})[owner] = (host_batch, context, force)
+                        phase_started = time.perf_counter()
                         pending = []
                         for lane in lanes:
                             if not lane.active:
@@ -545,6 +570,8 @@ def _evaluate_resident(
                                     min_play_gap_ticks=min_play_gap_ticks,
                                 ),
                             ))
+                        timing["action_selection_seconds"] += time.perf_counter() - phase_started
+                        phase_started = time.perf_counter()
                         engine.coordinator.begin_round(tuple(lane.env_id for lane, _commands in pending))
                         futures = {
                             executor.submit(
@@ -566,6 +593,7 @@ def _evaluate_resident(
                             raise
                         else:
                             engine.coordinator.finish_round()
+                        timing["engine_step_wall_seconds"] += time.perf_counter() - phase_started
                         for lane, (observations, _rewards, terms, truncs, _info) in stepped:
                             lane.observations = observations
                             _absorb_step(observations, lane.first_card_tick, lane.rejected)
@@ -598,10 +626,12 @@ def _evaluate_resident(
                             for session in lane.sessions:
                                 open_sessions.remove(session)
                     engine.coordinator.close_session()
+                    flush_timing()
         result = _summary_payload(games, rows)
         (output / "summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
     finally:
+        flush_timing()
         for session in open_sessions:
             session.end_episode()
         engine.close()
@@ -626,11 +656,14 @@ def evaluate(
     deck_pool=None,
     battle_level=None,
     schedule=None,
+    resident_lanes=None,
 ):
     if games < 1:
         raise ValueError("games must be positive")
-    if not (0 <= delay_a_ticks <= 0xFFFF and 0 <= delay_b_ticks <= 0xFFFF):
-        raise ValueError("delay ticks must be in [0, 65535]")
+    _delay_bounds(delay_a_ticks)
+    _delay_bounds(delay_b_ticks)
+    if resident_lanes is not None and (isinstance(resident_lanes, bool) or resident_lanes not in range(1, 17)):
+        raise ValueError("resident_lanes must be in 1..16")
     if schedule is not None and len(schedule) != games:
         raise ValueError("a paired schedule requires exactly games cases")
     if schedule is not None and torch.device(device).type not in ("cpu", "cuda"):
@@ -661,6 +694,8 @@ def evaluate(
         "battle_level": battle_level,
         "schedule": None if schedule is None else [asdict(case) for case in schedule],
         "transport": "resident-compact" if schedule is not None else "json",
+        "resident_lanes": (RESIDENT_EVAL_LANES if resident_lanes is None else resident_lanes)
+        if schedule is not None else None,
         "checkpoints": [
             {"path": str(p.checkpoint_path), "sha256": p.checkpoint_sha256, "checkpoint_id": p.checkpoint_id}
             for p in policies
@@ -683,6 +718,7 @@ def evaluate(
             delay_a_ticks=delay_a_ticks,
             delay_b_ticks=delay_b_ticks,
             min_play_gap_ticks=min_play_gap_ticks,
+            resident_lanes=resident_lanes,
         )
     bundle = production_semantic_bundle()
     native = NativeClashEnv(host, port, timeout=30.0)
