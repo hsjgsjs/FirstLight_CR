@@ -45,6 +45,10 @@ For a training run, remove `--max-groups 1` and use your dataset and tag selecti
 
 To add selected human demonstrations to an existing PPO model, use the audited general expert manifest and short matched trials described in [PPO + human replay trials (Chinese)](human_bc_zh.md). This retains WAIT supervision and separates imitation updates from on-policy PPO; the legacy Hog expert path remains supported.
 
+The first 200-update trial's reported results and limits are recorded in [the experiment note (Chinese)](human_bc_trial_200_zh.md). The [temporal reasoning plan (Chinese)](temporal_reasoning_plan_zh.md) describes proposed input and auxiliary-task changes; those architecture changes are not part of the current training implementation.
+
+The current sparring project's stages, checkpoint lineage, results, and open work are maintained in [the training progress journal (Chinese)](sparring_journey_zh.md). It is a manually maintained record of reported runs, not a live connection to the training server.
+
 ## 4. Native trajectory playback
 
 To create a complete native trajectory, start an idle offline engine and run:
