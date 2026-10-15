@@ -298,6 +298,20 @@ class HogExpertSamplerV4:
         if payload.get("cache_labels_verified") is not True:
             raise ValueError("BC requires a manifest audited against actual cached labels")
         self.rows = payload["rows"]
+        self.focus = payload.get("focus") if self.general else None
+        self.focus_rows = []
+        if self.focus is not None:
+            from .fireball_focus import validate_focus
+            validate_focus(self.focus)
+            for row in self.rows:
+                frames = row.get("fireball_focus_frames")
+                if (not isinstance(frames, list) or frames != sorted(set(frames))
+                        or any(type(t) is not int or not 0 <= t < row["sequence_length"] for t in frames)):
+                    raise ValueError("invalid audited fireball context frames")
+                if frames:
+                    self.focus_rows.append(row)
+            if not self.focus_rows:
+                raise ValueError("fireball focus needs audited moving-enemy contexts")
         if not self.rows or min(records_per_rank, window_steps) <= 0:
             raise ValueError("BC needs records and positive dimensions")
         keys = [(r["replay_tag"], r["owner"]) for r in self.rows]
@@ -387,6 +401,14 @@ class HogExpertSamplerV4:
         # This does not perturb PPO/collector RNG state and resumes exactly.
         prefix = "general-bc-v1" if self.general else "hog-bc-v1"
         rng = random.Random(f"{prefix}:{self.seed}:{update}")
+        if self.focus is not None:
+            selected = []
+            for _ in range(world_size * self.records_per_rank):
+                focused = rng.random() < self.focus["percent"] / 100.0
+                pool = self.focus_rows if focused else self.rows
+                row = rng.choices(pool, weights=[r["weight"] for r in pool], k=1)[0]
+                selected.append(dict(row, sampled_fireball_focus=focused))
+            return selected[rank::world_size]
         selected = rng.choices(
             self.rows, weights=[r["weight"] for r in self.rows], k=world_size * self.records_per_rank
         )
@@ -427,6 +449,15 @@ class HogExpertSamplerV4:
                 if self.general else
                 selected_window_mask(sequence.valid_mask, hog_rows, window_steps=self.window_steps, rng=rng)
             )
+            if row.get("sampled_fireball_focus"):
+                from .fireball_focus import focus_frames
+                if focus_frames(shard, index, self.focus) != row["fireball_focus_frames"]:
+                    raise ValueError("fireball context annotations changed after audit")
+                # Keep opening/general context, adding a complete window around
+                # a real Fireball action; retain trusted WAITs and full burn-in.
+                center = rng.choice(row["fireball_focus_frames"])
+                start = max(0, min(sequence.time_steps - self.window_steps, center - self.window_steps // 2))
+                selected[start:start + self.window_steps] |= sequence.valid_mask[start:start + self.window_steps]
             last = int(torch.nonzero(selected[:, 0], as_tuple=False)[-1]) + 1
             # Clip only after the last selected window. All earlier context is
             # preserved, including unsupervised waiting/defense frames.
@@ -456,13 +487,17 @@ class GeneralExpertSamplerV4(HogExpertSamplerV4):
     quality = staticmethod(cached_general_sequence_quality)
 
     def contract(self):
-        return {
+        contract = {
             **super().contract(),
             "schema": "v4-ppo-general-expert-bc.v1",
             "sampling": "stateless-seed-update-rank; opening+uniform-later-time+action-context-if-empty",
             "gate_act_weight": self.gate_act_weight,
             "training_split_only": True,
         }
+        if self.focus is not None:
+            contract.update(schema="v4-ppo-general-expert-bc.v2", focus=self.focus,
+                            sampling="general+probabilistic-focused-records; opening+uniform+moving-Fireball-context")
+        return contract
 
 
 def load_expert_sampler_v4(manifest_path, **kwargs):
@@ -682,6 +717,14 @@ def distributed_expert_bc_update_v4(
         bc_burnin_frames=float(stats[3]),
         bc_win_records=float(stats[4]),
     )
+    if getattr(sampler, "focus", None) is not None:
+        focus_stats = _sum(torch.tensor([
+            sum(bool(x.metadata.get("sampled_fireball_focus")) for x in items),
+            sum(sum(t < x.sequence.time_steps and bool(x.sequence.valid_mask[t, 0])
+                    for t in x.metadata.get("fireball_focus_frames", [])) for x in items),
+        ], device=device, dtype=torch.float64))
+        metrics.update(bc_fireball_focus_records=float(focus_stats[0]),
+                       bc_fireball_moving_frames=float(focus_stats[1]))
     if hog_gate_weight:
         hog_gate_loss = _sum(hog_gate_numerator) / hog_gate_count.clamp_min(1)
         metrics.update(
