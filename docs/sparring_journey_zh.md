@@ -224,6 +224,47 @@ General 的习惯是开局一直等，平均要到双倍圣水（约 120 秒）�
 
 有效的预期接续路线是 General → 早期 `spar16` 的 104 → 纠正后的 `spar16-from104` 及后续续训 → PPO 1208 → 人类 BC 200。错误起点的 `spar16-new` 单独保留，不能混入这条路线。各箭头的实际源身份最终以加载日志、检查点 ID/hash 和 `plan.json` 核对，不能只相信 `.env` 或文件夹名字。
 
+### 6.1.1 104 与 PPO 1208：已知差异和待补证据
+
+104 是用户确认过的“此前经过圣水惩罚、当时已经比较主动”的 PPO 检查点，不是从零训练。PPO 1208 是纠正起点后，在 104 所在路线继续 PPO 的后续模型；两者都还没有加入这次精选 1 万场的新增 BC，该 BC 是后面的 `spar16-human-v1` 试验。
+
+| 项目 | 104 | PPO 1208 所在后续阶段 |
+| --- | --- | --- |
+| 模型架构 | 原 V4，未加入本次讨论的时序改造 | 同一架构，主要改变训练配置并继续更新权重 |
+| 圣水惩罚 | 用户确认训练过；104 当时的确切系数、宽限和计数方式尚未读出 | 后续约定关闭连续满费段惩罚，首牌后整局浪费超过 3 点按 0.01 扣分 |
+| 先手与对手开局 | 104 的实际合同尚未审计 | 后续约定关闭过早先手惩罚；冻结对手 6–20 秒随机超时，20% 豁免 |
+| 法术误激活主塔惩罚 | 未确认 104 是否已经包含 | 后续约定系数 0.1 |
+| 执行延迟/连续动作间隔 | 不把后贴参数直接认定为 104 的实际配置 | 后续提供的参数为 `18-24` / `4-8` tick；新默认 `8-12` 是再后来的代码改动 |
+| 精确训练配置与优化器 | 缺少原阶段参数及检查点合同的实际读出 | 有后续参数讨论和运行日志；仍应读取 1208 合同完成最终核对 |
+| 行为/实力 | 用户反馈出牌已靠前；没有同条件独立评测 | 最近首牌 8/9/10 秒、固定对手约 38/45/38%；不能据此证明每项能力优于 104 |
+
+用户曾回忆过旧参数，如连续溢出惩罚 0.01、宽限 3、过早先手惩罚 0.1、免罚 14 秒及固定对手 20 秒开局超时；这些不能仅因出现在对话较早位置就绑定给 104。现在的 `trainer-options.txt` 也可能已被后来编辑，优先读取检查点 `extra.resume_contract`，再对照 `options-train-20261013-164620.txt`（若存在）、原阶段日志和加载身份。所有未知项保留为未知，不由代码默认值补齐。
+
+训练服务器上可读出两份实际合同（只读，不启动训练）：
+
+```bash
+.venv/bin/python - <<'PY'
+import json
+import torch
+paths = [
+    "runs/spar16/train-20261013-164620/checkpoints/update-00000104.pt",
+    "runs/spar16-from104/train-20261015-055801/checkpoints/update-00001208.pt",
+]
+for path in paths:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    print(json.dumps({
+        "path": path, "checkpoint_id": checkpoint.get("checkpoint_id"),
+        "update_step": checkpoint.get("update_step"),
+        "gate_temperature": checkpoint.get("ppo_gate_temperature"),
+        "has_optimizer": checkpoint.get("optimizer_state_dict") is not None,
+        "resume_contract": checkpoint.get("extra", {}).get("resume_contract"),
+    }, ensure_ascii=False, indent=2))
+    del checkpoint
+PY
+```
+
+文件若已被清理，需要从保留副本读取；没有原文件/原日志就不能完整还原对应阶段配置。更新编号本身不能证明 104 与 1208 之间恰好训练了多少次。
+
 ### 6.2 配置与基础设施的关键变化
 
 - 训练执行延迟保留 `18-24` tick；表示到引擎执行出牌，不含兵种部署或法术飞行。官方约一秒与此范围接近，实战是否更慢尚未实测确认。
