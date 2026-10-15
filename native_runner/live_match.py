@@ -111,6 +111,28 @@ def form_availability_of(capture: Mapping[str, Any], owner: int, seen: FormsSeen
     return tuple(masks)
 
 
+def tower_troop_of(capture: Mapping[str, Any], owner: int) -> int:
+    """Use exact public tower runtime, rather than assuming every live match is Princess.
+
+    Chef belongs to the King Tower and Duchess to side towers. Their native
+    runtime snapshots explicitly identify the type; no image/HP heuristic is used.
+    The existing Princess default is retained when neither special runtime is present.
+    """
+    special = set()
+    for item in (capture.get("rich") or {}).get("objects", ()):
+        if int(item.get("owner", -1)) != owner or int(item.get("cardId", 0)) != -1:
+            continue
+        runtime = item.get("towerTroopRuntime") or {}
+        kind = runtime.get("kind")
+        if kind == "royal_chef":
+            special.add(159_000_004)
+        elif kind == "dagger_duchess":
+            special.add(159_000_002)
+    if len(special) > 1:
+        raise RunnerError(f"owner {owner} has conflicting live Tower Troop runtimes: {sorted(special)}")
+    return next(iter(special), 159_000_000)
+
+
 def match_config_from_capture(capture: Mapping[str, Any], seen: FormsSeen | None = None) -> MatchConfig:
     """The MatchConfig BattleEnvV1 needs, read from one live capture (plus forms seen earlier)."""
 
@@ -121,6 +143,8 @@ def match_config_from_capture(capture: Mapping[str, Any], seen: FormsSeen | None
         deck1=deck_of(capture, 1),
         deck0_form_availability=form_availability_of(capture, 0, seen),
         deck1_form_availability=form_availability_of(capture, 1, seen),
+        tower_troop0_id=tower_troop_of(capture, 0),
+        tower_troop1_id=tower_troop_of(capture, 1),
     )
 
 
@@ -185,6 +209,7 @@ class LiveCaptureNative(_LiveNativeBase):
     """Reads the live battle through the probe's game-thread capture."""
 
     floors: EventFloors | None = None
+    public_card_play_events_from_combat_ring = True
 
     def observe_atomic(self) -> dict[str, Any]:
         command = "live observe-atomic"

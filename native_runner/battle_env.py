@@ -233,6 +233,7 @@ class _PendingRecord:
     inference_end_ms: int
     status: str = "queued"
     server_apply_ms: int | None = None
+    attested_native_sequence: int | None = None
 
 
 @dataclass(slots=True)
@@ -2639,7 +2640,11 @@ class BattleEnvV1:
                         card_id=card_id,
                         effective_card_id=int(runtime["effective_card_id"]),
                         native_effective_card_id=int(runtime["native_effective_card_id"]),
-                        requested_native_tick=before_native_tick,
+                        requested_native_tick=(
+                            int(queued.get("queuedAtTick", before_native_tick))
+                            if getattr(self.native, "reconcile_card_play_receipts", False)
+                            else before_native_tick
+                        ),
                         expected_native_tick=expected,
                         hand_slot=action.hand_slot,
                         card_parameter=int(queued["cardParameter"]),
@@ -2962,7 +2967,11 @@ class BattleEnvV1:
                 if id(item) not in matched_pending
                 and item.action.owner == owner
                 and item.card_id == card_id
-                and abs(item.expected_native_tick - play.tick) <= TICKS_PER_SECOND
+                and (
+                    item.attested_native_sequence == play.sequence
+                    if item.attested_native_sequence is not None
+                    else abs(item.expected_native_tick - play.tick) <= TICKS_PER_SECOND
+                )
             ]
             if nearby:
                 matched = min(
@@ -3977,11 +3986,35 @@ class BattleEnvV1:
     ) -> tuple[_PendingRecord, ...]:
         native_tick = int(raw["tick"])
         resolved: list[_PendingRecord] = []
+        claimed_sequences: set[int] = set()
+        reconcile_receipts = getattr(self.native, "reconcile_card_play_receipts", False)
         for item in self._pending:
             if item.status != "queued":
                 continue
             resolution_tick = item.expected_native_tick
-            if native_tick < item.expected_native_tick:
+            attested_play = None
+            if reconcile_receipts:
+                # Live executeTick is an estimate, not the game's receipt. Match
+                # the actual consume-card event before enforcing that estimate.
+                candidates = [
+                    play
+                    for play in native_public_card_plays
+                    if play.sequence not in claimed_sequences
+                    and item.requested_native_tick <= play.tick <= native_tick
+                    and play.deployment.owner == item.action.owner
+                    and play.deployment.played_card_global_id == item.card_id
+                    and play.deployment.card_parameter == item.card_parameter
+                    and play.deployment.deck_slot == item.deck_slot
+                    and play.deployment.cost == item.cost
+                ]
+                if len(candidates) > 1:
+                    raise BattleEnvError("live card_play receipt is not unique for a pending action")
+                if candidates:
+                    attested_play = candidates[0]
+                    claimed_sequences.add(attested_play.sequence)
+                    item.attested_native_sequence = attested_play.sequence
+                    resolution_tick = attested_play.tick
+            if attested_play is None and native_tick < item.expected_native_tick:
                 continue
             player = _player(raw, item.action.owner)
             same_card = any(
@@ -3991,7 +4024,7 @@ class BattleEnvV1:
                 and int(card.get("deckSlot", -1)) == item.deck_slot
                 for card in player.get("hand", ())
             )
-            item.status = "rejected" if same_card else "executed"
+            item.status = "executed" if attested_play is not None else ("rejected" if same_card else "executed")
             item.server_apply_ms = observed_ms
             resolved.append(item)
             spec = self.card_specs.get(item.card_id)
@@ -4018,6 +4051,15 @@ class BattleEnvV1:
                 "form_code": item.form_code,
                 "native_form_code": item.native_form_code,
             }
+            if attested_play is not None:
+                event_data.update(
+                    source="native_card_play",
+                    native_sequence=attested_play.sequence,
+                    native_event_id=f"{attested_play.state_epoch}:{attested_play.sequence}",
+                    deployment_sequence=attested_play.deployment.deployment_sequence,
+                    execution_attested=True,
+                    observed_native_tick=native_tick,
+                )
             if item.status == "rejected":
                 stored_diagnostic = item.action.metadata.get("rejection_diagnostic")
                 diagnostic = dict(stored_diagnostic) if isinstance(stored_diagnostic, Mapping) else {}

@@ -10,7 +10,7 @@ $repository = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $repository
 
 $python = Get-LocalSetting "CR_PYTHON"
-$checkpoint = "checkpoints/My/update-00001208.pt"
+$checkpoint = "checkpoints/My/update-00000200.pt"
 $autoQueueFlag = if ($NoAutoQueue) { @() } else { @("--auto-queue") }
 
 Write-Host "正在开启实战网络模式并转发控制端口..."

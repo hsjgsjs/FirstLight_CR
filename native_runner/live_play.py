@@ -44,6 +44,8 @@ SEAT_PATH = LIVE_ROOT / "seat.json"
 FIRST_TOUCH_TICK = 94
 LAND_TICKS = 26  # tile touch -> execution, with margin (issue +0..4, then +21)
 DEAL_GUARD_TICKS = 3
+# Keep card input on the short-touch path verified against native deployments.
+# Extra UI sleeps must not become part of the policy's measured execution latency.
 LOST_TAP_TICKS = 60  # a tapped card still in its slot this long after the tap was never taken
 MAX_CONTRACT_REBUILDS = 4  # deck-contract corrections within one battle
 
@@ -152,7 +154,8 @@ class AdbTaps:
         self._run(f"input tap {x} {y}")
 
     def play(self, card: tuple[int, int], tile: tuple[int, int]) -> None:
-        # Sequential `input` commands keep well over the 5 ms the client needs between touches.
+        # Keep the two taps in one shell command; this is the short path used by
+        # the recordings whose card_play events were successfully attested.
         self._run(f"input tap {card[0]} {card[1]} && input tap {tile[0]} {tile[1]}")
 
     def close(self) -> None:
@@ -180,6 +183,9 @@ class LiveTapNative(LiveCaptureNative):
         super().__init__(host, port, timeout=timeout)
         self.layout = layout
         self.taps = taps
+        # Only real input can be reconciled with the game's deployment receipts.
+        self.reconcile_card_play_receipts = taps is not None
+        self.public_card_play_events_from_combat_ring = self.reconcile_card_play_receipts
         self.log = log
         self.seat: int | None = None
         self.generation: int | None = None
@@ -190,6 +196,7 @@ class LiveTapNative(LiveCaptureNative):
         self.last_capture_id = None
         self._slots: dict[int, tuple[int, int, int]] = {}  # handIndex -> (cardId, deckSlot, tick first seen)
         self._tapped: dict[int, tuple[int, int, int]] = {}  # handIndex -> (cardId, deckSlot, tap tick)
+        self.tap_counts = {"sent": 0, "hand_changed": 0, "lost": 0, "skipped": 0}
 
     # -- reading ---------------------------------------------------------------------------
     def observe_atomic(self) -> dict[str, Any]:
@@ -221,7 +228,16 @@ class LiveTapNative(LiveCaptureNative):
             tapped = self._tapped.get(slot)
             if tapped is not None and (tapped[:2] != identity or tick - tapped[2] > LOST_TAP_TICKS):
                 if tapped[:2] == identity:
+                    self.tap_counts["lost"] += 1
                     self.log({"event": "tap_lost", "tick": tick, "slot": slot, "card": identity[0]})
+                    print(f"  警告：tick {tick} 槽位 {slot} 的点击后手牌未变化，可能未生效。", flush=True)
+                else:
+                    self.tap_counts["hand_changed"] += 1
+                    self.log({"event": "tap_hand_changed", "tick": tick, "slot": slot,
+                              "card": tapped[0], "tap_tick": tapped[2], "new_card": identity[0],
+                              "execution_attested": False})
+                    print(f"  tick {tick}: 点击后手牌已轮换（累计 {self.tap_counts['hand_changed']} 次）；"
+                          "实际部署以游戏事件为准。", flush=True)
                 del self._tapped[slot]
 
     # -- acting ----------------------------------------------------------------------------
@@ -260,6 +276,7 @@ class LiveTapNative(LiveCaptureNative):
         tick = self._tick()
         card = next((c for c in self._hand() if int(c["handIndex"]) == action.hand_index), None)
         if card is None:  # BattleEnvV1 only needs the execute tick of a canceled play
+            self.tap_counts["skipped"] += 1
             self.log({"event": "tap_skipped", "tick": tick, "slot": action.hand_index, "reason": "slot is empty"})
             return {"terminalCanceled": True, "executeTick": tick}
         descriptor = _decode_observed_hand_card(card)
@@ -277,6 +294,7 @@ class LiveTapNative(LiveCaptureNative):
         }
         reason = self._blocked(action.hand_index, tick)
         if reason is not None:
+            self.tap_counts["skipped"] += 1
             self.log({"event": "tap_skipped", "tick": tick, "slot": action.hand_index, "card": receipt["cardId"],
                       "reason": reason})
             return {**receipt, "terminalCanceled": True, "executeTick": tick}
@@ -290,6 +308,7 @@ class LiveTapNative(LiveCaptureNative):
         after = self._tick()
         self.play_gap.commit(action.owner, after)
         self._tapped[action.hand_index] = (receipt["cardId"], receipt["deckSlot"], after)
+        self.tap_counts["sent"] += 1
         self.log({"event": "tap", "tick": tick, "after_tick": after, "slot": action.hand_index,
                   "card": receipt["cardId"], "world": [action.x, action.y], "screen": [card_point, tile_point],
                   "input_ms": round((time.perf_counter() - started) * 1000), "dry_run": self.taps is None,
@@ -370,18 +389,32 @@ def wait_for_battle(
     *,
     periodic_action: Callable[[], None] | None = None,
     periodic_interval_s: float = 18.0,
+    timeout_s: float = 90.0,
 ) -> int:
-    """The generation of a running battle (a new one when ``skip_generation`` is given)."""
+    """Wait for a validated running battle, with a bounded startup timeout."""
 
     last_periodic = time.monotonic()
+    deadline = last_periodic + timeout_s
+    last_error = None
     while True:
+        if time.monotonic() >= deadline:
+            raise RunnerError(f"{timeout_s:g} 秒内未取得可用对局观测；已停止等待且未点击界面。最近错误：{last_error}")
         first = control._request("live status")
         time.sleep(0.5)
         second = control._request("live status")
         running = second.get("attached") and int(second.get("tick", -1)) > int(first.get("tick", -1))
         generation = int(second.get("generation", -1))
-        if running and generation == int(first.get("generation", -2)) and generation != skip_generation:
-            return generation
+        if running and int(second.get("tick", -1)) >= FIRST_TOUCH_TICK and generation == int(first.get("generation", -2)) and generation != skip_generation:
+            # A controller can advance during loading/teardown with no readable
+            # players. Only a validated battle capture permits model startup.
+            try:
+                capture = control._validate_atomic_result(control._request("live observe-atomic"))
+                if int(capture["generation"]) == generation:
+                    return generation
+            except RunnerError as error:
+                if str(error) != last_error:
+                    print(f"等待完整对局观测（不点击界面）：{error}")
+                last_error = str(error)
         if periodic_action is not None and (time.monotonic() - last_periodic) >= periodic_interval_s:
             periodic_action()
             last_periodic = time.monotonic()
@@ -456,6 +489,9 @@ def play_battle(
             "dry_run": taps is None, "sample": not getattr(args, "deterministic", False),
             "gate_temperature": getattr(model, "ppo_gate_temperature", None),
             "min_play_gap_ticks": getattr(args, "min_play_gap_ticks", DEFAULT_PLAY_GAP_TICKS),
+            "input_method": "input_tap",
+            "card_selection_gap_seconds": 0.0,
+            "touch_hold_ms": 0,
             "adb_serial": setting("CR_ADB_SERIAL"),
             "source_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
         })
@@ -553,8 +589,8 @@ def play_battle(
                 timing.observe(env.deployment_timing_events(seat), observation.tick)
             if all(terms.values()) or all(truncs.values()):
                 summary["result"] = "terminated"
+                summary["terminal"] = observation.terminal.to_dict()
                 if recording is not None:
-                    summary["terminal"] = observation.terminal.to_dict()
                     recording.submit("policy_frame", observation.to_dict(), tick=observation.tick,
                                      capture_id=native.last_capture_id, recurrent_episode=summary["rebuilds"],
                                      terminal=True)
@@ -590,7 +626,8 @@ def play_battle(
                     episode.close()
                 episode = None
     except (RunnerError, BattleEnvError) as error:
-        summary["result"] = f"battle over or lost: {error}"
+        summary["result"] = "error"
+        summary["error"] = str(error)
     except BaseException as error:
         summary["result"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "error"
         summary["error"] = str(error)
@@ -601,6 +638,7 @@ def play_battle(
                 episode.close()
             if timing is not None:
                 timing.finish()
+            summary["tap_counts"] = dict(native.tap_counts)
             log({"event": "end", **summary})
             screenshot("end")
         finally:
@@ -701,36 +739,37 @@ def run(args: argparse.Namespace) -> None:
     auto_queue = getattr(args, "auto_queue", False)
     tab_x, tab_y = round(width * 0.5000), round(height * 0.9375)
     battle_x, battle_y = round(width * 0.5000), round(height * 0.7637)
-    confirm_x, confirm_y = round(width * 0.6500), round(height * 0.6000)
 
-    def maybe_requeue() -> None:
-        if auto_queue and taps is not None:
-            print("【全自动】检测到仍在匹配或等待中，重新切回大厅并点击「对战」……")
+    # Queue only once. A timeout or a failed observation is never evidence that
+    # the game is in the lobby; periodic blind clicks can interrupt a real match.
+    try:
+        initial_status = control._request("live status")
+        if auto_queue and taps is not None and not initial_status.get("attached"):
+            print("【单次匹配】点击大厅对战按钮；等待期间不会重复点击。")
             taps.tap(tab_x, tab_y)
             time.sleep(0.8)
             taps.tap(battle_x, battle_y)
-            time.sleep(1.0)
-            taps.tap(confirm_x, confirm_y)
-
-    if auto_queue and taps is not None:
-        print("【全自动模式已就绪】切回大厅并点击「对战」按钮，开始匹配……")
-        taps.tap(tab_x, tab_y)
-        time.sleep(0.8)
-        taps.tap(battle_x, battle_y)
-        time.sleep(1.0)
-        taps.tap(confirm_x, confirm_y)
-
-    try:
-        while args.games == 0 or played < args.games:
-            prompt = "【全自动】等待匹配进入对局……" if auto_queue else "等待对局……（在手机上向 MuMu 账号发起友谊战或在模拟器点击对战）"
-            print(prompt)
-            last = wait_for_battle(control, last, periodic_action=maybe_requeue if auto_queue else None)
+        elif auto_queue and initial_status.get("attached"):
             try:
-                play_battle(model, args, layout, taps)
-                played += 1
+                control._validate_atomic_result(control._request("live observe-atomic"))
+            except RunnerError as error:
+                raise RunnerError("接口报告 attached，但完整对局观测不可读，可能是大厅动画。"
+                                  "为避免误点已停止；请确认大厅后单次点击对战，用不带 --auto-queue 的命令接管。") from error
+            print("已验证完整对局观测，直接接管，不点击大厅或匹配按钮。")
+
+        while args.games == 0 or played < args.games:
+            print("等待对局……（等待期间不发送界面点击）")
+            last = wait_for_battle(control, last)
+            try:
+                summary = play_battle(model, args, layout, taps)
             except (RunnerError, BattleEnvError) as error:
-                print(f"对局未能正常开始或提前结束（{error}），继续等待下一局……")
-            if auto_queue and taps is not None:
+                print(f"对局初始化失败：{error}。已停止自动点击，不返回大厅、不重新匹配。")
+                raise
+            terminal = summary.get("terminal") or {}
+            if summary.get("result") != "terminated" or not terminal.get("ended"):
+                raise RunnerError(f"对局控制失败，停止自动点击并保留录制：{summary}")
+            played += 1
+            if auto_queue and taps is not None and (args.games == 0 or played < args.games):
                 auto_return_to_lobby_and_queue(taps, width, height, control)
     finally:
         try:

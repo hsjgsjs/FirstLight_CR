@@ -132,6 +132,7 @@ def test_play_battle_recording_preserves_terminal_and_closes_on_setup_failure(tm
         ordinary = {}
         last_capture_id = None
         capture_micros = 10
+        tap_counts = {"sent": 0, "hand_changed": 0, "lost": 0, "skipped": 0}
 
         def observe_atomic(self):
             capture = {"tick": 90, "generation": 7, "ordinary": {"players": [

@@ -19,6 +19,8 @@ venv/
 /user-provided/
 
 # Local deployment configuration; publish only the blank template.
+# Local update bundle may contain deployment configuration or recordings.
+/nr-update.tar
 .env
 .env.*
 !.env.example
