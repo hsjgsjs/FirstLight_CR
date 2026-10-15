@@ -251,3 +251,15 @@ def test_prepared_trial_pins_optimizer_and_continues_temperature(tmp_path):
     with pytest.raises(ValueError, match="whitespace"):
         continuation_options('--fixed-opponent-checkpoint "path with spaces.pt"',
                              torch.load(checkpoint, weights_only=False))
+    # Changing the play rhythm must not restart temperature annealing or Adam.
+    changed = tmp_path / "slower-trial"
+    options.write_text(options.read_text() + " --min-play-gap-ticks=4-8")
+    slower = prepare_experiment(checkpoint, options, manifests / "train.json", changed,
+                               min_play_gap_ticks=(8, 12))
+    changed_control = (changed / "ppo-options.txt").read_text().split()
+    changed_human = (changed / "human-options.txt").read_text().split()
+    assert slower["min_play_gap_ticks"] == [8, 12]
+    assert slower["starting_gate_temperature"] == plan["starting_gate_temperature"]
+    assert changed_control == control + ["--min-play-gap-ticks", "8-12"]
+    assert changed_human[:len(changed_control)] == changed_control
+    assert (changed / "baseline.pt").read_bytes() == checkpoint.read_bytes()

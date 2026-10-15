@@ -61,7 +61,7 @@ def test_duel_infers_both_owners_and_consumes_force_request(monkeypatch, tmp_pat
 
         return SimpleNamespace(start_episode=lambda *_args, **_kwargs: None, end_episode=lambda: None, decide=decide)
 
-    monkeypatch.setattr(offline_duel, "NativeClashEnv", lambda *_args, **_kwargs: Native())
+    monkeypatch.setattr(offline_duel, "SpacedRenderNativeV4", lambda *_args, **_kwargs: Native())
     monkeypatch.setattr(offline_duel, "BattleEnvV1", lambda **_kwargs: Environment())
     monkeypatch.setattr(
         offline_duel,

@@ -12,6 +12,6 @@
   "deterministic": false,
   "gate_temperature": null,
   "delay_ticks": 0,
-  "min_play_gap_ticks": null,
+  "min_play_gap_ticks": "8-12",
   "max_score_drop": 0.05
 }

@@ -20,6 +20,7 @@ from torch import Tensor
 
 from ...battle_env import TICKS_PER_SECOND, _elixir_generated_raw
 from ...contracts import ActionKind, ActionV1
+from ...play_timing import parse_play_gap_ticks
 from ...match_factory import NATIVE_GAMEPLAY_END_TICK
 from .cluster_self_play import (
     ClusterCollectionV4,
@@ -752,17 +753,6 @@ def space_plays_v4(
             last_landing_tick = landing
         spaced.append(action)
     return tuple(spaced), last_landing_tick
-
-
-def parse_play_gap_ticks(value: str) -> tuple[int, int]:
-    low, _, high = value.strip().partition("-")
-    try:
-        bounds = (int(low), int(high or low))
-    except ValueError:
-        raise ValueError("play gap must be N or MIN-MAX ticks, e.g. 4-8") from None
-    if not 1 <= bounds[0] <= bounds[1] <= 200:
-        raise ValueError("play gap must be 1 <= MIN <= MAX <= 200 ticks")
-    return bounds
 
 
 @dataclass(frozen=True, slots=True)

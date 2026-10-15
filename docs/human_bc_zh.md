@@ -114,3 +114,31 @@ bash native_runner/training/v4/lab_ppo.sh start spar16-ppo-control-v1 200
 比较 `baseline.pt`、纯 PPO 对照、PPO 加人类数据模型。在相同卡组、种子、双方位置、推理方式和延迟下，对同一组固定对手评测。训练最后 256 场统计和模仿损失都不能代替该比较。现有 `duel.sh` 是开局干预配对评测，不能直接把它的 forced/natural 差值当作这次模型提升。
 
 同时亲手对战观察错误落点、防守、圣水管理和何时等待。首牌时间无需强行接近一个数值。若混合路线没有收益或出现退化，保留 baseline/对照，调整模仿频率、数据构成或监督窗口后再试；有收益才延长，或者关闭 BC 再继续 PPO 验证收益能否保留。
+
+## 连续出牌间隔与提前量
+
+新训练的默认 `--min-play-gap-ticks 8-12` 把同一方的连续出牌/技能间隔设为 0.4–0.6 游戏秒。它独立于 `--execution-delay-ticks 18-24`：首次出牌仍使用原有执行延迟，只有排得过近的后续动作会继续推迟。离线人机/双模型对战及 `live_play run` 默认采用同样的间隔范围，可通过 `--min-play-gap-ticks` 覆盖。
+
+已经运行的试验保存了旧参数，更新代码不会改变它。为保留当前温度和剩余退火进度，先让当前 200 次试验结束或正常停止，再从最新检查点准备新阶段：
+
+```bash
+source_checkpoint="$(rg --files --no-ignore runs/spar16-human-v1 -g 'update-*.pt' | sort | tail -n 1)"
+.venv/bin/python -m native_runner.training.v4.prepare_expert_experiment \
+  --checkpoint "$source_checkpoint" \
+  --trainer-options runs/spar16-human-v1/trainer-options.txt \
+  --expert-manifest runs/human-experts-v1/train.json \
+  --min-play-gap-ticks 8-12 \
+  --output runs/human-trial-gap-v2
+
+CR_PPO_CHECKPOINT="$PWD/runs/human-trial-gap-v2/baseline.pt" \
+CR_PPO_RESUME_CHECKPOINT="" \
+CR_PPO_EXTRA_ARGS="$(cat runs/human-trial-gap-v2/human-options.txt)" \
+CR_LAB_KEEP_CHECKPOINTS=100 \
+bash native_runner/training/v4/lab_ppo.sh start spar16-human-gap-v2 200
+```
+
+两份生成参数都使用 `8-12`；优化器、当前温度和剩余退火进度从检查点接续，其他原对手、奖励和延迟配置保留。新目录保留旧试验作比较；`200` 是新阶段的更新上限。更改间隔后的结果不适合直接当作仅改变 BC 的对照。
+
+也可用 `options 名字 --min-play-gap-ticks 8-12` 改已有运行，再 `resume`；但这种改参数后的热启动会按保存的起始温度重新计数退火，需要保留退火进度时采用上面的准备入口。
+
+火球命中移动目标和下兵拉扯都依赖提前量，但涉及的延迟不同：火球还包含飞行时间，下兵还包含部署时间和敌方转移目标的时机。稳定且一致的时序有利于 PPO 学习更早行动；只增加训练轮次不能保证改善。人类 BC 保留原录像动作时机，没有自动改写成更早的动作。后续专项应固定移动目标和速度，分别记录命中率、拉扯成功率与正常对战表现，并保留该等待的样本，避免只学会过早出牌。

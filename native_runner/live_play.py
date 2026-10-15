@@ -30,6 +30,7 @@ from .cr_native_env import NativeClashEnv, RunnerError, _decode_observed_hand_ca
 from .live_diagnose import CONTROL_HOST, CONTROL_PORT, _adb
 from .live_match import LiveCaptureNative
 from .paths import WORKSPACE_ROOT
+from .play_timing import DEFAULT_PLAY_GAP_TICKS, PlayGapClock, parse_play_gap_ticks
 
 LIVE_ROOT = WORKSPACE_ROOT / "runs" / "live"
 LAYOUT_PATH = LIVE_ROOT / "layout.json"
@@ -173,6 +174,7 @@ class LiveTapNative(LiveCaptureNative):
         taps: AdbTaps | None,
         log: Callable[[dict[str, Any]], None],
         timeout: float = 10.0,
+        min_play_gap_ticks: tuple[int, int] = DEFAULT_PLAY_GAP_TICKS,
     ) -> None:
         super().__init__(host, port, timeout=timeout)
         self.layout = layout
@@ -182,6 +184,7 @@ class LiveTapNative(LiveCaptureNative):
         self.generation: int | None = None
         self.ordinary: Mapping[str, Any] | None = None
         self.capture_micros: int | None = None  # game-thread time of the probe's last capture
+        self.play_gap = PlayGapClock(min_play_gap_ticks, seed="live-taps")
         self._slots: dict[int, tuple[int, int, int]] = {}  # handIndex -> (cardId, deckSlot, tick first seen)
         self._tapped: dict[int, tuple[int, int, int]] = {}  # handIndex -> (cardId, deckSlot, tap tick)
 
@@ -232,6 +235,23 @@ class LiveTapNative(LiveCaptureNative):
             return "dealt too recently to be touched"
         return None
 
+    def _wait_for_play_gap(self, owner: int, tick: int) -> int:
+        target = self.play_gap.next_tick(owner, tick)
+        deadline = time.monotonic() + max(5.0, (target - tick) * 0.05 + 2.0)
+        if tick < target:
+            self.log({"event": "play_gap_wait", "tick": tick, "until_tick": target, "owner": owner})
+        while tick < target:
+            status = self.observe()
+            if status["ended"]:
+                raise RunnerError("battle ended while waiting for the next tap")
+            tick = int(status["tick"])
+            if tick >= target:
+                break
+            if time.monotonic() >= deadline:
+                raise RunnerError("live battle clock stopped while waiting for the next tap")
+            time.sleep(0.01)
+        return tick
+
     def _play(self, action: Any) -> dict[str, Any]:
         assert self.seat is not None and action.owner == self.seat
         tick = self._tick()
@@ -257,12 +277,15 @@ class LiveTapNative(LiveCaptureNative):
             self.log({"event": "tap_skipped", "tick": tick, "slot": action.hand_index, "card": receipt["cardId"],
                       "reason": reason})
             return {**receipt, "terminalCanceled": True, "executeTick": tick}
+        tick = self._wait_for_play_gap(action.owner, tick)
+        receipt["queuedAtTick"] = tick
         card_point = tuple(round(v) for v in self.layout.hand[action.hand_index])
         tile_point = self.layout.world_point(action.x, action.y, self.seat)
         started = time.perf_counter()
         if self.taps is not None:
             self.taps.play(card_point, tile_point)
         after = self._tick()
+        self.play_gap.commit(action.owner, after)
         self._tapped[action.hand_index] = (receipt["cardId"], receipt["deckSlot"], after)
         self.log({"event": "tap", "tick": tick, "after_tick": after, "slot": action.hand_index,
                   "card": receipt["cardId"], "world": [action.x, action.y], "screen": [card_point, tile_point],
@@ -277,10 +300,12 @@ class LiveTapNative(LiveCaptureNative):
 
     def queue_ability_action_at(self, action: Any, *, execute_in_ticks: int = 1) -> dict[str, Any]:
         tick = self._tick()
+        tick = self._wait_for_play_gap(action.owner, tick)
         point = tuple(round(v) for v in self.layout.ability)
         if self.taps is not None and tick >= FIRST_TOUCH_TICK:
             self.taps.tap(*point)
         after = self._tick()
+        self.play_gap.commit(action.owner, after)
         self.log({"event": "ability_tap", "tick": tick, "screen": point, "dry_run": self.taps is None})
         return {
             "tick": tick,
@@ -372,13 +397,14 @@ def play_battle(
 
     factory = native_factory or (lambda **kw: LiveTapNative(CONTROL_HOST, CONTROL_PORT, **kw))
     native = factory(layout=layout, taps=taps, log=log)
+    native.play_gap = PlayGapClock(getattr(args, "min_play_gap_ticks", DEFAULT_PLAY_GAP_TICKS), seed="live-taps")
     first = native.observe_atomic()
     seat = choose_seat(first, args.owner, args.account_id)
     if not recorded:
         remember_seat(first, seat)
     native.seat = seat
     log({"event": "start", "tick": first["tick"], "seat": seat, "players": players_of(first),
-         "checkpoint": args.checkpoint, "layout": asdict(layout)})
+         "checkpoint": args.checkpoint, "layout": asdict(layout), "min_play_gap_ticks": native.play_gap.bounds})
     print(f"对局开始（tick {first['tick']}），模型操作 owner {seat}；日志 {path}")
     summary: dict[str, Any] = {"log": str(path), "decisions": 0, "taps": 0, "rebuilds": 0}
 
@@ -467,6 +493,15 @@ class RecordedTapNative(LiveTapNative):
         self.full_rings = full_rings
         self.index = 0
         self.moved = False
+
+    def _wait_for_play_gap(self, owner: int, tick: int) -> int:
+        # Recorded time advances by captures, never by wall-clock sleep.
+        target = self.play_gap.next_tick(owner, tick)
+        while tick < target:
+            self.index += 1
+            self.moved = False
+            tick = self._tick()
+        return tick
 
     def _request(self, command: str, **_: Any) -> dict[str, Any]:
         from .live_match import trim_event_rings
@@ -645,6 +680,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             command.add_argument("--device", default=None, help="cuda or cpu (default: cuda when available)")
             command.add_argument("--games", type=int, default=0, help="battles to play (0: until stopped)")
             command.add_argument("--dry-run", action="store_true", help="decide and log, but do not tap")
+            command.add_argument("--min-play-gap-ticks", type=parse_play_gap_ticks, default=DEFAULT_PLAY_GAP_TICKS,
+                                 help="minimum gap between plays/abilities, in game ticks (default: 8-12 = 0.4-0.6 s)")
             command.add_argument("--deterministic", action="store_true",
                                  help="always take the most likely action (rarely plays; default samples)")
             command.add_argument("--gate-temperature", type=float,

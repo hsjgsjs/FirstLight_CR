@@ -16,14 +16,15 @@ from ...cr_native_env import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     NATIVE_RENDER_SPEEDS,
-    NativeClashEnv,
     RunnerError,
 )
+from ...play_timing import DEFAULT_PLAY_GAP_TICKS, parse_play_gap_ticks
 from ...match_factory import MatchConfig
 from ...rich_telemetry_adapter import RuntimeEffectCatalog
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .policy_session import build_policy_session_v4, load_policy_v4
+from .render_timing import SpacedRenderNativeV4
 
 
 def _rendered_action(action: ActionV1) -> ActionV1:
@@ -51,6 +52,7 @@ def run_offline_match(
     device: str = "cpu",
     sample: bool = True,
     speed: float = 1.0,
+    min_play_gap_ticks: tuple[int, int] = DEFAULT_PLAY_GAP_TICKS,
     artifact_dir: Path,
     should_stop: Callable[[], bool] = lambda: False,
     on_ready: Callable[[dict], None] = lambda _info: None,
@@ -64,7 +66,9 @@ def run_offline_match(
         (artifact_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
         return result
     bundle = production_semantic_bundle()
-    native = NativeClashEnv(host, port, timeout=30.0)
+    native = SpacedRenderNativeV4(
+        host, port, timeout=30.0, min_play_gap_ticks=min_play_gap_ticks, timing_seed=match.seed,
+    )
     native.public_card_play_events_from_combat_ring = True
     environment = BattleEnvV1(
         native=native,
@@ -102,6 +106,7 @@ def run_offline_match(
             "checkpoint_sha256": loaded.checkpoint_sha256,
             "actor_owner": actor_owner,
             "human_owner": 1 - actor_owner,
+            "min_play_gap_ticks": min_play_gap_ticks,
             "match": asdict(match),
         }
         (artifact_dir / "identity.json").write_text(json.dumps(identity, indent=2), encoding="utf-8")
@@ -170,6 +175,7 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--speed", type=float, default=1.0)
+    parser.add_argument("--min-play-gap-ticks", type=parse_play_gap_ticks, default=DEFAULT_PLAY_GAP_TICKS)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--artifact-dir", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -189,6 +195,7 @@ def main(argv=None) -> int:
         device=args.device,
         sample=not args.deterministic,
         speed=args.speed,
+        min_play_gap_ticks=args.min_play_gap_ticks,
         artifact_dir=args.artifact_dir,
         should_stop=lambda: (args.artifact_dir / "stop").exists(),
         on_ready=ready,

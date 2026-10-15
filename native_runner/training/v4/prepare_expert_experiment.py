@@ -12,8 +12,10 @@ from pathlib import Path
 import shlex
 import shutil
 
+from ...play_timing import parse_play_gap_ticks
 
-def continuation_options(text, payload):
+
+def continuation_options(text, payload, *, min_play_gap_ticks=None):
     contract = payload.get("extra", {}).get("resume_contract", {})
     if "gate_temperature_anneal_updates" not in contract:
         raise ValueError("source must be a strict PPO checkpoint with a saved temperature schedule")
@@ -23,6 +25,8 @@ def continuation_options(text, payload):
     if not 0 < end <= temperature:
         raise ValueError("invalid source temperature schedule")
     removed = {"--gate-temperature-start", "--gate-temperature-end", "--gate-temperature-anneal-updates"}
+    if min_play_gap_ticks is not None:
+        removed.add("--min-play-gap-ticks")
     tokens, kept = shlex.split(text), []
     i = 0
     while i < len(tokens):
@@ -42,13 +46,19 @@ def continuation_options(text, payload):
         "--gate-temperature-start", str(temperature), "--gate-temperature-end", str(end),
         "--gate-temperature-anneal-updates", str(remaining),
     ])
+    if min_play_gap_ticks is not None:
+        low, high = min_play_gap_ticks
+        gap = f"{low}-{high}"
+        parse_play_gap_ticks(gap)
+        kept.extend(["--min-play-gap-ticks", gap])
     # lab_ppo's launcher deliberately splits options on whitespace.
     if any(any(c.isspace() for c in token) for token in kept):
         raise ValueError("lab trainer option paths must not contain whitespace; use a symlink")
     return kept
 
 
-def prepare_experiment(checkpoint, trainer_options, manifest, output, *, coefficient=0.1, every_updates=4):
+def prepare_experiment(checkpoint, trainer_options, manifest, output, *, coefficient=0.1, every_updates=4,
+                       min_play_gap_ticks=None):
     import torch
     from .checkpoint import CHECKPOINT_SCHEMA_V4
 
@@ -67,7 +77,7 @@ def prepare_experiment(checkpoint, trainer_options, manifest, output, *, coeffic
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if payload.get("schema") != CHECKPOINT_SCHEMA_V4 or payload.get("optimizer_state_dict") is None:
         raise ValueError("experiment requires a strict PPO checkpoint with optimizer state")
-    tokens = continuation_options(Path(trainer_options).read_text(), payload)
+    tokens = continuation_options(Path(trainer_options).read_text(), payload, min_play_gap_ticks=min_play_gap_ticks)
     human_tokens = tokens + [
         "--expert-bc-manifest", str(manifest), "--expert-bc-coefficient", str(coefficient),
         "--expert-bc-every-updates", str(every_updates),
@@ -84,6 +94,8 @@ def prepare_experiment(checkpoint, trainer_options, manifest, output, *, coeffic
         warm_start_optimizer=True, starting_gate_temperature=payload["ppo_gate_temperature"],
         bc_coefficient=coefficient, bc_every_updates=every_updates,
     )
+    if min_play_gap_ticks is not None:
+        plan["min_play_gap_ticks"] = list(min_play_gap_ticks)
     (output / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return plan
 
@@ -96,9 +108,12 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--coefficient", type=float, default=0.1)
     parser.add_argument("--every-updates", type=int, default=4)
+    parser.add_argument("--min-play-gap-ticks", type=parse_play_gap_ticks,
+                        help="override consecutive-action gaps while preserving the checkpoint's temperature schedule")
     args = parser.parse_args(argv)
     plan = prepare_experiment(args.checkpoint, args.trainer_options, args.expert_manifest, args.output,
-                              coefficient=args.coefficient, every_updates=args.every_updates)
+                              coefficient=args.coefficient, every_updates=args.every_updates,
+                              min_play_gap_ticks=args.min_play_gap_ticks)
     print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
     return 0
 

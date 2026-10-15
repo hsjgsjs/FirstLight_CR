@@ -1,6 +1,7 @@
 import json
+from types import SimpleNamespace
 
-from native_runner.duel import completed_history, evaluation_key, split_blocks
+from native_runner.duel import completed_history, evaluation_key, read_options, split_blocks
 
 
 def options(tmp_path):
@@ -79,3 +80,16 @@ def test_legacy_checkpoint_overwrite_is_not_reused(tmp_path):
     write_run(tmp_path, settings, key, legacy=True)
     (tmp_path / 'model.pt').write_bytes(b'new weights')
     assert completed_history(tmp_path, settings, evaluation_key(settings)) == set()
+
+
+def test_legacy_null_gap_uses_current_default_and_custom_gap_is_preserved(tmp_path):
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"weights")
+    settings = dict(checkpoint_a=str(checkpoint), checkpoint_b=str(checkpoint), min_play_gap_ticks=None)
+    config = tmp_path / "duel.json"
+    args = SimpleNamespace(checkpoint_a=None, checkpoint_b=None, blocks=None, opening_seconds=None, engines=None)
+    config.write_text(json.dumps(settings))
+    assert read_options(config, args)["min_play_gap_ticks"] == "8-12"
+    settings["min_play_gap_ticks"] = "10-14"
+    config.write_text(json.dumps(settings))
+    assert read_options(config, args)["min_play_gap_ticks"] == "10-14"

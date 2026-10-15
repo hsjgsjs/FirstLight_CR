@@ -15,6 +15,7 @@ import torch
 
 from ...cr_native_env import DEFAULT_HOST, DEFAULT_PORT
 from ...match_factory import MatchConfig
+from ...play_timing import DEFAULT_PLAY_GAP_TICKS
 from .async_cluster_self_play import opening_force_seconds_v4, parse_play_gap_ticks, parse_seconds_range
 from .deck_pool import DeckPoolManifestV4
 from .evaluate import evaluate, sample_deck_pair
@@ -100,7 +101,7 @@ def main(argv=None):
     parser.add_argument("--deterministic", action="store_true", help="argmax decisions; default samples as in training")
     parser.add_argument("--gate-temperature", type=float, help="same override for both models; default uses saved values")
     parser.add_argument("--delay-ticks", type=int, default=0, help="same execution delay for both models")
-    parser.add_argument("--min-play-gap-ticks", type=parse_play_gap_ticks)
+    parser.add_argument("--min-play-gap-ticks", type=parse_play_gap_ticks, default=DEFAULT_PLAY_GAP_TICKS)
     parser.add_argument("--max-score-drop", type=float, default=0.05, help="absolute B score drop threshold; 0.05 = 5 pp")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--plan-only", action="store_true", help="write the schedule without loading models or connecting")

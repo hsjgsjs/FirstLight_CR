@@ -145,7 +145,7 @@ tail runs/schedule.log                                                      # �
 
 ```bash
 bash native_runner/training/v4/lab_ppo.sh options spar16-gw                                   # 查看当前参数，一行一个
-bash native_runner/training/v4/lab_ppo.sh options spar16-gw --min-play-gap-ticks 4-8          # 新增或替换一项
+bash native_runner/training/v4/lab_ppo.sh options spar16-gw --min-play-gap-ticks 8-12          # 新增或替换一项
 bash native_runner/training/v4/lab_ppo.sh options spar16-gw --unset --game-elixir-overflow-grace   # 删除一项
 ```
 
@@ -222,7 +222,7 @@ python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --game
 
 - **做通用对练模型，不做专精。** 对练要什么卡组都能打、打法正常。
 - **训练时加入执行延迟。** 学习者和对手都加，延迟在 18–24 tick 之间随机。
-- **两张牌不能同时落地。** `--min-play-gap-ticks 4-8`：同一方连续两次出牌或技能，落地至少相隔随机 4–8 tick（1 tick = 50 ms，即 200–400 ms），和人手点两张牌的间隔一致。原来一次决策最多能出 2 张牌，而且同一 tick 落地；相邻两次决策各自抽延迟，也可能几乎同时落地。新开的训练默认带上；已有的训练用 `options 名字 --min-play-gap-ticks 4-8` 加上，下一次续训自动热启动。评测器也有同名参数，对双方都生效。
+- **两张牌不能同时落地。** `--min-play-gap-ticks 8-12`：同一方连续两次出牌或技能，落地至少相隔随机 8–12 tick（1 tick = 50 ms，即 400–600 ms）。原来一次决策最多能出 2 张牌，而且同一 tick 落地；相邻两次决策各自抽延迟，也可能几乎同时落地。新开的训练默认带上；已有的训练用 `options 名字 --min-play-gap-ticks 8-12` 加上，下一次续训自动热启动。评测器、离线人机对战、离线双模型对战和实战接管也支持同名参数，默认 8–12 tick。离线对战按引擎回执中的执行时间排队；实战接管按游戏 tick 等待下一次点击。双方时钟独立，首次出牌不额外等待。已有训练的保存参数不会自动迁移。
 - **对手**：自我对战 40%；固定对手 60%，从冻结的 General、Active IL、速猪专精 1 里均匀抽。原版 IL 占 0%（只作为锚点登记，不上场）。原版 IL 很被动，打它学到的是等对方犯错。
 - **连续满费溢出惩罚关闭**：`--personal-elixir-overflow-penalty 0 --personal-elixir-overflow-grace 0`。不开启按连续满费段计算的惩罚。
 - **整局圣水浪费惩罚开启**：`--game-elixir-overflow-penalty 0.01 --game-elixir-overflow-grace 3`。从学习者**第一张牌真正下出之后**开始，把整局满格浪费的圣水累加，超过 3 点后每多浪费 1 点扣 0.01。降到 10 以下不会重置这个整局累计值；首牌前的等待不算在内。`status` 会显示「after the first card」这一行。

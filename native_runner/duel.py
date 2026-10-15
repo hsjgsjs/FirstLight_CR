@@ -38,6 +38,9 @@ def read_options(path, args):
     if not isinstance(saved, dict) or saved.keys() - defaults.keys():
         raise ValueError("配置必须是 JSON 对象，且只能包含 duel.example.json 中的参数名")
     options = {**defaults, **saved}
+    # Older generated configs used null; adopt the current timing by default.
+    if options["min_play_gap_ticks"] is None:
+        options["min_play_gap_ticks"] = defaults["min_play_gap_ticks"]
     for key in ("checkpoint_a", "checkpoint_b", "blocks", "opening_seconds", "engines"):
         if getattr(args, key) is not None:
             options[key] = getattr(args, key)
