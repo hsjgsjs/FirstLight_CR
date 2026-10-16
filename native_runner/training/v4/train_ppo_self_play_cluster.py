@@ -1050,6 +1050,24 @@ def main() -> int:
         default=14.0,
         help="battle time from which opening the game is free (14 s: the starting 5 elixir is full)",
     )
+    parser.add_argument(
+        "--late-opening-penalty",
+        type=float,
+        default=0.0,
+        help="cost per elixir wasted at full before the first card, beyond --late-opening-grace (0=off)",
+    )
+    parser.add_argument(
+        "--late-opening-grace",
+        type=float,
+        default=10.0,
+        help="elixir wasted before the first card exempt from --late-opening-penalty (10: about 28 s at full)",
+    )
+    parser.add_argument(
+        "--late-opening-penalty-cap",
+        type=float,
+        default=0.1,
+        help="most --late-opening-penalty charges in one game, so waiting for double elixir stays a choice",
+    )
     parser.add_argument("--unilateral-elixir-overflow-penalty", type=float, default=0.0)
     parser.add_argument("--elixir-overflow-step-penalty-cap", type=float, default=0.1)
     parser.add_argument("--clip-range", type=float, default=0.1)
@@ -1223,6 +1241,14 @@ def main() -> int:
         and 4.5 < args.early_first_play_free_seconds <= 180.0
     ):
         raise ValueError("early first play penalty must be nonnegative and its free time in (4.5, 180] s")
+    if not (
+        all(
+            math.isfinite(value) and value >= 0.0
+            for value in (args.late_opening_penalty, args.late_opening_grace, args.late_opening_penalty_cap)
+        )
+        and (args.late_opening_penalty == 0.0 or args.late_opening_penalty_cap > 0.0)
+    ):
+        raise ValueError("late opening penalty, grace and cap must be finite and nonnegative, with a positive cap")
     if args.first_hog_deferral_penalty > 0.0 and args.first_hog_deferral_penalty_episode_cap <= 0.0:
         raise ValueError("first-Hog deferral penalty requires a positive episode cap")
     _gate_temperature_for_update(
@@ -1402,6 +1428,11 @@ def main() -> int:
         if args.early_first_play_penalty > 0.0
         else None
     )
+    late_opening = (
+        (args.late_opening_penalty, args.late_opening_grace, args.late_opening_penalty_cap)
+        if args.late_opening_penalty > 0.0
+        else None
+    )
     resume_contract = {
         "schema": "v4-ppo-strict-resume.v1",
         "anchor_checkpoint_id": anchor_state_id,
@@ -1482,6 +1513,8 @@ def main() -> int:
         resume_contract["min_play_gap_ticks"] = list(args.min_play_gap_ticks)
     if early_first_play is not None:
         resume_contract["early_first_play"] = list(early_first_play)
+    if late_opening is not None:
+        resume_contract["late_opening"] = list(late_opening)
     if args.fixed_opponent_opening_force_after_seconds is not None:
         resume_contract["fixed_opponent_opening_force_after_seconds"] = list(
             args.fixed_opponent_opening_force_after_seconds
@@ -1580,6 +1613,7 @@ def main() -> int:
             execution_delay_ticks=args.execution_delay_ticks,
             game_elixir_overflow=game_elixir_overflow,
             early_first_play=early_first_play,
+            late_opening=late_opening,
             min_play_gap_ticks=args.min_play_gap_ticks,
         )
         for engine_index in engine_indices

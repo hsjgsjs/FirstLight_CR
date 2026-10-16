@@ -590,6 +590,11 @@ early = [r["early_first_play_penalty_total"][o] for r, o in seats if "early_firs
 if early and any(early):
     print(f"  opened the game early: {sum(value > 0 for value in early) / len(early):.0%} of games, "
           f"mean penalty {statistics.mean(early):.3f}")
+# Only tracked when --late-opening-penalty is on: games the learner leaked past the grace before its first card.
+late = [r["late_opening_penalty_total"][o] for r, o in seats if "late_opening_penalty_total" in r]
+if late and any(late):
+    print(f"  late opening charged: {sum(value > 0 for value in late) / len(late):.0%} of games, "
+          f"mean penalty {statistics.mean(late):.3f}")
 # Only with --fixed-opponent-opening-force-after-seconds: fixed opponents made to open the game.
 frozen = [r for r in recent if r["policy_matchup"] == "current-history"]
 eligible = [r for r in frozen if "opening_force_exempt" in r
