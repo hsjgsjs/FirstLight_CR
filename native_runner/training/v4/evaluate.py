@@ -440,6 +440,8 @@ def _evaluate_resident(
     delay_b_ticks,
     min_play_gap_ticks,
     resident_lanes=None,
+    trace_dir=None,
+    checkpoint_ids=None,
 ):
     """Play a paired schedule on one engine's resident slots.
 
@@ -467,9 +469,12 @@ def _evaluate_resident(
     )
     rows = []
     open_sessions = []
+    tracer = None if trace_dir is None else TraceWriter(Path(trace_dir))
     try:
         for native in engine.natives:
             native.public_card_play_events_from_combat_ring = True
+        for environment in engine.environments:
+            environment.record_privileged_combat = tracer is not None
         engine.prepare()
         with (output / "matches.jsonl").open("w", encoding="utf-8", buffering=1) as log:
             with ThreadPoolExecutor(max_workers=lane_count, thread_name_prefix="eval-lane") as executor:
@@ -485,6 +490,20 @@ def _evaluate_resident(
                                 torch.Generator(device="cpu").manual_seed(case.match.seed).get_state()
                             )
                         observations, _info = environment.reset(match_config=case.match, options=_RESET_OPTIONS)
+                        if tracer is not None:
+                            tracer.start(
+                                wave_start + offset,
+                                {
+                                    "seed": case.match.seed,
+                                    "a_owner": case.a_owner,
+                                    "checkpoint_ids": checkpoint_ids,
+                                    "deck_ids": case.deck_ids,
+                                    "case": case.metadata(),
+                                },
+                            )
+                            tracer.write(
+                                wave_start + offset, observations, environment.drain_privileged_combat_records()
+                            )
                         elixir = {
                             owner: next(player.elixir_exact for player in obs.players if player.owner == owner)
                             for owner, obs in observations.items()
@@ -598,11 +617,17 @@ def _evaluate_resident(
                         for lane, (observations, _rewards, terms, truncs, _info) in stepped:
                             lane.observations = observations
                             _absorb_step(observations, lane.first_card_tick, lane.rejected)
+                            if tracer is not None:
+                                tracer.write(
+                                    lane.index, observations, lane.environment.drain_privileged_combat_records()
+                                )
                             lane.terminated = bool(terms["__all__"])
                             lane.truncated = bool(truncs["__all__"])
                             if not (lane.terminated or lane.truncated):
                                 continue
                             lane.active = False
+                            if tracer is not None:
+                                tracer.close(lane.index)
                             row = _match_row(
                                 game_index=lane.index,
                                 seed=lane.seed,
@@ -632,6 +657,8 @@ def _evaluate_resident(
         (output / "summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
     finally:
+        if tracer is not None:
+            tracer.close()
         flush_timing()
         for session in open_sessions:
             session.end_episode()
@@ -662,8 +689,6 @@ def evaluate(
 ):
     if games < 1:
         raise ValueError("games must be positive")
-    if trace_dir is not None and schedule is not None:
-        raise ValueError("combat traces are recorded only on the JSON transport, without a paired schedule")
     _delay_bounds(delay_a_ticks)
     _delay_bounds(delay_b_ticks)
     if resident_lanes is not None and (isinstance(resident_lanes, bool) or resident_lanes not in range(1, 17)):
@@ -723,6 +748,8 @@ def evaluate(
             delay_b_ticks=delay_b_ticks,
             min_play_gap_ticks=min_play_gap_ticks,
             resident_lanes=resident_lanes,
+            trace_dir=trace_dir,
+            checkpoint_ids=[policy.checkpoint_id for policy in policies],
         )
     bundle = production_semantic_bundle()
     native = NativeClashEnv(host, port, timeout=30.0)
@@ -790,7 +817,7 @@ def evaluate(
                             "deck_ids": pair_ids,
                         },
                     )
-                    tracer.write(observations, environment.drain_privileged_combat_records())
+                    tracer.write(index, observations, environment.drain_privileged_combat_records())
                 sessions = [
                     build_policy_session_v4(
                         environment,
@@ -832,9 +859,9 @@ def evaluate(
                     terminated, truncated = bool(terms["__all__"]), bool(truncs["__all__"])
                     _absorb_step(observations, first_card_tick, rejected)
                     if tracer is not None:
-                        tracer.write(observations, environment.drain_privileged_combat_records())
+                        tracer.write(index, observations, environment.drain_privileged_combat_records())
                 if tracer is not None:
-                    tracer.close()
+                    tracer.close(index)
                 row = _match_row(
                     game_index=index,
                     seed=current.seed,

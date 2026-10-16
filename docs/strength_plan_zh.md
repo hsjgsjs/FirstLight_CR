@@ -73,7 +73,7 @@
 - 观测里的 `damage`、`death_or_despawn` 事件由公开快照差分得到，**不含攻击者**，死亡与消失也不区分（设计如此，模型输入保持公平）。
 - 环境本来就在读原生战斗记录（combat ring），其中 `damage`、`death` 记录带 `source`（攻击方本体，如火枪手）、`immediate_source`（直接命中物，如子弹）和 `lethal` 标记。这类特权信息可以作标签和统计口径，不能作模型输入。
 - `BattleEnvV1.record_privileged_combat` 打开后，原生伤害/死亡记录（含攻击者）可用 `drain_privileged_combat_records()` 取出，不进入任何观测。
-- `evaluate --trace-dir 目录` 把每局双方视角的精简状态和这些原生记录写成 `trace-NNNN.jsonl.gz`；`python -m native_runner.training.v4.defense_trace 目录` 统计：
+- `python -m native_runner.training.v4.defense_trace record --model-a "BC 200" --model-b "General 460" --existing-engine 127.0.0.1:28000` 按 `round_robin.local.json` 的条件在常驻引擎上跑几个循环赛组（默认 0–2 组，12 局），把每局双方视角的精简状态和这些原生记录写成 `evaluations/defense-audit/traces/trace-NNNN.jsonl.gz`，随后统计（`defense_trace analyze 目录` 可重新统计；`evaluate --trace-dir` 也能写同样的记录）：
   - 原生记录能给出攻击者的击杀比例，以及没有来源、来源无法对应到实体的比例；
   - 按攻击者种类与卡牌列出的击杀排行，用于人工核对，例如滚木击杀哥布林是否记在滚木上；
   - 只用公开状态（攻击目标、投射物来源/目标/落点、生成者链）的启发式能否找回同一攻击者，作为没有原生记录时（如实战录像）的备选。
