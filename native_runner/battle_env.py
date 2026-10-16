@@ -507,6 +507,10 @@ class BattleEnvV1:
         self._combat_evolution_entities: dict[int, _CombatEvolutionEntity] = {}
         self._causal_group_by_entity: dict[int, CausalGroupRefV1] = {}
         self._combat_event_kind_by_sequence: dict[int, str] = {}
+        # Exact native damage and death records with their attackers, kept only when an evaluation asks for
+        # them (metrics and training labels). Never part of an observation: FAIR combat stays snapshot-derived.
+        self.record_privileged_combat = False
+        self._privileged_combat_records: list[dict[str, Any]] = []
         self._phase_event_identity: tuple[int, int] | None = None
         self._phase_next_sequence: int | None = None
         self._phase_events_by_entity: dict[EntityKey, list[PhaseHookEvent]] = {}
@@ -893,6 +897,7 @@ class BattleEnvV1:
         self._combat_evolution_entities.clear()
         self._causal_group_by_entity.clear()
         self._combat_event_kind_by_sequence.clear()
+        self._privileged_combat_records.clear()
         self._phase_event_identity = None
         self._phase_next_sequence = None
         self._phase_events_by_entity.clear()
@@ -2868,6 +2873,7 @@ class BattleEnvV1:
         self._combat_evolution_entities.clear()
         self._causal_group_by_entity.clear()
         self._combat_event_kind_by_sequence.clear()
+        self._privileged_combat_records.clear()
 
     def _consume_native_public_card_plays(
         self, rich_context: _RichObservationContext
@@ -3560,6 +3566,7 @@ class BattleEnvV1:
             self._combat_evolution_entities.clear()
             self._causal_group_by_entity.clear()
             self._combat_event_kind_by_sequence.clear()
+            self._privileged_combat_records.clear()
         expected = self._checked_ring_sequence(envelope, self._combat_next_sequence, label="combat")
         if not envelope.hook_set_installed:
             if envelope.events:
@@ -3582,6 +3589,8 @@ class BattleEnvV1:
                     if entity_id is None:
                         raise BattleEnvError("present native combat fact lacks a canonical identity")
             self._record_public_causal_group(event, rich_context)
+            if self.record_privileged_combat and event.kind in ("damage", "death"):
+                self._privileged_combat_records.append(self._privileged_combat_record(event, rich_context))
             target_entity_id = self._combat_entity_id(event.target, rich_context)
             if event.kind == "spawn" and target_entity_id is not None:
                 deployment = event.deployment_context
@@ -3600,6 +3609,38 @@ class BattleEnvV1:
                 self._causal_group_by_entity.pop(target_entity_id, None)
         self._combat_next_sequence = envelope.next_sequence
         return
+
+    def _privileged_combat_record(self, event: Any, rich_context: _RichObservationContext) -> dict[str, Any]:
+        def fact(value: Any) -> dict[str, Any] | None:
+            if not value.present:
+                return None
+            return {
+                "id": self._combat_entity_id(value, rich_context),
+                "owner": value.owner,
+                "card": value.card_id,
+                "object_kind": value.object_kind,
+            }
+
+        record: dict[str, Any] = {
+            "t": self._canonical_tick(event.tick),
+            "kind": event.kind,
+            "lethal": event.lethal,
+            "target": fact(event.target),
+            "source": fact(event.source),
+            "immediate": fact(event.immediate_source),
+            "projectile": fact(event.projectile),
+        }
+        if event.actual_amount is not None:
+            record["amount"] = event.actual_amount
+        if event.post_hp is not None:
+            record["post_hp"] = event.post_hp
+        return record
+
+    def drain_privileged_combat_records(self) -> list[dict[str, Any]]:
+        """Return and forget the native damage/death records gathered since the last call."""
+
+        records, self._privileged_combat_records = self._privileged_combat_records, []
+        return records
 
     @staticmethod
     def _effect_instance_key(effect: Any) -> tuple[Any, ...]:

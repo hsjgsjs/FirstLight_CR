@@ -28,6 +28,7 @@ from .async_cluster_self_play import (
 )
 from .cluster_self_play import build_resident_engine_v4
 from .deck_pool import DeckPoolManifestV4
+from .defense_trace import TraceWriter
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .policy_session import build_policy_session_v4, load_policy_v4
@@ -657,9 +658,12 @@ def evaluate(
     battle_level=None,
     schedule=None,
     resident_lanes=None,
+    trace_dir=None,
 ):
     if games < 1:
         raise ValueError("games must be positive")
+    if trace_dir is not None and schedule is not None:
+        raise ValueError("combat traces are recorded only on the JSON transport, without a paired schedule")
     _delay_bounds(delay_a_ticks)
     _delay_bounds(delay_b_ticks)
     if resident_lanes is not None and (isinstance(resident_lanes, bool) or resident_lanes not in range(1, 17)):
@@ -731,6 +735,8 @@ def evaluate(
     )
     rows = []
     sessions = []
+    tracer = None if trace_dir is None else TraceWriter(Path(trace_dir))
+    environment.record_privileged_combat = tracer is not None
     try:
         with (output / "matches.jsonl").open("w", encoding="utf-8", buffering=1) as log:
             # Without a deck pool, A keeps deck0 and only the side swaps. With one, every pair of games draws two
@@ -774,6 +780,17 @@ def evaluate(
                     owner: next(p.elixir_exact for p in obs.players if p.owner == owner)
                     for owner, obs in observations.items()
                 }
+                if tracer is not None:
+                    tracer.start(
+                        index,
+                        {
+                            "seed": current.seed,
+                            "a_owner": a_owner,
+                            "checkpoint_ids": [policy.checkpoint_id for policy in policies],
+                            "deck_ids": pair_ids,
+                        },
+                    )
+                    tracer.write(observations, environment.drain_privileged_combat_records())
                 sessions = [
                     build_policy_session_v4(
                         environment,
@@ -814,6 +831,10 @@ def evaluate(
                     observations, _, terms, truncs, _ = environment.step(commands, record_trace=False)
                     terminated, truncated = bool(terms["__all__"]), bool(truncs["__all__"])
                     _absorb_step(observations, first_card_tick, rejected)
+                    if tracer is not None:
+                        tracer.write(observations, environment.drain_privileged_combat_records())
+                if tracer is not None:
+                    tracer.close()
                 row = _match_row(
                     game_index=index,
                     seed=current.seed,
@@ -840,6 +861,8 @@ def evaluate(
         (output / "summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
     finally:
+        if tracer is not None:
+            tracer.close()
         for session in sessions:
             session.end_episode()
         native.close_transport()
@@ -888,6 +911,11 @@ def main(argv=None):
         "then swaps them; without it every game uses the match config's decks",
     )
     parser.add_argument("--battle-level", type=int, choices=(11, 16), help="card and King Tower level")
+    parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        help="write each game's compact combat trace here (see defense_trace.py for the kill-attribution audit)",
+    )
     args = parser.parse_args(argv)
     config = json.loads(args.match_config.read_text(encoding="utf-8")) if args.match_config else {}
     for key in ("owner0_account_id", "owner1_account_id"):
@@ -911,6 +939,7 @@ def main(argv=None):
         gate_temperature_b=args.gate_temperature_b,
         deck_pool=None if args.deck_pool is None else DeckPoolManifestV4.load(args.deck_pool),
         battle_level=args.battle_level,
+        trace_dir=args.trace_dir,
     )
     return 0
 
