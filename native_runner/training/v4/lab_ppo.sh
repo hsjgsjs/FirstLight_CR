@@ -669,10 +669,11 @@ for stage in sorted(run.glob("train-*")):
     shown += 1
     print(f"== {stage.name}  updates {metrics[0]['update']}-{metrics[-1]['update']}")
     saved = run / f"options-{stage.name}.txt"
-    options = set(saved.read_text().split("--")) if saved.exists() else None
+    options = {item.strip() for item in saved.read_text().split("--") if item.strip()} if saved.exists() else None
     if options is not None and previous is not None and options != previous:
-        print("   options -", " | ".join(sorted(item.strip() for item in previous - options if item.strip())))
-        print("   options +", " | ".join(sorted(item.strip() for item in options - previous if item.strip())))
+        for sign, changed in (("-", previous - options), ("+", options - previous)):
+            if changed:
+                print(f"   options {sign}", " | ".join(sorted(changed)))
     previous = options if options is not None else previous
     print("   updates    vs fixed (n)  self  kl      clip   EV     entropy  adv scale  steps  plays  wasted  first"
           "  grad cos  snr")
