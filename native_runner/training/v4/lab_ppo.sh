@@ -649,11 +649,15 @@ PY
     ;;
   trend)
     # Win rate against the fixed opponents over the whole run, next to what the optimizer did at the time.
-    "$python" - "$runs/${2:?usage: lab_ppo.sh trend NAME [BLOCK]}" "${3:-16}" <<'PY'
+    name=${2:?usage: lab_ppo.sh trend NAME [BLOCK]}
+    [[ ${3:-16} =~ ^[1-9][0-9]*$ ]] || { echo "BLOCK must be a positive number of updates (one NAME per command)" >&2; exit 2; }
+    [[ -d $runs/$name ]] || { echo "no run named $name in $runs" >&2; exit 1; }
+    "$python" - "$runs/$name" "${3:-16}" <<'PY'
 import json, math, statistics as st, sys
 from pathlib import Path
 run, block = Path(sys.argv[1]), int(sys.argv[2])
 previous = None
+shown = 0
 for stage in sorted(run.glob("train-*")):
     if not (stage / "metrics.jsonl").exists():
         continue
@@ -662,6 +666,7 @@ for stage in sorted(run.glob("train-*")):
         if (stage / "matches.jsonl").exists() else []
     if not metrics:
         continue
+    shown += 1
     print(f"== {stage.name}  updates {metrics[0]['update']}-{metrics[-1]['update']}")
     saved = run / f"options-{stage.name}.txt"
     options = set(saved.read_text().split("--")) if saved.exists() else None
@@ -688,6 +693,9 @@ for stage in sorted(run.glob("train-*")):
               f"{median('advantage_scale'):7.3f}  {median('minibatch_updates'):5.0f}  "
               f"{st.mean(row['active_actions'][owner] for row, owner in seats) if seats else math.nan:5.1f}  "
               f"{st.median(wasted) if wasted else math.nan:6.1f}  {st.median(first) if first else math.nan:5.0f}")
+if not shown:
+    stages = sorted(path.name for path in run.glob("train-*"))
+    print(f"{run.name}: no finished update yet" + (f" (stages: {', '.join(stages)})" if stages else " (no train-* stage; did it start?)"))
 PY
     ;;
   load)
