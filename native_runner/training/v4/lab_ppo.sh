@@ -64,6 +64,11 @@ user=$(id -un)
 export TMPDIR=${TMPDIR:-/dev/shm}
 export CR_PPO_ENGINES_PER_GUEST=${CR_PPO_ENGINES_PER_GUEST:-4}
 
+# Ports given by the caller, read once: instance_setup exports its own choice, and a later call (after
+# launch-env selects another instance) must not mistake that export for the caller's.
+requested_base_port=${CR_PPO_BASE_PORT:-}
+requested_worker_port=${CR_PPO_REMOTE_WORKER_PORT:-}
+
 # Everything two labs on one machine must not share. The default instance keeps the original names.
 instance_setup() {
   instance=${CR_LAB_INSTANCE:-}
@@ -72,8 +77,8 @@ instance_setup() {
   node_dir=$runs/lab-node$suffix
   stop_marker=$runs/lab-stopped-on-purpose$suffix
   schedule_tag="# lab_ppo schedule${instance:+ instance $instance}"
-  base_port=${CR_PPO_BASE_PORT:-$((28000 + 200 * ${instance:-0}))}
-  worker_port=${CR_PPO_REMOTE_WORKER_PORT:-$((29900 + ${instance:-0}))}
+  base_port=${requested_base_port:-$((28000 + 200 * ${instance:-0}))}
+  worker_port=${requested_worker_port:-$((29900 + ${instance:-0}))}
   guest_prefix=crppo$instance
   export SLURM_JOB_ID=local$instance CR_PPO_GUEST_PREFIX=$guest_prefix
   export CR_EMULATOR_BASE_PORT=$((5554 + 16 * ${instance:-0})) CR_PPO_REMOTE_WORKER_PORT=$worker_port
