@@ -87,7 +87,7 @@ python -m native_runner.training.v4.evaluate_opening \
 
 正式评测把 `--blocks` 改为 50 或 100，分别是 400 或 800 局，并用新的输出目录。CPU 资源有限时可以先跑 20 组（160 局），结合区间宽度再决定后续规模。每一组的 8 局在同一个引擎的 8 个槽上同时推进，采集用训练的 compact 格式。同一拍所有观测按模型各做一次前向：机器上看得到 CUDA 时这次前向在 GPU 上，采样仍用 CPU 随机数，避免强制出牌打乱配对序列。两份模型仍只加载一次。`--cpu-threads` 控制 CPU 上的 PyTorch 算子线程，不是并行对局数。
 
-连续出牌/技能默认至少间隔随机 8–12 tick（400–600 ms），与新训练默认一致。旧版 `duel.local.json` 中该项为 `null` 时也采用这个默认值；显式填写的其他范围仍保留。执行延迟 `delay_ticks` 保持独立配置，若要复现训练的约一秒延迟，可设为 `21`。改变时序参数会建立新的历史评测分组，不会合并旧规则结果。
+连续出牌/技能默认至少间隔随机 6–10 tick（300–500 ms），与新训练默认一致（2026-10-16 前为 8–12）。旧版 `duel.local.json` 中该项为 `null` 时也采用这个默认值；显式填写的其他范围仍保留。执行延迟 `delay_ticks` 保持独立配置，若要复现训练的约一秒延迟，可设为 `21`。改变时序参数会建立新的历史评测分组，不会合并旧规则结果。
 
 其他条件通过以下参数设置：
 
@@ -98,7 +98,7 @@ python -m native_runner.training.v4.evaluate_opening \
 | `--deck-pool /path/to/pool.json` | 使用训练卡组池；覆盖配置中的卡组 |
 | `--battle-level 11` | 统一卡牌和国王塔等级；覆盖 match-config 对应等级字段 |
 | `--delay-ticks 21` | 双方相同的动作执行延迟，20 tick = 1 秒 |
-| `--min-play-gap-ticks 8-12` | 双方连续动作的最小间隔，默认 400–600 ms |
+| `--min-play-gap-ticks 6-10` | 双方连续动作的最小间隔，默认 300–500 ms |
 | `--gate-temperature 0.2` | 双方使用相同 act/wait 温度 |
 | `--max-score-drop 0.05` | 把 B 得分率下降超过 5 个百分点作为明显变弱的阈值 |
 | `--plan-only` | 只写计划，不加载 checkpoint、不连接引擎；仍需 Python 项目依赖 |

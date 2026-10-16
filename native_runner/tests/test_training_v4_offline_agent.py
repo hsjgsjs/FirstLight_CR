@@ -22,7 +22,7 @@ def test_interface_match_json_round_trips_through_cli(monkeypatch, tmp_path):
         assert restored == match
         assert options["actor_owner"] == 1
         assert options["sample"] is False
-        assert options["min_play_gap_ticks"] == (8, 12)
+        assert options["min_play_gap_ticks"] == (6, 10)
         assert not options["should_stop"]()
         options["on_ready"]({"mode": "native-render"})
         (artifacts / "stop").touch()

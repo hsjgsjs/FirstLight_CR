@@ -22,7 +22,7 @@ bash round_robin.sh --existing-engine 127.0.0.1:28000
 
 需要调整时复制 `round_robin.example.json` 为 `round_robin.local.json`，编辑其中的路径或设置。该本机配置不会提交 Git。支持 `--config` 选择另一份配置。
 
-示例对局参数是依据已有训练记录给出的候选值：16 级、每次决策随机抽取 18–24 tick 执行延迟、连续动作间隔 4–8 tick、确定性出牌。它们不代表已实际读取服务器 `trainer-options.txt`；正式运行前请对照服务器保存的阶段参数核实。采样模式必须显式提供对所有模型一致的 `gate_temperature`。设备默认 `cpu`。
+示例对局参数：16 级、每次决策随机抽取 18–24 tick 执行延迟、连续动作间隔 6–10 tick（2026-10-16 起的统一默认；首轮结果使用 4–8）、确定性出牌。它们不代表已实际读取服务器 `trainer-options.txt`；正式运行前请对照服务器保存的阶段参数核实。采样模式必须显式提供对所有模型一致的 `gate_temperature`。设备默认 `cpu`。
 
 ## 规模与分工
 

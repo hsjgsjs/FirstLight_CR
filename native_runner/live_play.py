@@ -887,7 +887,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             command.add_argument("--record-screenshots", action="store_true",
                                  help="save start/end debug screenshots with --record (adds ADB latency)")
             command.add_argument("--min-play-gap-ticks", type=parse_play_gap_ticks, default=DEFAULT_PLAY_GAP_TICKS,
-                                 help="minimum gap between plays/abilities, in game ticks (default: 8-12 = 0.4-0.6 s)")
+                                 help="minimum gap between plays/abilities, in game ticks (default: 6-10 = 0.3-0.5 s)")
             command.add_argument("--deterministic", action="store_true",
                                  help="always take the most likely action (rarely plays; default samples)")
             command.add_argument("--gate-temperature", type=float, default=None,

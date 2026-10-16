@@ -89,7 +89,7 @@ def test_legacy_null_gap_uses_current_default_and_custom_gap_is_preserved(tmp_pa
     config = tmp_path / "duel.json"
     args = SimpleNamespace(checkpoint_a=None, checkpoint_b=None, blocks=None, opening_seconds=None, engines=None)
     config.write_text(json.dumps(settings))
-    assert read_options(config, args)["min_play_gap_ticks"] == "8-12"
+    assert read_options(config, args)["min_play_gap_ticks"] == "6-10"
     settings["min_play_gap_ticks"] = "10-14"
     config.write_text(json.dumps(settings))
     assert read_options(config, args)["min_play_gap_ticks"] == "10-14"

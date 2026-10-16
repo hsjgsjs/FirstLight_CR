@@ -920,7 +920,7 @@ def main() -> int:
         type=parse_play_gap_ticks,
         help=(
             "land each policy's consecutive card plays and abilities at least MIN-MAX ticks apart (drawn per "
-            "play; a tick is 50 ms, so 8-12 is 400-600 ms), as a human cannot tap two cards at once"
+            "play; a tick is 50 ms, so 6-10 is 300-500 ms), as a human cannot tap two cards at once"
         ),
     )
     parser.add_argument(

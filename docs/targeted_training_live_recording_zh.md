@@ -10,9 +10,9 @@
 
 通用改进候选是补齐可信的在途动作与剩余时间表示，再研究 0.5/1/2 秒短期位置、存活和血量变化的辅助预测。辅助标签只能用于训练，不能把真实未来输入实战策略。预测结果还要以这段时间内实际执行的动作作为条件；要判断“不再补防是否也安全”，需要无额外干预片段或受控反事实复现，不能直接拿已经补防后的幸存/伤害结果当标签。这套输入/辅助目标修改尚未实现。
 
-## 1. 从最新检查点按 0.4–0.6 秒间隔继续训练
+## 1. 从最新检查点按 0.3–0.5 秒间隔继续训练
 
-`--min-play-gap-ticks 8-12` 表示同一方连续出牌或技能至少间隔随机 8–12 个游戏 tick，每 tick 50ms。它不是每隔 0.4–0.6 秒强制出牌，也不会给独立的第一张牌再增加这段延迟。训练的 `--execution-delay-ticks 18-24` 继续保留。已有运行的 `4-8` 不会随代码更新自动变成 `8-12`。
+`--min-play-gap-ticks 6-10` 表示同一方连续出牌或技能至少间隔随机 6–10 个游戏 tick，每 tick 50ms（2026-10-16 起的默认，此前为 8–12）。它不是每隔 0.3–0.5 秒强制出牌，也不会给独立的第一张牌再增加这段延迟。训练的 `--execution-delay-ticks 18-24` 继续保留。已有运行保存的 `4-8` 或 `8-12` 不会随代码更新自动变成 `6-10`。
 
 为保留优化器、当前温度及剩余退火进度，使用准备入口生成新实验，而不是直接改旧运行参数后热启动。先让当前短实验结束；需要立即停止时运行 `bash native_runner/training/v4/lab_ppo.sh stop`，确认停止并写出检查点后继续。
 
@@ -25,7 +25,7 @@ test -f "$source_checkpoint" || exit 1
   --checkpoint "$source_checkpoint" \
   --trainer-options runs/spar16-human-v1/trainer-options.txt \
   --expert-manifest runs/human-experts-v1/train.json \
-  --min-play-gap-ticks 8-12 \
+  --min-play-gap-ticks 6-10 \
   --output runs/human-gap-trial-v1
 
 cat runs/human-gap-trial-v1/plan.json
@@ -67,7 +67,7 @@ test -f "$source_checkpoint" || exit 1
   --checkpoint "$source_checkpoint" \
   --trainer-options runs/spar16-human-v1/trainer-options.txt \
   --expert-manifest runs/human-experts-v1/train-fireball-v1.json \
-  --min-play-gap-ticks 8-12 --coefficient 0.05 --every-updates 4 \
+  --min-play-gap-ticks 6-10 --coefficient 0.05 --every-updates 4 \
   --output runs/fireball-trial-v1
 
 CR_PPO_CHECKPOINT="$PWD/runs/fireball-trial-v1/baseline.pt" \
@@ -94,12 +94,12 @@ bash native_runner/training/v4/lab_ppo.sh start spar16-fireball-v1 100
 等正在打的这一局结束，Ctrl+C 退出旧接管进程，再用原来的模型路径启动：
 
 ```powershell
-.\.venv\Scripts\python.exe -u -m native_runner.live_play run --checkpoint "你的当前检查点.pt" --gate-temperature 0.2 --min-play-gap-ticks 8-12 --record
+.\.venv\Scripts\python.exe -u -m native_runner.live_play run --checkpoint "你的当前检查点.pt" --gate-temperature 0.2 --min-play-gap-ticks 6-10 --record
 ```
 
 `--account-id` 沿用已保存设置；需要时显式提供。第一次调试可增加 `--games 1 --record-screenshots`，保存开局和结束的截图，便于核对分辨率；ADB 截图会增加启动时的耗时，通常不需要长期打开。`--dry-run --record` 可先验证采集和拟点击坐标，档案会明确标记没有真实点击。
 
-原有启动脚本也能转发这些参数：` .\native_runner\launch_live_my.ps1 --record --min-play-gap-ticks 8-12`。该脚本会重启游戏，并使用脚本里指定的权重，因此先核对权重路径、等当前对局结束后再用。
+原有启动脚本也能转发这些参数：` .\native_runner\launch_live_my.ps1 --record --min-play-gap-ticks 6-10`。该脚本会重启游戏，并使用脚本里指定的权重，因此先核对权重路径、等当前对局结束后再用。
 
 每局保存到终端打印的 `runs\live\recordings\match-...`：
 

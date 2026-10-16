@@ -11,7 +11,7 @@
   "match_config": null,
   "battle_level": 16,
   "delay_ticks": "18-24",
-  "min_play_gap_ticks": "4-8",
+  "min_play_gap_ticks": "6-10",
   "sample": false,
   "gate_temperature": null,
   "seed": 1001,
