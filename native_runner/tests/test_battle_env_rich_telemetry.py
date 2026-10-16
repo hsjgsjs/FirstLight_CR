@@ -4123,6 +4123,44 @@ def test_invisible_entity_damage_remains_public_to_both_players(
 
 
 
+@pytest.mark.parametrize("recorded", [True, False])
+def test_privileged_combat_records_name_the_attacker_without_reaching_observations(
+    catalog, recorded: bool
+) -> None:
+    before = _ordinary()
+    before_rich = _rich(before)
+    _set_combat_events(before_rich, epoch_first_sequence=70, events=[])
+    after = deepcopy(before)
+    after["tick"] = 21
+    after["objects"][7]["hp"] = 650  # type: ignore[index]
+    after_rich = _rich(after)
+    _set_combat_events(
+        after_rich, epoch_first_sequence=70, events=[_damage_combat_event(after, sequence=70, tick=21)]
+    )
+    native = _TransitionNativeStub(before, before_rich, after, after_rich)
+    env = _environment(native, catalog)
+    env.record_privileged_combat = recorded
+    _reset(env)
+    assert env.drain_privileged_combat_records() == []
+
+    observations, _, _, _, _ = env.step({0: ActionV1.wait(0, 1), 1: ActionV1.wait(1, 1)})
+
+    damage = [item for item in observations[0].events if item.event_type == "damage"]
+    assert len(damage) == 1 and damage[0].combat.source_entity is None
+    records = env.drain_privileged_combat_records()
+    assert env.drain_privileged_combat_records() == []
+    if not recorded:
+        assert records == []
+        return
+    assert len(records) == 1
+    record = records[0]
+    assert record["kind"] == "damage" and record["lethal"] is False
+    assert record["target"]["id"] == damage[0].entity_id
+    assert record["source"]["id"] is not None and record["source"]["id"] != damage[0].entity_id
+    assert record["source"] == record["immediate"]
+    assert record["projectile"] is None
+    assert record["amount"] == 50 and record["post_hp"] == 650
+
 def test_native_combat_cursor_fails_closed_before_oldest_retained_sequence(
     catalog,
 ) -> None:
