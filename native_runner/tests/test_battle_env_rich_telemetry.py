@@ -4123,6 +4123,27 @@ def test_invisible_entity_damage_remains_public_to_both_players(
 
 
 
+def test_hero_runtime_form_units_are_hero_entities(catalog) -> None:
+    hero_form = 203_000_014  # Musketeer hero runtime form; it has no card spec of its own
+    before = _ordinary()
+    before["objects"][7]["cardId"] = hero_form  # type: ignore[index]
+    before_rich = _rich(before)
+    _set_combat_events(before_rich, epoch_first_sequence=70, events=[])
+    after = deepcopy(before)
+    after["tick"] = 21
+    after_rich = _rich(after)
+    _set_combat_events(after_rich, epoch_first_sequence=70, events=[])
+    env = _environment(_TransitionNativeStub(before, before_rich, after, after_rich), catalog)
+    _reset(env)
+
+    observations, _, _, _, _ = env.step({0: ActionV1.wait(0, 1), 1: ActionV1.wait(1, 1)})
+
+    for owner in (0, 1):
+        heroes = [entity for entity in observations[owner].entities if entity.card_id == hero_form]
+        assert len(heroes) == 1 and heroes[0].entity_kind == "hero"
+        others = [entity for entity in observations[owner].entities if entity.card_id == SEMANTIC_BASELINE_DECK[0]]
+        assert others and all(entity.entity_kind != "hero" for entity in others)
+
 @pytest.mark.parametrize("recorded", [True, False])
 def test_privileged_combat_records_name_the_attacker_without_reaching_observations(
     catalog, recorded: bool
