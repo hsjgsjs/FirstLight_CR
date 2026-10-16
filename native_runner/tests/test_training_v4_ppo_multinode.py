@@ -106,6 +106,7 @@ def test_bind_rank_cpus_deduplicates_time_shared_worker_cores(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bound: list[set[int]] = []
+    monkeypatch.delenv("CR_PPO_TRAINER_CPUS", raising=False)
     monkeypatch.setattr(
         os,
         "sched_setaffinity",
@@ -123,6 +124,28 @@ def test_bind_rank_cpus_deduplicates_time_shared_worker_cores(
 
     assert assigned == (40, 0, 2)
     assert bound == [{0, 2, 40}]
+
+
+def test_bind_rank_cpus_can_keep_the_rank_on_control_cpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bound: list[set[int]] = []
+    monkeypatch.setattr(os, "sched_setaffinity", lambda _pid, cpus: bound.append(set(cpus)), raising=False)
+    monkeypatch.setenv("CR_PPO_TRAINER_CPUS", "control")
+
+    assigned = _bind_rank_cpus(
+        {"control_cpus": "6,7"},
+        local_rank=0,
+        world=1,
+        engine_indices=(0, 1, 2),
+        worker_cpus=(0, 1, 10),
+    )
+
+    assert assigned == (6, 7)
+    assert bound == [{6, 7}]
+    monkeypatch.setenv("CR_PPO_TRAINER_CPUS", "engines")
+    with pytest.raises(ValueError, match="CR_PPO_TRAINER_CPUS"):
+        _bind_rank_cpus({"control_cpus": "6,7"}, local_rank=0, world=1, engine_indices=(0,), worker_cpus=(0,))
 
 
 def test_trainer_resolves_manifest_hosts_and_ports() -> None:
