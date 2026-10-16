@@ -647,6 +647,13 @@ def _bind_rank_cpus(
     assigned = tuple(dict.fromkeys((*assigned_control, *assigned_engines)))
     if not assigned_control or not assigned_engines:
         raise ValueError("distributed rank received no control CPU")
+    scope = os.environ.get("CR_PPO_TRAINER_CPUS", "control-and-engines")
+    if scope not in {"control", "control-and-engines"}:
+        raise ValueError("CR_PPO_TRAINER_CPUS must be control or control-and-engines")
+    if scope == "control":
+        # Remote workers own the engine CPUs. Keeping the rank on its control CPUs stops busy
+        # workers from preempting the serial inference thread and the ATen pool sized from this set.
+        assigned = assigned_control
     os.sched_setaffinity(0, set(assigned))
     return assigned
 

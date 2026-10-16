@@ -136,6 +136,7 @@ bash native_runner/training/v4/lab_ppo.sh start 名字B 200
 - 实例 1 使用自己的引擎端口（28200 起）、worker 端口（29901）、模拟器名（`crppo1_*`）和控制台端口（5570 起）、`/dev/shm/firstlight-ppo-local1-*`、节点目录 `runs/lab-node-1`、停止标记和定时任务；它的启动、清理、`stop`、`status`、`ensure` 都只动自己的进程。默认实例的名字、端口与以前完全相同。
 - 实例记在 `runs/名字/launch-env` 里：`resume 名字`、`stop 名字 分钟`、`status 名字`、`schedule 名字 …` 会自动用该运行所在的实例。不带名字的 `stop` 只停默认实例；停实例 1 用 `CR_LAB_INSTANCE=1 bash … stop` 或 `bash … stop 名字B 0`。
 - 每个实例 8 个引擎约需 32 GB 内存；每个实例最多 8 台模拟器（32 个引擎），否则控制台端口会和另一个实例重叠。
+- **超线程的机器**（`lscpu -e` 里两个逻辑核同属一个物理核）：训练器每次更新约有 70 秒花在单线程推理循环上，这个线程最怕被抢核。给每个实例的 `CR_LAB_CONTROL_CPUS` 两个**独占的物理核**，并让这两个物理核的另一个逻辑核空着；引擎和 worker 可以共用同一组核，并用满两个逻辑核。训练器默认只在 `CR_LAB_CONTROL_CPUS` 上运行（`CR_PPO_TRAINER_CPUS=control`）。以前它还会被放到 worker 的核上，被 95% 忙碌的 worker 抢走时间。`load 名字` 按该运行启动时的 CPU 范围标注各组核。
 - 两个实例必须用**同一份**代码。不要在一个旧代码的训练运行时拉取新代码再启动另一个：旧版脚本的清理会停掉所有训练器和 worker，新旧代码的进程也不能混用。
 
 ### 每天定时运行

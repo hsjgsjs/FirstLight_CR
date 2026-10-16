@@ -33,13 +33,15 @@
 # worker ports, emulator names and console ports, /dev/shm files, node directory, stop marker and schedule,
 # and every command (stop, status, ensure, schedule) acts on that instance only. Give each instance its own
 # CPU ranges and GPU (CR_LAB_*_CPUS, CR_LAB_TRAIN_GPUS); a run remembers its instance in launch-env.
+# The trainer runs on CR_LAB_CONTROL_CPUS only (CR_PPO_TRAINER_CPUS=control); control-and-engines also lets
+# it use the worker CPUs, where busy workers preempt its serial inference thread.
 # A start saves these launch settings to runs/NAME/launch-env and a resume restores them, unless the same
 # variable is given on the resume command line.
 set -euo pipefail
 
 launch_vars=(CR_PPO_ENGINE_COUNT CR_LAB_ENGINE_CPUS CR_LAB_WORKER_CPUS CR_LAB_CONTROL_CPUS CR_LAB_TRAIN_GPUS
   CR_PPO_INFERENCE_BATCH_WAIT_MS CR_PPO_SEGMENT_SECONDS CR_PPO_LANE_MICROBATCH_SIZE NCCL_P2P_DISABLE
-  CR_PPO_CHECKPOINT CR_LAB_INSTANCE)
+  CR_PPO_CHECKPOINT CR_LAB_INSTANCE CR_PPO_TRAINER_CPUS)
 explicit_vars=" "
 for variable in "${launch_vars[@]}" CR_PPO_EXTRA_ARGS; do
   [[ ! -v $variable ]] || explicit_vars+="$variable "
@@ -63,6 +65,7 @@ host=$(hostname -s)
 user=$(id -un)
 export TMPDIR=${TMPDIR:-/dev/shm}
 export CR_PPO_ENGINES_PER_GUEST=${CR_PPO_ENGINES_PER_GUEST:-4}
+export CR_PPO_TRAINER_CPUS=${CR_PPO_TRAINER_CPUS:-control}
 
 # Ports given by the caller, read once: instance_setup exports its own choice, and a later call (after
 # launch-env selects another instance) must not mistake that export for the caller's.
@@ -615,6 +618,13 @@ PY
     ;;
   load)
     # Live CPU use per core group and GPU use over 5 seconds, then where recent updates spent their time.
+    if [[ -n ${2:-} ]]; then
+      # Label the core groups with the ranges that run was started with.
+      load_launch_env "$runs/$2"
+      engine_cpus=${CR_LAB_ENGINE_CPUS:-$engine_cpus}
+      worker_cpus=${CR_LAB_WORKER_CPUS:-$worker_cpus}
+      control_cpus=${CR_LAB_CONTROL_CPUS:-$control_cpus}
+    fi
     "$python" - "$engine_cpus" "$worker_cpus" "$control_cpus" <<'PY'
 import sys, time
 
