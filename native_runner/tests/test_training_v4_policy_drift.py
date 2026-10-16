@@ -1,5 +1,7 @@
 """The drift report must read zero for identical policies and point at the head that actually moved."""
 
+from dataclasses import replace
+
 import torch
 
 from native_runner.tests.test_training_v4_model import _batch, _model
@@ -62,3 +64,34 @@ def test_identical_policy_reads_zero_and_a_moved_delay_head_reads_only_there() -
     assert abs(delay_only.head_kl["candidate"]) < 1e-6 and abs(delay_only.head_kl["target"]) < 1e-6
     text = report("moved", delay_only)
     assert "per-play KL" in text and all(head in text for head in HEADS)
+
+
+def test_repeated_candidate_uids_in_recorded_games_do_not_stop_the_report() -> None:
+    torch.manual_seed(4)
+    base, moved = _model().eval(), _model().eval()
+    batch = _batch(1)
+    # Recorded games can carry the same UID on two candidates; scoring must not depend on it.
+    batch = replace(batch, candidates=replace(batch.candidates, uid=torch.tensor([[101, 101, 101, 101, 0]])))
+    gates = [GATE_ACT, GATE_WAIT, GATE_ACT, GATE_ACT]
+    sequence = ILSequenceV4(
+        observations=(batch,) * len(gates),
+        actions=_human_actions(gates),
+        episode_start=torch.tensor([[True]] + [[False]] * (len(gates) - 1)),
+        valid_mask=torch.ones(len(gates), 1, dtype=torch.bool),
+        returns=torch.zeros(len(gates), 1),
+    )
+    tally = Tally()
+    with torch.no_grad():
+        compare_sequence(
+            base,
+            [moved],
+            sequence,
+            [tally],
+            temperatures=(0.33, 1.0, 2.0),
+            width=base.config.board_width,
+            generator=torch.Generator().manual_seed(2),
+        )
+    assert tally.steps == len(gates) and tally.sampled_acts == len(gates)
+    # A WAIT names no candidate, so only the plays are left out of the human comparison.
+    assert tally.human_dropped == gates.count(GATE_ACT)
+    assert "repeated card UID" in report("moved", tally)

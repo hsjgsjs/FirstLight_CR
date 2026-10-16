@@ -19,6 +19,7 @@ import json
 import math
 import sys
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -57,6 +58,22 @@ def wait_actions(batch_size, device, width):
     )
 
 
+def with_slot_uids(model, batch, human):
+    """Number candidates by slot. A UID only names a candidate and is not a model input, but recorded games can
+    repeat one, and a repeated UID cannot be matched back to a single candidate when a play is scored.
+    The human's own play keeps its candidate if its recorded UID was unique, otherwise it is dropped (None).
+    """
+    candidates = batch.candidates
+    slots = torch.arange(1, candidates.uid.shape[1] + 1, device=candidates.uid.device).expand_as(candidates.uid)
+    renumbered = replace(batch, candidates=replace(candidates, uid=slots.to(candidates.uid.dtype)))
+    try:
+        index = model._resolve_candidate_indices(batch, human)
+    except ValueError:
+        return renumbered, None
+    uid = torch.where(index >= 0, index + 1, torch.full_like(index, -1)).to(human.candidate_uid.dtype)
+    return renumbered, replace(human, candidate_uid=uid)
+
+
 def head_log_probs(components):
     return {
         "gate": components.gate_log_prob,
@@ -91,6 +108,7 @@ class Tally:
         self.delays = {"new": Counter(), "base": Counter()}
         self.human = {"new": Counter(), "base": Counter()}
         self.human_counts = Counter()
+        self.human_dropped = 0
 
 
 def describe_plays(output, batch, catalog, width, side, tally):
@@ -129,15 +147,20 @@ def compare_sequence(base, models, sequence, tallies, *, temperatures, width, ge
             contexts.append(context)
         if not bool(sequence.valid_mask[t, 0]):
             continue
+        batch, human = with_slot_uids(base, batch, human)
         waits = wait_actions(1, device, base.config.max_micro_actions)
         base_wait = base._decode(batch, contexts[0], sample=False, forced_actions=waits, **decode).log_prob
         base_act = 1.0 - float(base_wait.exp())
         torch.manual_seed(int(torch.randint(0, 2**31 - 1, (1,), generator=generator)))
         base_sample = base._decode(batch, contexts[0], sample=True, forced_actions=None, **decode)
-        human_base = head_log_probs(
-            base._decode(batch, contexts[0], sample=False, forced_actions=human, **decode).action_components
+        human_base = (
+            None
+            if human is None
+            else head_log_probs(
+                base._decode(batch, contexts[0], sample=False, forced_actions=human, **decode).action_components
+            )
         )
-        human_act = bool(human.gate[0] == GATE_ACT)
+        human_act = human is not None and bool(human.gate[0] == GATE_ACT)
         trusted_gate = bool(gate_mask[t, 0])
         for model, context, tally in zip(models, contexts[1:], tallies, strict=True):
             tally.steps += 1
@@ -166,6 +189,9 @@ def compare_sequence(base, models, sequence, tallies, *, temperatures, width, ge
             sample = model._decode(batch, context, sample=True, forced_actions=None, **decode)
             describe_plays(sample, batch, base.catalog, width, "new", tally)
             describe_plays(base_sample, batch, base.catalog, width, "base", tally)
+            if human is None:
+                tally.human_dropped += 1
+                continue
             human_new = head_log_probs(
                 model._decode(batch, context, sample=False, forced_actions=human, **decode).action_components
             )
@@ -182,7 +208,11 @@ def compare_sequence(base, models, sequence, tallies, *, temperatures, width, ge
 def report(label, tally):
     steps = max(tally.steps, 1)
     acts = max(tally.sampled_acts, 1)
-    lines = [f"== {label}  ({tally.steps} decisions)"]
+    lines = [
+        f"== {label}  ({tally.steps} decisions"
+        + (f"; {tally.human_dropped} human plays with a repeated card UID left out" if tally.human_dropped else "")
+        + ")"
+    ]
     lines.append(
         f"   play probability per decision: baseline {tally.act_base / steps:.4f} -> {tally.act_new / steps:.4f}"
         f"   gate KL {tally.gate_kl / steps:.5f}"
