@@ -13,6 +13,7 @@ from native_runner.training.v4.distributed_ppo import _gradient_noise_statistics
 from native_runner.training.v4.learning import evaluate_recurrent_sequence
 from native_runner.training.v4.ppo import PPOConfigV4, StoredRolloutV4
 from native_runner.training.v4.tensors import GATE_ACT, GATE_WAIT, ActionSequenceV4
+from native_runner.training.v4.train_ppo_self_play_cluster import _value_clip_range
 
 
 def _actions(gates, candidates, delays):
@@ -193,3 +194,61 @@ def test_gradient_noise_measurement_leaves_the_update_unchanged() -> None:
         results.append(model.state_dict())
     for name, value in results[0].items():
         torch.testing.assert_close(results[1][name], value, rtol=0.0, atol=0.0)
+
+
+def test_value_clip_option() -> None:
+    assert _value_clip_range(0.1, None) == 0.1
+    assert _value_clip_range(0.1, 0.5) == 0.5
+    assert _value_clip_range(0.1, 0.0) is None
+    with pytest.raises(ValueError):
+        _value_clip_range(0.1, -1.0)
+
+
+def _value_after_update(value_clip_range):
+    model = _production_like_model()
+    batch = _states(8)
+    actions = _actions([GATE_WAIT] * 8, [0] * 8, [0] * 8)
+    lanes = batch.batch_size
+    # Small enough that Adam's momentum does not carry the value past the clip.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, eps=1e-5, weight_decay=0.0)
+    with torch.no_grad():
+        behavior = _evaluate(model, batch, actions)
+    rollout = StoredRolloutV4(
+        observations=(batch,),
+        actions=(actions,),
+        episode_start=torch.ones(1, lanes, dtype=torch.bool),
+        valid_mask=torch.ones(1, lanes, dtype=torch.bool),
+        behavior_log_prob=behavior.log_prob,
+        behavior_value=behavior.value,
+        next_value=torch.zeros(1, lanes),
+        rewards=torch.full((1, lanes), 1.0),
+        terminated=torch.ones(1, lanes, dtype=torch.bool),
+        truncated=torch.zeros(1, lanes, dtype=torch.bool),
+        initial_state=model.initial_state(lanes),
+        gate_temperature=model.ppo_gate_temperature,
+        action_temperature=model.ppo_action_temperature,
+        continue_temperature=model.ppo_continue_temperature,
+        policy_state_id="value-clip",
+    )
+    distributed_ppo_update_v4(
+        model,
+        optimizer,
+        rollout,
+        epochs=8,
+        lane_minibatch_size=lanes,
+        sequence_chunk_steps=1,
+        config=PPOConfigV4(
+            clip_range=0.1, value_clip_range=value_clip_range, entropy_coefficient=0.0, max_grad_norm=None
+        ),
+        autocast_dtype=None,
+    )
+    with torch.no_grad():
+        return float(behavior.value.mean()), float(_evaluate(model, batch, actions).value.mean())
+
+
+def test_value_clip_holds_the_value_near_its_rollout_value() -> None:
+    before, clipped = _value_after_update(0.1)
+    _, free = _value_after_update(None)
+    # Every return is +1: the clipped value stops about 0.1 above where it started, the free one keeps going.
+    assert clipped - before < 0.15
+    assert free - before > 0.5

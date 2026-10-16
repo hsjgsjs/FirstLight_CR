@@ -62,6 +62,16 @@ SPECIAL_TOWER_RUNTIME_IDS = frozenset((159_000_002, 159_000_004))
 WANDB_PROJECT = "cr-ai-ppo"
 
 
+def _value_clip_range(clip_range: float, value_clip_range: float | None) -> float | None:
+    """The PPO value clip: the policy clip unless given, and None (no clipping) for 0."""
+
+    if value_clip_range is None:
+        return clip_range
+    if not math.isfinite(value_clip_range) or value_clip_range < 0.0:
+        raise ValueError("--value-clip-range must be 0 (off) or positive")
+    return value_clip_range or None
+
+
 def _gate_temperature_for_update(update_step: int, *, start: float, end: float, anneal_updates: int) -> float:
     """Return the behavior temperature for one 1-indexed rollout update."""
 
@@ -1080,6 +1090,14 @@ def main() -> int:
     parser.add_argument("--unilateral-elixir-overflow-penalty", type=float, default=0.0)
     parser.add_argument("--elixir-overflow-step-penalty-cap", type=float, default=0.1)
     parser.add_argument("--clip-range", type=float, default=0.1)
+    parser.add_argument(
+        "--value-clip-range",
+        type=float,
+        help=(
+            "how far one update may move a state's value from its rollout value (default: --clip-range); "
+            "0 turns value clipping off"
+        ),
+    )
     parser.add_argument("--hog-deploy-reward", type=float, default=0.0)
     parser.add_argument(
         "--spell-king-activation-penalty", "--fireball-king-activation-penalty",
@@ -1546,6 +1564,8 @@ def main() -> int:
         resume_contract["execution_delay_ticks"] = list(args.execution_delay_ticks)
     if not args.score_model_delay_offset:
         resume_contract["score_model_delay_offset"] = False
+    if args.value_clip_range is not None:
+        resume_contract["value_clip_range"] = _value_clip_range(args.clip_range, args.value_clip_range)
     # Likewise omitted when off so existing strict resumes keep matching.
     if game_elixir_overflow is not None:
         resume_contract["game_elixir_overflow"] = list(game_elixir_overflow)
@@ -1726,7 +1746,7 @@ def main() -> int:
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
         clip_range=args.clip_range,
-        value_clip_range=args.clip_range,
+        value_clip_range=_value_clip_range(args.clip_range, args.value_clip_range),
         value_coefficient=0.5,
         entropy_coefficient=0.0,
         max_grad_norm=args.max_grad_norm,
