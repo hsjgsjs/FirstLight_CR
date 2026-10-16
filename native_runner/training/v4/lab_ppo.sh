@@ -18,6 +18,9 @@
 #                                     check every 15 minutes and resume again if the run died without being
 #                                     stopped; replaces any earlier schedule
 #   lab_ppo.sh ensure NAME            resume NAME unless it is running or was stopped on purpose
+#   lab_ppo.sh watch NAME [MINUTES]   around the clock, run ensure NAME every MINUTES (default 5), so a run
+#                                     that dies without being stopped comes back on its own
+#   lab_ppo.sh unwatch NAME           remove that check
 #   lab_ppo.sh unschedule             remove the daily schedule
 #
 # UPDATES is the total update count to stop at (default 30000, more than a week). The trainer options
@@ -537,6 +540,27 @@ case ${1:-} in
       log "ensure $name: not running and not stopped on purpose; resuming"
       exec bash "$script_dir/lab_ppo.sh" resume "$name"
     fi
+    ;;
+  watch)
+    name=${2:?usage: lab_ppo.sh watch NAME [MINUTES]} minutes=${3:-5}
+    [[ $minutes =~ ^[1-9][0-9]?$ ]] && ((minutes <= 30)) || { echo "MINUTES must be 1-30" >&2; exit 2; }
+    command -v crontab >/dev/null || { echo "crontab is not installed" >&2; exit 1; }
+    if [[ -z $(newest_checkpoint "$runs/$name") && ! -s $runs/$name/trainer-options.txt ]]; then
+      echo "runs/$name has no checkpoint or saved options to resume from" >&2
+      exit 1
+    fi
+    watch_tag="# lab_ppo watch $name"
+    {
+      { crontab -l 2>/dev/null || true; } | { grep -Ev -- " $(regex_literal "$watch_tag")\$" || true; }
+      echo "*/$minutes * * * * bash $script_dir/lab_ppo.sh ensure $name >>$runs/$name/logs/watch.log 2>&1 $watch_tag"
+    } | crontab -
+    echo "watching $name: every $minutes minutes, resume it if it died without being stopped (log: runs/$name/logs/watch.log)"
+    echo "a deliberate stop (lab_ppo.sh stop) is left alone; remove the check with: lab_ppo.sh unwatch $name"
+    ;;
+  unwatch)
+    name=${2:?usage: lab_ppo.sh unwatch NAME}
+    { crontab -l 2>/dev/null || true; } | { grep -Ev -- " $(regex_literal "# lab_ppo watch $name")\$" || true; } | crontab -
+    echo "no longer watching $name"
     ;;
   unschedule)
     { crontab -l 2>/dev/null || true; } | { grep -v -- "$schedule_tag\$" || true; } | crontab -
