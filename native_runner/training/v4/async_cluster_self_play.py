@@ -663,6 +663,10 @@ class AsyncResidentEngineSpecV4:
     # (penalty at the first decision, seconds after which it is zero) for opening a game with the first card
     # before the opponent has landed one; None disables it.
     early_first_play: tuple[float, float] | None = None
+    # (coefficient per elixir, grace elixir, cap per game) for elixir wasted at full before the owner's first
+    # card; None disables it.  The grace leaves ordinary openings untouched and the cap keeps a deliberate
+    # wait for double elixir affordable.
+    late_opening: tuple[float, float, float] | None = None
 
 
 def game_elixir_overflow_penalty_v4(
@@ -683,6 +687,31 @@ def game_elixir_overflow_penalty_v4(
         return wasted, accrued, 0.0
     wasted += newly_wasted
     penalty = min(step_cap, max(0.0, coefficient * max(0.0, wasted - grace) - accrued))
+    return wasted, accrued + penalty, penalty
+
+
+def late_opening_penalty_v4(
+    *,
+    wasted: float,
+    accrued: float,
+    newly_wasted: float,
+    counting: bool,
+    coefficient: float,
+    grace: float,
+    cap: float,
+    step_cap: float,
+) -> tuple[float, float, float]:
+    """Charge elixir wasted before the first card beyond ``grace``, up to ``cap`` per game.
+
+    Counts only while ``counting`` (before the owner's first card). Openings that leak less than ``grace``
+    cost nothing, so this cannot pull ordinary openings earlier; it only makes an open-ended standoff
+    cost something, at most ``cap``. Returns the new (wasted, accrued cost, penalty this step).
+    """
+    if not counting:
+        return wasted, accrued, 0.0
+    wasted += newly_wasted
+    owed = min(cap, coefficient * max(0.0, wasted - grace))
+    penalty = min(step_cap, max(0.0, owed - accrued))
     return wasted, accrued + penalty, penalty
 
 
@@ -1026,6 +1055,13 @@ def _engine_worker(
         and early_first_play[1] * TICKS_PER_SECOND > FIRST_POLICY_DECISION_TICK
     ):
         raise ValueError("early first play needs a positive penalty and a free time after the first decision")
+    late_opening = spec.late_opening
+    if late_opening is not None and not (
+        all(math.isfinite(value) and value >= 0.0 for value in late_opening)
+        and late_opening[0] > 0.0
+        and late_opening[2] > 0.0
+    ):
+        raise ValueError("late opening needs a positive coefficient and cap and a nonnegative grace")
     validate_reward_parameters_v4(locals())
     segment_end_decision_steps = segment_decision_steps
     tensorize_seconds = 0.0
@@ -1437,6 +1473,8 @@ def _engine_worker(
             game_wasted = list(runtime.game_elixir_overflow_wasted)
             game_accrued = list(runtime.game_elixir_overflow_cost_accrued)
             game_totals = list(runtime.game_elixir_overflow_penalty_total)
+            late_wasted = list(runtime.late_opening_wasted)
+            late_accrued = list(runtime.late_opening_cost_accrued)
             adjusted_reward = dict(reward)
             for owner in (0, 1):
                 newly_wasted = _newly_wasted_elixir_v4(
@@ -1493,9 +1531,23 @@ def _engine_worker(
                     )
                     game_totals[owner] += game_penalty
                     adjusted_reward[owner] -= game_penalty
+                if late_opening is not None:
+                    late_wasted[owner], late_accrued[owner], late_penalty = late_opening_penalty_v4(
+                        wasted=late_wasted[owner],
+                        accrued=late_accrued[owner],
+                        newly_wasted=newly_wasted,
+                        counting=runtime.first_successful_card_tick[owner] is None,
+                        coefficient=late_opening[0],
+                        grace=late_opening[1],
+                        cap=late_opening[2],
+                        step_cap=elixir_overflow_step_penalty_cap,
+                    )
+                    adjusted_reward[owner] -= late_penalty
             runtime.game_elixir_overflow_wasted = (game_wasted[0], game_wasted[1])
             runtime.game_elixir_overflow_cost_accrued = (game_accrued[0], game_accrued[1])
             runtime.game_elixir_overflow_penalty_total = (game_totals[0], game_totals[1])
+            runtime.late_opening_wasted = (late_wasted[0], late_wasted[1])
+            runtime.late_opening_cost_accrued = (late_accrued[0], late_accrued[1])
             runtime.personal_elixir_overflow_wasted = (personal_wasted[0], personal_wasted[1])
             runtime.personal_elixir_overflow_cost_accrued = (personal_accrued[0], personal_accrued[1])
             runtime.unilateral_elixir_overflow_wasted = (unilateral_wasted[0], unilateral_wasted[1])
