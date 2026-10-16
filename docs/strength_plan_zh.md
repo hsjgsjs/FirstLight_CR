@@ -166,7 +166,7 @@ bash native_runner/training/v4/lab_ppo.sh start spar16-recent-v1 200
 
 因此每次更新是一步学习率 1e-5 的 AdamW；`approx_kl` 和 `clip_fraction` 在这一步之前测得，按构造为 0，裁剪和 `--target-kl` 从未起作用。此前各阶段的“一千余次更新”实际只是一千余步极小的梯度步，这可以解释各模型长期停在 General 460 附近；每 4 次更新一次的人类 BC 步相对 PPO 步的分量也因此偏大。
 
-决定：两边从 update 200 用同一组更强的学习设置重新开新阶段（两边相同，对照仍成立）：`--learning-rate 3e-5 --ppo-epochs 4`。多轮后 `approx_kl` 与 `clip_fraction` 才有意义，`--target-kl 0.01` 与 `--clip-range 0.1` 作为刹车。健康范围：`approx_kl` 约 0.002–0.01、`clip_fraction` 约 0.02–0.15；`minibatch_updates` 经常小于 4 表示频繁触发 KL 提前停止，步子过大。新阶段更新计数从 1 开始，出牌温度按 update 200 处的值接续（`--gate-temperature-start 0.339 --gate-temperature-anneal-updates 1392`）。
+建议（待用户确认）：两边从 update 200 用同一组更强的学习设置重新开新阶段（两边相同，对照仍成立）：`--learning-rate 3e-5 --ppo-epochs 4`。多轮后 `approx_kl` 与 `clip_fraction` 才有意义，`--target-kl 0.01` 与 `--clip-range 0.1` 作为刹车。健康范围：`approx_kl` 约 0.002–0.01、`clip_fraction` 约 0.02–0.15；`minibatch_updates` 经常小于 4 表示频繁触发 KL 提前停止，步子过大。新阶段更新计数从 1 开始，出牌温度按 update 200 处的值接续（`--gate-temperature-start 0.339 --gate-temperature-anneal-updates 1392`）。
 
 启动日志里加载起点不报合同错误即为升级成功。新代码保存的检查点合同为 `v4.1`，旧代码无法加载；实战机器需先更新代码。
 
