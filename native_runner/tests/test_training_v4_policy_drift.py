@@ -95,3 +95,63 @@ def test_repeated_candidate_uids_in_recorded_games_do_not_stop_the_report() -> N
     # A WAIT names no candidate, so only the plays are left out of the human comparison.
     assert tally.human_dropped == gates.count(GATE_ACT)
     assert "repeated card UID" in report("moved", tally)
+
+
+def test_states_without_a_legal_play_are_measured_on_the_gate_only() -> None:
+    torch.manual_seed(5)
+    base, moved = _model().eval(), _model().eval()
+    playable = _batch(1)
+    # The fixture's second row has no legal candidate, like a recorded state short of elixir.
+    unplayable = _batch(2).index_select(torch.tensor([1]))
+    observations = (playable, unplayable, unplayable, playable)
+    gates = [GATE_ACT, GATE_WAIT, GATE_WAIT, GATE_ACT]
+    sequence = ILSequenceV4(
+        observations=observations,
+        actions=_human_actions(gates),
+        episode_start=torch.tensor([[True]] + [[False]] * (len(gates) - 1)),
+        valid_mask=torch.ones(len(gates), 1, dtype=torch.bool),
+        returns=torch.zeros(len(gates), 1),
+    )
+    tally = Tally()
+    with torch.no_grad():
+        compare_sequence(
+            base,
+            [moved],
+            sequence,
+            [tally],
+            temperatures=(0.33, 1.0, 2.0),
+            width=base.config.board_width,
+            generator=torch.Generator().manual_seed(3),
+        )
+    assert tally.steps == len(gates)
+    assert tally.sampled_acts == 2
+
+
+def test_a_decision_that_cannot_be_scored_is_counted_not_fatal(monkeypatch) -> None:
+    from native_runner.training.v4 import policy_drift
+
+    def broken(*args, **kwargs):
+        raise ValueError("odd recorded state")
+
+    monkeypatch.setattr(policy_drift, "measure_step", broken)
+    base = _model().eval()
+    sequence = ILSequenceV4(
+        observations=(_batch(1),) * 3,
+        actions=_human_actions([GATE_WAIT] * 3),
+        episode_start=torch.tensor([[True], [False], [False]]),
+        valid_mask=torch.ones(3, 1, dtype=torch.bool),
+        returns=torch.zeros(3, 1),
+    )
+    tally = Tally()
+    with torch.no_grad():
+        compare_sequence(
+            base,
+            [base],
+            sequence,
+            [tally],
+            temperatures=(0.33, 1.0, 2.0),
+            width=base.config.board_width,
+            generator=torch.Generator().manual_seed(4),
+        )
+    assert tally.skipped == 3
+    assert "3 decisions could not be scored" in report("x", tally)

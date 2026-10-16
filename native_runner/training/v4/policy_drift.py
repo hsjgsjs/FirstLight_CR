@@ -28,6 +28,7 @@ from ...card_names import CARD_NAMES
 from .cache import load_il_cache_shard
 from .catalog import FIRST_REAL_CARD_VOCAB_ID
 from .checkpoint import load_actor_critic_checkpoint
+from .decoding import ShadowCandidateLegality
 from .factory import build_production_model_v4
 from .imitation import slice_il_sequence
 from .ppo_expert_bc import load_expert_sampler_v4
@@ -109,6 +110,7 @@ class Tally:
         self.human = {"new": Counter(), "base": Counter()}
         self.human_counts = Counter()
         self.human_dropped = 0
+        self.skipped = 0
 
 
 def describe_plays(output, batch, catalog, width, side, tally):
@@ -147,30 +149,57 @@ def compare_sequence(base, models, sequence, tallies, *, temperatures, width, ge
             contexts.append(context)
         if not bool(sequence.valid_mask[t, 0]):
             continue
-        batch, human = with_slot_uids(base, batch, human)
-        waits = wait_actions(1, device, base.config.max_micro_actions)
-        base_wait = base._decode(batch, contexts[0], sample=False, forced_actions=waits, **decode).log_prob
-        base_act = 1.0 - float(base_wait.exp())
-        torch.manual_seed(int(torch.randint(0, 2**31 - 1, (1,), generator=generator)))
-        base_sample = base._decode(batch, contexts[0], sample=True, forced_actions=None, **decode)
-        human_base = (
-            None
-            if human is None
-            else head_log_probs(
-                base._decode(batch, contexts[0], sample=False, forced_actions=human, **decode).action_components
+        try:
+            measure_step(
+                base,
+                models,
+                contexts,
+                tallies,
+                batch,
+                human,
+                trusted_gate=bool(gate_mask[t, 0]),
+                decode=decode,
+                width=width,
+                generator=generator,
             )
+        except ValueError as error:
+            # One odd recorded state must not cost the whole report; it is counted and named once.
+            if not any(tally.skipped for tally in tallies):
+                print(f"skipping a decision the models cannot score: {error}", file=sys.stderr, flush=True)
+            for tally in tallies:
+                tally.skipped += 1
+
+
+def measure_step(base, models, contexts, tallies, batch, human, *, trusted_gate, decode, width, generator):
+    """Compare every checkpoint with the baseline at one recorded decision."""
+    device = next(base.parameters()).device
+    batch, human = with_slot_uids(base, batch, human)
+    waits = wait_actions(1, device, base.config.max_micro_actions)
+    base_wait = base._decode(batch, contexts[0], sample=False, forced_actions=waits, **decode).log_prob
+    base_act = 1.0 - float(base_wait.exp())
+    torch.manual_seed(int(torch.randint(0, 2**31 - 1, (1,), generator=generator)))
+    base_sample = base._decode(batch, contexts[0], sample=True, forced_actions=None, **decode)
+    human_base = (
+        None
+        if human is None
+        else head_log_probs(
+            base._decode(batch, contexts[0], sample=False, forced_actions=human, **decode).action_components
         )
-        human_act = human is not None and bool(human.gate[0] == GATE_ACT)
-        trusted_gate = bool(gate_mask[t, 0])
-        for model, context, tally in zip(models, contexts[1:], tallies, strict=True):
-            tally.steps += 1
-            new_wait = model._decode(batch, context, sample=False, forced_actions=waits, **decode).log_prob
-            new_act = 1.0 - float(new_wait.exp())
-            p, q = min(max(new_act, 1e-9), 1 - 1e-9), min(max(base_act, 1e-9), 1 - 1e-9)
-            tally.gate_kl += p * math.log(p / q) + (1 - p) * math.log((1 - p) / (1 - q))
-            tally.act_new += new_act
-            tally.act_base += base_act
-            # A play drawn from the checkpoint, its gate forced to ACT so every step informs the later heads.
+    )
+    human_act = human is not None and bool(human.gate[0] == GATE_ACT)
+    # Short of elixir or with nothing to play, only the gate is a choice; the later heads are not asked.
+    can_play = bool(ShadowCandidateLegality(batch.candidates, base.config).candidate_mask().any())
+    for model, context, tally in zip(models, contexts[1:], tallies, strict=True):
+        tally.steps += 1
+        new_wait = model._decode(batch, context, sample=False, forced_actions=waits, **decode).log_prob
+        new_act = 1.0 - float(new_wait.exp())
+        p, q = min(max(new_act, 1e-9), 1 - 1e-9), min(max(base_act, 1e-9), 1 - 1e-9)
+        tally.gate_kl += p * math.log(p / q) + (1 - p) * math.log((1 - p) / (1 - q))
+        tally.act_new += new_act
+        tally.act_base += base_act
+        # A play drawn from the checkpoint, its gate forced to ACT so every playable step informs the later heads.
+        drawn = None
+        if can_play:
             drawn = model._decode(
                 batch,
                 context,
@@ -179,30 +208,30 @@ def compare_sequence(base, models, sequence, tallies, *, temperatures, width, ge
                 preselected_gate=torch.full((1,), GATE_ACT, dtype=torch.long, device=device),
                 **decode,
             )
-            if int(drawn.actions.micro_action_count[0]) > 0:
-                scored_base = base._decode(batch, contexts[0], sample=False, forced_actions=drawn.actions, **decode)
-                new_heads = head_log_probs(drawn.action_components)
-                base_heads = head_log_probs(scored_base.action_components)
-                tally.sampled_acts += 1
-                for head in HEADS:
-                    tally.head_kl[head] += float(new_heads[head][0] - base_heads[head][0])
-            sample = model._decode(batch, context, sample=True, forced_actions=None, **decode)
-            describe_plays(sample, batch, base.catalog, width, "new", tally)
-            describe_plays(base_sample, batch, base.catalog, width, "base", tally)
-            if human is None:
-                tally.human_dropped += 1
+        if drawn is not None and int(drawn.actions.micro_action_count[0]) > 0:
+            scored_base = base._decode(batch, contexts[0], sample=False, forced_actions=drawn.actions, **decode)
+            new_heads = head_log_probs(drawn.action_components)
+            base_heads = head_log_probs(scored_base.action_components)
+            tally.sampled_acts += 1
+            for head in HEADS:
+                tally.head_kl[head] += float(new_heads[head][0] - base_heads[head][0])
+        sample = model._decode(batch, context, sample=True, forced_actions=None, **decode)
+        describe_plays(sample, batch, base.catalog, width, "new", tally)
+        describe_plays(base_sample, batch, base.catalog, width, "base", tally)
+        if human is None:
+            tally.human_dropped += 1
+            continue
+        human_new = head_log_probs(
+            model._decode(batch, context, sample=False, forced_actions=human, **decode).action_components
+        )
+        for head in ("gate", *HEADS):
+            if head == "gate" and not trusted_gate:
                 continue
-            human_new = head_log_probs(
-                model._decode(batch, context, sample=False, forced_actions=human, **decode).action_components
-            )
-            for head in ("gate", *HEADS):
-                if head == "gate" and not trusted_gate:
-                    continue
-                if head != "gate" and not human_act:
-                    continue
-                tally.human["new"][head] += float(human_new[head][0])
-                tally.human["base"][head] += float(human_base[head][0])
-                tally.human_counts[head] += 1
+            if head != "gate" and not human_act:
+                continue
+            tally.human["new"][head] += float(human_new[head][0])
+            tally.human["base"][head] += float(human_base[head][0])
+            tally.human_counts[head] += 1
 
 
 def report(label, tally):
@@ -211,6 +240,7 @@ def report(label, tally):
     lines = [
         f"== {label}  ({tally.steps} decisions"
         + (f"; {tally.human_dropped} human plays with a repeated card UID left out" if tally.human_dropped else "")
+        + (f"; {tally.skipped} decisions could not be scored" if tally.skipped else "")
         + ")"
     ]
     lines.append(
