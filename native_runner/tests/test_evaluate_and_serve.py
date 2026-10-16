@@ -327,6 +327,80 @@ def test_scheduled_evaluation_locksteps_one_block_on_resident_slots(monkeypatch,
     assert timing["elapsed_seconds"] >= timing["engine_step_wall_seconds"] >= 0
 
 
+def test_scheduled_evaluation_writes_one_combat_trace_per_game(monkeypatch, tmp_path):
+    from native_runner.training.v4.defense_trace import read_trace
+    from native_runner.training.v4.evaluation_protocol import natural_schedule
+
+    terminal = NS(winner=0, to_dict=lambda: {"winner": 0, "ended": True})
+    observations = {
+        owner: NS(
+            tick=300, owner=owner, players=[NS(owner=owner, elixir_exact=5.0)], events=[], entities=[], towers=[],
+            terminal=terminal,
+        )
+        for owner in (0, 1)
+    }
+
+    class Environment:
+        def __init__(self):
+            self.native = NS()
+            self.record_privileged_combat = False
+            self.steps = 0
+
+        def reset(self, *, match_config, options):
+            return observations, {}
+
+        def step(self, commands, **kwargs):
+            self.steps += 1
+            return observations, {}, {"__all__": True}, {"__all__": False}, {}
+
+        def drain_privileged_combat_records(self):
+            assert self.record_privileged_combat
+            return [{"t": 300, "kind": "death"}] if self.steps else []
+
+    environments = tuple(Environment() for _ in range(16))
+    engine = NS(
+        natives=tuple(NS() for _ in range(16)),
+        environments=environments,
+        coordinator=NS(
+            close_session=lambda: None, start_session=lambda: None, begin_round=lambda ids: None,
+            finish_round=lambda: None, abort_round=lambda error: None,
+        ),
+        prepare=lambda: None,
+        close=lambda: None,
+    )
+
+    def session(environment, model, *, actor_owner, **kwargs):
+        return NS(
+            start_episode=lambda *a, **k: None,
+            prepare_host_batch=lambda observation: ("host", True),
+            finish_decision=lambda observation, host_batch, context, force_opening=False: NS(
+                decoded=NS(actions=(ActionV1.wait(actor_owner, ticks=5),)), forced_opening=force_opening
+            ),
+            end_episode=lambda: None,
+        )
+
+    monkeypatch.setattr(
+        evaluate,
+        "load_policy_v4",
+        lambda path, **k: NS(
+            model=_Model(path), checkpoint_path=Path(path), checkpoint_sha256="hash", checkpoint_id=path
+        ),
+    )
+    monkeypatch.setattr(evaluate, "build_resident_engine_v4", lambda *a, **k: engine)
+    monkeypatch.setattr(evaluate, "build_policy_session_v4", session)
+    monkeypatch.setattr(evaluate, "forward_resident_contexts", lambda entries: [(e[1], None) for e in entries])
+    schedule = natural_schedule(MatchConfig(seed=7), range(4))
+    evaluate.evaluate(
+        "a.pt", "b.pt", games=16, match=MatchConfig(seed=7), output=tmp_path, schedule=schedule,
+        resident_lanes=16, trace_dir=tmp_path / "traces",
+    )
+    assert all(environment.record_privileged_combat for environment in environments)
+    traces = sorted((tmp_path / "traces").glob("trace-*.jsonl.gz"))
+    assert len(traces) == 16
+    header, views, combat = read_trace(traces[3])
+    assert header["checkpoint_ids"] == ["a.pt", "b.pt"] and header["seed"] == schedule[3].match.seed
+    assert len(views) == 4 and combat == [{"t": 300, "kind": "death"}]
+
 def test_evaluation_range_delays_are_repeatable_and_preserve_waits():
     plays = (ActionV1.play(0, 0, (3, 20), execute_offset_ticks=1), ActionV1.wait(0, ticks=5))
     offsets = []

@@ -10,12 +10,11 @@ so this tool measures:
 2. how well a heuristic from public state alone (unit/tower attack targets, projectile
    source/target/destination, spawner links) recovers the same attacker, for data without the ring.
 
-Record (one engine, JSON transport):
-    python -m native_runner.training.v4.evaluate --checkpoint-a A.pt --checkpoint-b B.pt \
-        --games 20 --deck-pool DECKS --sample --gate-temperature-a 0.2 --gate-temperature-b 0.2 \
-        --output evaluations/defense-trace --trace-dir evaluations/defense-trace/traces
-Analyze:
-    python -m native_runner.training.v4.defense_trace evaluations/defense-trace/traces
+Record a few round-robin blocks on a resident engine (round_robin.local.json conditions), then audit:
+    python -m native_runner.training.v4.defense_trace record --model-a "BC 200" --model-b "General 460" \
+        --existing-engine 127.0.0.1:28000
+Audit traces again (also those from evaluate --trace-dir):
+    python -m native_runner.training.v4.defense_trace analyze evaluations/defense-audit/traces
 """
 
 from __future__ import annotations
@@ -24,6 +23,7 @@ import argparse
 import gzip
 import json
 import math
+import sys
 from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -131,31 +131,36 @@ def compact_view(observation: Any) -> dict[str, Any]:
 
 class TraceWriter:
     """Write one gzip JSON-lines trace per game: a header, each owner's view of every step, and the
-    exact native damage/death records gathered since the previous step."""
+    exact native damage/death records gathered since the previous step. Games may be open at once."""
 
     def __init__(self, directory: Path) -> None:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._handle: Any = None
+        self._handles: dict[int, Any] = {}
 
     def start(self, game_index: int, header: Mapping[str, Any]) -> None:
-        self.close()
+        self.close(game_index)
         path = self.directory / f"trace-{game_index + 1:04d}.jsonl.gz"
-        self._handle = gzip.open(path, "wt", encoding="utf-8")  # noqa: SIM115 - one file spans many calls
-        self._handle.write(json.dumps({"version": TRACE_VERSION, **header}) + "\n")
+        handle = gzip.open(path, "wt", encoding="utf-8")  # noqa: SIM115 - one file spans many calls
+        handle.write(json.dumps({"version": TRACE_VERSION, **header}) + "\n")
+        self._handles[game_index] = handle
 
-    def write(self, observations: Mapping[int, Any], combat: list[Mapping[str, Any]] = ()) -> None:
-        if self._handle is None:
-            raise RuntimeError("trace writer has no open game")
+    def write(self, game_index: int, observations: Mapping[int, Any], combat: list[Mapping[str, Any]] = ()) -> None:
+        handle = self._handles.get(game_index)
+        if handle is None:
+            raise RuntimeError(f"trace writer has no open game {game_index}")
         if combat:
-            self._handle.write(json.dumps({"combat": list(combat)}, separators=(",", ":")) + "\n")
+            handle.write(json.dumps({"combat": list(combat)}, separators=(",", ":")) + "\n")
         for owner in sorted(observations):
-            self._handle.write(json.dumps(compact_view(observations[owner]), separators=(",", ":")) + "\n")
+            handle.write(json.dumps(compact_view(observations[owner]), separators=(",", ":")) + "\n")
 
-    def close(self) -> None:
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
+    def close(self, game_index: int | None = None) -> None:
+        """Close one game's trace, or every open trace."""
+
+        for index in tuple(self._handles) if game_index is None else (game_index,):
+            handle = self._handles.pop(index, None)
+            if handle is not None:
+                handle.close()
 
 
 def read_trace(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -371,9 +376,67 @@ def format_report(audit: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Audit enemy-unit kill attribution in recorded traces.")
-    parser.add_argument("traces", type=Path, help="directory of trace-*.jsonl.gz written by evaluate --trace-dir")
+def record(argv: list[str]) -> int:
+    """Play a few round-robin blocks on a resident engine with traces on, then audit them."""
+
+    import torch
+
+    from ...round_robin import base_match, existing_endpoint, parse_blocks, read_options
+    from .deck_pool import DeckPoolManifestV4
+    from .evaluate import evaluate
+    from .evaluation_protocol import natural_schedule
+
+    parser = argparse.ArgumentParser(
+        prog="defense_trace record",
+        description="Play round-robin blocks (same config and conditions as round_robin.sh) with combat traces.",
+    )
+    parser.add_argument("--config", type=Path, help="round-robin config (default: round_robin.local.json)")
+    parser.add_argument("--model-a", required=True, help="model name from the config, e.g. 'BC 200'")
+    parser.add_argument("--model-b", required=True, help="model name from the config, e.g. 'General 460'")
+    parser.add_argument("--blocks", type=parse_blocks, default=[0, 1, 2], help="block IDs (4 games each), default 0-2")
+    parser.add_argument("--existing-engine", type=existing_endpoint, required=True, help="HOST:PORT")
+    parser.add_argument("--output", type=Path, default=Path("evaluations/defense-audit"))
+    args = parser.parse_args(argv)
+    for key in ("cpu_threads", "lanes", "deck_pool", "delay_ticks", "min_play_gap_ticks", "battle_level", "device"):
+        setattr(args, key, None)
+    options = read_options(args)
+    for name in (args.model_a, args.model_b):
+        if name not in options["models"]:
+            parser.error(f"{name!r} is not a model in the config: {sorted(options['models'])}")
+    torch.set_num_threads(options["cpu_threads"])
+    match = base_match(options)
+    schedule = natural_schedule(match, args.blocks, deck_pool=DeckPoolManifestV4.load(options["deck_pool"]))
+    host, port = args.existing_engine
+    traces = args.output / "traces"
+    print(f"{args.model_a} vs {args.model_b}: {len(schedule)} games, blocks {args.blocks}", flush=True)
+    evaluate(
+        options["models"][args.model_a],
+        options["models"][args.model_b],
+        games=len(schedule),
+        match=match,
+        output=args.output,
+        host=host,
+        port=port,
+        device=options["device"],
+        sample=options["sample"],
+        delay_a_ticks=tuple(options["delay_ticks"]),
+        delay_b_ticks=tuple(options["delay_ticks"]),
+        min_play_gap_ticks=tuple(options["min_play_gap_ticks"]),
+        gate_temperature_a=options["gate_temperature"],
+        gate_temperature_b=options["gate_temperature"],
+        schedule=schedule,
+        resident_lanes=options["lanes"],
+        trace_dir=traces,
+    )
+    audit = audit_directory(traces)
+    (args.output / "audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    print(format_report(audit))
+    return 0
+
+
+def analyze(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="defense_trace", description="Audit enemy-unit kill attribution.")
+    parser.add_argument("traces", type=Path, help="directory of trace-*.jsonl.gz written with --trace-dir")
     parser.add_argument("--json", type=Path, help="also write the raw audit counts here")
     args = parser.parse_args(argv)
     audit = audit_directory(args.traces)
@@ -383,6 +446,15 @@ def main(argv: list[str] | None = None) -> int:
         args.json.write_text(json.dumps(audit, indent=2), encoding="utf-8")
     print(format_report(audit))
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "record":
+        return record(arguments[1:])
+    if arguments and arguments[0] == "analyze":
+        arguments = arguments[1:]
+    return analyze(arguments)
 
 
 if __name__ == "__main__":
