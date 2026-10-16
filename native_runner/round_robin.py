@@ -304,6 +304,13 @@ def _run(args):
     from .duel import (check_engine_settings, choose_ports, stop_group, tail, wait_ready)
 
     options = read_options(args)
+    config = args.config or ROOT / "round_robin.local.json"
+    if config.is_file():
+        print(f"配置文件：{config.resolve()}", flush=True)
+    else:
+        print(f"未找到 {config}，使用 round_robin.example.json 的默认设置。", flush=True)
+    print(f"模型：{'、'.join(options['models'])}；采样 {options['sample']}，"
+          f"出牌温度 {options['gate_temperature']}。", flush=True)
     identity = study_identity(options)
     if args.engines < 1 or args.engines > 64:
         raise ValueError("engines must be in 1..64")
