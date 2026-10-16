@@ -4356,11 +4356,16 @@ class BattleEnvV1:
             )
             card_id_raw = int(item.get("cardId", -1))
             spec = self.card_specs.get(card_id_raw)
-            kind = (
-                "projectile"
-                if rich_item.projectile is not None
-                else (spec.kind.value if spec is not None else ("effect" if card_id_raw <= 0 else "unknown"))
-            )
+            if rich_item.projectile is not None:
+                kind = "projectile"
+            elif spec is not None:
+                kind = spec.kind.value
+            elif card_id_raw in NORMAL_MODE_HERO_FORM_TO_BASE_CARD:
+                # Hero runtime forms (2030000xx) have no card spec of their own; without this they were
+                # labelled "unknown" and the policy never saw its hero form or active-ability marks.
+                kind = "hero"
+            else:
+                kind = "effect" if card_id_raw <= 0 else "unknown"
             velocity = self._entity_velocity.get(entity_id)
             if runtime.projectile_state is not None and velocity is not None:
                 projectile = runtime.projectile_state
