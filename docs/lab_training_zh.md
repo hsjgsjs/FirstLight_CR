@@ -157,6 +157,22 @@ tail runs/schedule.log                                                      # �
 - 续训会自动用上第一次 `start` 时的引擎数、CPU 分配和 GPU 设置，这些都存在 `runs/名字/launch-env` 里，不用再手动带变量。
 - 定时任务用的是 `.env` 里的设置，不受当前终端里残留变量的影响。
 
+### 全天自动拉起
+
+服务器全天可用时，不用 `schedule`，用 `watch` 让训练崩溃后自动续训：
+
+```bash
+bash native_runner/training/v4/lab_ppo.sh watch 名字A        # 每 5 分钟检查一次（可写第 2 个参数改间隔，1–30 分钟）
+bash native_runner/training/v4/lab_ppo.sh watch 名字B        # 每个运行各加一次；实例从 launch-env 自动识别
+bash native_runner/training/v4/lab_ppo.sh unwatch 名字A      # 取消
+tail runs/名字A/logs/watch.log                                # 检查和拉起的记录
+```
+
+- 每次检查就是 `ensure`：训练在跑就什么都不做；被主动 `stop` 过（留有停止记号）也不动；否则从最新的严格检查点续训，最多丢掉上一个检查点之后的几次更新。
+- 所以要停训练照常用 `stop`，`watch` 不会把它拉起来；之后手动 `resume` 时会清掉记号，`watch` 继续生效。
+- 注意：用 `options` 改了参数而还没 `resume` 时，下一次自动拉起就会按新参数热启动。改参数时要把 gate 温度的接续也一起写进去，不要留一半。
+- 可以和 `schedule` 同时用：每天的定时停止也会留下停止记号，`watch` 不会在停机时段把训练拉起来。
+
 ### 中途改参数
 
 - **续训时可以直接改**：总更新次数 `UPDATES`、`CR_PPO_INFERENCE_BATCH_WAIT_MS`。
