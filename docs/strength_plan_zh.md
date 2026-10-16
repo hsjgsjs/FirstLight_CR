@@ -86,15 +86,25 @@
 
 ## 8. 开始训练：近期指令的同源对照实验
 
-目的：判断 3.1 新输入本身有没有用。两次运行除代码版本外完全相同：同一个起点、同一份参数（含 6–10 间隔、人类 BC 设置）、同样 200 次更新。新输入实验加载旧检查点时自动无损升级，起点输出与对照完全相同，差异只来自训练中学到的东西。
+目的：判断 3.1 新输入本身有没有用。两次运行用**同一份新代码**、同一个起点、同一份参数（含 6–10 间隔、人类 BC 设置）、同样 200 次更新，唯一区别是对照加 `--freeze-recent-actions`：新输入通往原网络的路径固定为零、相关参数不训练，对照模型因此和改动前的模型完全等价（评测、实战喂它近期指令也不影响输出）。新输入实验加载旧检查点时自动无损升级，两边起点输出完全相同。
 
-**第一步，对照（旧代码，现在就能跑）。** 在未拉取新代码的仓库中，按[人类 BC 操作说明](human_bc_zh.md)“连续出牌间隔与提前量”一节，从 BC 200 准备 `runs/human-trial-gap-v2` 并启动 `spar16-human-gap-v2`，200 次更新约 2 小时。
+两块卡可以同时跑（见[单机训练记录](lab_training_zh.md)「同一台机器跑两个训练」）。服务器先拉取并合并新代码；**如果对照已经在旧代码上跑起来了，先等它结束再拉代码**，不要两种代码混用。
 
-**运行期间不要拉取或合并新代码。** 续训、自动重试或远程 worker 会启动新的 Python 进程；新旧代码混用会让传输格式不一致而报错，对照也会在续训时被自动升级成带新输入的模型。
+**第一步，准备起点和参数**（只做一次）：按[人类 BC 操作说明](human_bc_zh.md)「连续出牌间隔与提前量」一节的 `prepare_expert_experiment` 命令，从 BC 200 生成 `runs/human-trial-gap-v2`。
 
-**第二步，新输入（对照结束后）。** 拉取新代码，用对照的同一份起点和参数启动：
+**第二步，两个实例同时启动：**
 
 ```bash
+# 对照：GPU 0，默认实例，冻结新输入
+CR_PPO_CHECKPOINT="$PWD/runs/human-trial-gap-v2/baseline.pt" \
+CR_PPO_RESUME_CHECKPOINT="" \
+CR_PPO_EXTRA_ARGS="$(cat runs/human-trial-gap-v2/human-options.txt) --freeze-recent-actions" \
+CR_LAB_KEEP_CHECKPOINTS=100 \
+bash native_runner/training/v4/lab_ppo.sh start spar16-gap-control-v1 200
+
+# 新输入：GPU 1，实例 1，CPU 范围按自己的核数调整、不要和实例 0 重叠
+CR_LAB_INSTANCE=1 CR_LAB_TRAIN_GPUS=1 \
+CR_LAB_ENGINE_CPUS=20-27 CR_LAB_WORKER_CPUS=28-35 CR_LAB_CONTROL_CPUS=36-39 \
 CR_PPO_CHECKPOINT="$PWD/runs/human-trial-gap-v2/baseline.pt" \
 CR_PPO_RESUME_CHECKPOINT="" \
 CR_PPO_EXTRA_ARGS="$(cat runs/human-trial-gap-v2/human-options.txt)" \
@@ -102,6 +112,8 @@ CR_LAB_KEEP_CHECKPOINTS=100 \
 bash native_runner/training/v4/lab_ppo.sh start spar16-recent-v1 200
 ```
 
-启动日志里加载起点不报合同错误即为升级成功；保存的新检查点合同为 `v4.1`，旧代码无法加载，旧代码环境（例如尚未更新的实战机器）需先更新。
+两边的 CPU 份额要相同（引擎数、核数一致），否则吞吐不同、同样 200 次更新的墙钟和数据新旧程度会有差别，但更新次数与每次对局数相同，比较仍然成立。查看：`bash … status spar16-gap-control-v1`、`bash … status spar16-recent-v1`（自动识别实例）。
+
+启动日志里加载起点不报合同错误即为升级成功。新代码保存的检查点合同为 `v4.1`，旧代码无法加载；实战机器需先更新代码。
 
 **第三步，评测。** 循环赛模型设为 General 460、BC 200、两次运行的最终检查点，采样、温度 0.2、间隔 6–10，各机器合并结果后比较“新输入对对照”这一对。同时实战录像观察滚木/法术已出手后的重复补牌是否减少。两者差距在区间内不显著时，不据此宣称有效，可延长两边训练再比。

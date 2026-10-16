@@ -29,13 +29,17 @@
 # (0; nvidia-smi numbers, e.g. 0,1), CR_LAB_KEEP_CHECKPOINTS (3) and CR_LAB_CHECKPOINT_BUCKET (1000):
 # the newest few strict checkpoints are kept plus the first one in every bucket of that many updates.
 # NCCL_P2P_DISABLE, CR_PPO_INFERENCE_BATCH_WAIT_MS and other environment variables pass through to the trainer.
+# CR_LAB_INSTANCE (unset, or 1-3) runs a second, independent lab on the same machine: its own engine and
+# worker ports, emulator names and console ports, /dev/shm files, node directory, stop marker and schedule,
+# and every command (stop, status, ensure, schedule) acts on that instance only. Give each instance its own
+# CPU ranges and GPU (CR_LAB_*_CPUS, CR_LAB_TRAIN_GPUS); a run remembers its instance in launch-env.
 # A start saves these launch settings to runs/NAME/launch-env and a resume restores them, unless the same
 # variable is given on the resume command line.
 set -euo pipefail
 
 launch_vars=(CR_PPO_ENGINE_COUNT CR_LAB_ENGINE_CPUS CR_LAB_WORKER_CPUS CR_LAB_CONTROL_CPUS CR_LAB_TRAIN_GPUS
   CR_PPO_INFERENCE_BATCH_WAIT_MS CR_PPO_SEGMENT_SECONDS CR_PPO_LANE_MICROBATCH_SIZE NCCL_P2P_DISABLE
-  CR_PPO_CHECKPOINT)
+  CR_PPO_CHECKPOINT CR_LAB_INSTANCE)
 explicit_vars=" "
 for variable in "${launch_vars[@]}" CR_PPO_EXTRA_ARGS; do
   [[ ! -v $variable ]] || explicit_vars+="$variable "
@@ -48,20 +52,70 @@ cd "$repository_root"
 source "${repository_root}/native_runner/local_config.sh"
 python=${CR_AI_PYTHON:-python}
 runs=$repository_root/runs
-node_dir=$runs/lab-node
 engine_cpus=${CR_LAB_ENGINE_CPUS:-0-7}
 worker_cpus=${CR_LAB_WORKER_CPUS:-8-15}
 control_cpus=${CR_LAB_CONTROL_CPUS:-16-19}
 engine_count=${CR_PPO_ENGINE_COUNT:-8}
-base_port=${CR_PPO_BASE_PORT:-28000}
-worker_port=${CR_PPO_REMOTE_WORKER_PORT:-29900}
 train_gpus=${CR_LAB_TRAIN_GPUS:-0}
 keep_checkpoints=${CR_LAB_KEEP_CHECKPOINTS:-3}
 checkpoint_bucket=${CR_LAB_CHECKPOINT_BUCKET:-1000}
 host=$(hostname -s)
 user=$(id -un)
-export SLURM_JOB_ID=local TMPDIR=${TMPDIR:-/dev/shm}
+export TMPDIR=${TMPDIR:-/dev/shm}
 export CR_PPO_ENGINES_PER_GUEST=${CR_PPO_ENGINES_PER_GUEST:-4}
+
+# Everything two labs on one machine must not share. The default instance keeps the original names.
+instance_setup() {
+  instance=${CR_LAB_INSTANCE:-}
+  [[ -z $instance || $instance =~ ^[1-3]$ ]] || { echo "CR_LAB_INSTANCE must be unset or 1-3" >&2; exit 2; }
+  suffix=${instance:+-$instance}
+  node_dir=$runs/lab-node$suffix
+  stop_marker=$runs/lab-stopped-on-purpose$suffix
+  schedule_tag="# lab_ppo schedule${instance:+ instance $instance}"
+  base_port=${CR_PPO_BASE_PORT:-$((28000 + 200 * ${instance:-0}))}
+  worker_port=${CR_PPO_REMOTE_WORKER_PORT:-$((29900 + ${instance:-0}))}
+  guest_prefix=crppo$instance
+  export SLURM_JOB_ID=local$instance CR_PPO_GUEST_PREFIX=$guest_prefix
+  export CR_EMULATOR_BASE_PORT=$((5554 + 16 * ${instance:-0})) CR_PPO_REMOTE_WORKER_PORT=$worker_port
+}
+instance_setup
+
+# Extended-regex form of a literal path or value.
+regex_literal() {
+  sed 's/[][\\.*^$+?(){}|/]/\\&/g' <<<"$1"
+}
+
+# PIDs of this user's processes whose command line matches $1 and, if given, not $2.
+matching_pids() {
+  local include=$1 exclude=${2:-}
+  { pgrep -u "$user" -af -- "$include" 2>/dev/null || true; } \
+    | { if [[ -n $exclude ]]; then grep -Ev -- "$exclude" || true; else cat; fi; } \
+    | awk '$1 != '"$$"' {print $1}'
+}
+
+kill_matching() {
+  local signal=$1 pids
+  shift
+  pids=$(matching_pids "$@")
+  [[ -z $pids ]] || kill "-$signal" $pids 2>/dev/null || true
+}
+
+# This instance's processes, by the ports, paths and names only it uses. The default instance also matches
+# trainers started before topologies moved into the node directory (runs/NAME/topology.json).
+instance_patterns() {
+  local node runs_re
+  node=$(regex_literal "$node_dir")
+  runs_re=$(regex_literal "$runs")
+  echo "launch_ppo_engine_node\.sh $node( |$)"
+  echo "remote_ppo_worker_server .*--port $worker_port( |$)"
+  echo "tcp_endpoint_proxy.* --listen-base $base_port( |$)"
+  echo "-avd ${guest_prefix}_"
+  if [[ -n $instance ]]; then
+    echo "(train_ppo_self_play_cluster|torch\.distributed\.run).*--engine-ready $node/topology\.json"
+  else
+    echo "(train_ppo_self_play_cluster|torch\.distributed\.run).*--engine-ready $runs_re/[^ ]*topology\.json"
+  fi
+}
 
 default_extra_args() {
   # The path to Active IL contains a space, and the trainer options are split on whitespace.
@@ -89,7 +143,11 @@ cpu_count() {
 }
 
 supervisor_pids() {
-  pgrep -u "$user" -f "lab_ppo\.sh _run " || true
+  if [[ -n $instance ]]; then
+    matching_pids "lab_ppo\.sh _run .* lab-instance=$instance( |$)"
+  else
+    matching_pids "lab_ppo\.sh _run " "lab-instance=[1-9]"
+  fi
 }
 
 log() {
@@ -97,20 +155,26 @@ log() {
 }
 
 # Only this user's processes, and only emulators of the PPO engine clusters (AVD names crppo_*).
+# Only this instance's processes: see instance_patterns.
 cleanup() {
+  local -a patterns
+  mapfile -t patterns < <(instance_patterns)
+  local trainer=${patterns[4]} engine=${patterns[0]} exclude=""
+  [[ -n $instance ]] || exclude="lab-node-[1-9]/topology"
   [[ ! -d $node_dir ]] || touch "$node_dir/STOP_ENGINES"
-  pkill -u "$user" -f "train_ppo_self_play_cluster|torch\.distributed\.run" 2>/dev/null || true
+  kill_matching TERM "$trainer" "$exclude"
   for _ in {1..6}; do
-    pgrep -u "$user" -f "launch_ppo_engine_node" >/dev/null || break
+    [[ -n $(matching_pids "$engine") ]] || break
     sleep 5
   done
-  local pattern="launch_ppo_engine_node|remote_ppo_worker_server|tcp_endpoint_proxy|train_ppo_self_play_cluster"
-  pkill -u "$user" -f "$pattern" 2>/dev/null || true
-  pkill -u "$user" -f -- "-avd crppo_" 2>/dev/null || true
-  sleep 3
-  pkill -9 -u "$user" -f "$pattern" 2>/dev/null || true
-  pkill -9 -u "$user" -f -- "-avd crppo_" 2>/dev/null || true
-  rm -rf /dev/shm/firstlight-ppo-local-*
+  local signal pattern
+  for signal in TERM KILL; do
+    for pattern in "${patterns[@]}"; do
+      kill_matching "$signal" "$pattern" "$exclude"
+    done
+    [[ $signal == KILL ]] || sleep 3
+  done
+  rm -rf /dev/shm/firstlight-ppo-"$SLURM_JOB_ID"-*
 }
 
 prune_checkpoints() {
@@ -243,9 +307,11 @@ run() {
   local gpu_count
   gpu_count=$(tr ',' '\n' <<<"$train_gpus" | grep -c .)
   "$python" -m native_runner.training.v4.build_ppo_multinode_topology \
-    --node-ready "$node_dir/engine-node-ready.json" --output "$run_dir/topology.json" \
-    --trainer-job-id local --trainer-host "$host" --gpus "$gpu_count" \
+    --node-ready "$node_dir/engine-node-ready.json" --output "$node_dir/topology.json" \
+    --trainer-job-id "$SLURM_JOB_ID" --trainer-host "$host" --gpus "$gpu_count" \
     --worker-cpus "$worker_cpus" --control-cpus "$control_cpus" >"$logs/topology.log" 2>&1
+  # The trainer reads the node's copy, whose path identifies this instance's trainer to cleanup.
+  cp "$node_dir/topology.json" "$run_dir/topology.json"
 
   local extra=${CR_PPO_EXTRA_ARGS:-}
   if [[ -z $extra && -n $resume && -s $run_dir/trainer-options.txt ]]; then
@@ -260,7 +326,7 @@ run() {
   local trainer_extra=$extra
   [[ -z ${CR_LAB_WARM_START_OPTIMIZER:-} ]] || trainer_extra+=" --warm-start-optimizer"
   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$train_gpus CR_PPO_EXTRA_ARGS=$trainer_extra \
-    bash "$script_dir/launch_ppo_multinode_training.sh" "$stage" "$run_dir/topology.json" "$updates" \
+    bash "$script_dir/launch_ppo_multinode_training.sh" "$stage" "$node_dir/topology.json" "$updates" \
     "${CR_PPO_SEGMENT_SECONDS:-40}" "$resume" >>"$logs/trainer.log" 2>&1 &
   local trainer_pid=$!
 
@@ -312,6 +378,15 @@ load_launch_env() {
   done <"$1/launch-env"
 }
 
+# Act on the instance a run was started in, unless CR_LAB_INSTANCE is given on the command line.
+use_run_instance() {
+  local saved
+  [[ $explicit_vars != *" CR_LAB_INSTANCE "* && -f $runs/$1/launch-env ]] || return 0
+  saved=$(sed -n 's/^CR_LAB_INSTANCE=//p' "$runs/$1/launch-env")
+  export CR_LAB_INSTANCE=$saved
+  instance_setup
+}
+
 # Wait up to $2 minutes for a strict checkpoint newer than the current one in runs/$1.
 wait_for_checkpoint() {
   local before deadline=$((SECONDS + $2 * 60))
@@ -323,26 +398,26 @@ wait_for_checkpoint() {
   log "no new checkpoint within $2 minutes; stopping anyway"
 }
 
-# Present after a deliberate stop (by hand or by the schedule) until the next start or resume, so
+# A deliberate stop (by hand or by the schedule) leaves $stop_marker until the next start or resume, so
 # ensure can tell a run that was stopped from one that crashed.
-stop_marker=$runs/lab-stopped-on-purpose
 
 start() {
   local name=${1:?usage: lab_ppo.sh start|resume NAME [UPDATES]} updates=${2:-30000} resume=${3:-}
   if [[ -n $(supervisor_pids) ]]; then
-    echo "a lab PPO run is already active; run: lab_ppo.sh stop" >&2
+    echo "a lab PPO run is already active${instance:+ in instance $instance}; run:" \
+      "${instance:+CR_LAB_INSTANCE=$instance }lab_ppo.sh stop" >&2
     exit 1
   fi
   rm -f "$stop_marker"
   local run_dir=$runs/$name
   mkdir -p "$run_dir/logs"
   save_launch_env "$run_dir"
-  setsid nohup bash "$script_dir/lab_ppo.sh" _run "$run_dir" "$updates" "$resume" \
+  setsid nohup bash "$script_dir/lab_ppo.sh" _run "$run_dir" "$updates" "$resume" "lab-instance=${instance:-0}" \
     >>"$run_dir/logs/supervisor.log" 2>&1 </dev/null &
   echo "started run $name in the background (supervisor pid $!)"
   echo "  progress:  tail -f $run_dir/logs/supervisor.log $run_dir/logs/trainer.log"
   echo "  status:    bash native_runner/training/v4/lab_ppo.sh status $name"
-  echo "  stop:      bash native_runner/training/v4/lab_ppo.sh stop"
+  echo "  stop:      ${instance:+CR_LAB_INSTANCE=$instance }bash native_runner/training/v4/lab_ppo.sh stop"
 }
 
 case ${1:-} in
@@ -358,6 +433,7 @@ case ${1:-} in
     shift
     checkpoint=$(newest_checkpoint "$runs/${1:?usage: lab_ppo.sh resume NAME [UPDATES]}")
     load_launch_env "$runs/$1"
+    instance_setup
     if [[ $explicit_vars == *" CR_PPO_EXTRA_ARGS "* && -s $runs/$1/trainer-options.txt ]]; then
       remember_stage_options "$runs/$1"
       echo "$CR_PPO_EXTRA_ARGS" >"$runs/$1/trainer-options.txt"
@@ -383,6 +459,7 @@ case ${1:-} in
     fi
     ;;
   stop)
+    [[ -z ${2:-} ]] || { use_run_instance "$2"; }
     mkdir -p "$runs" && date -Is >"$stop_marker"
     if [[ -n ${3:-} ]]; then
       log "waiting up to $3 minutes for the next checkpoint of $2"
@@ -397,7 +474,7 @@ case ${1:-} in
       done
     fi
     cleanup
-    echo "stopped; remaining processes: $(pgrep -u "$user" -fc -- "-avd crppo_|remote_ppo_worker_server|train_ppo_self_play_cluster" || true)"
+    echo "stopped${instance:+ instance $instance}; remaining processes: $(instance_patterns | while read -r pattern; do matching_pids "$pattern"; done | sort -u | wc -l)"
     ;;
   schedule)
     name=${2:?usage: lab_ppo.sh schedule NAME HH:MM HH:MM} begin=${3:?start time HH:MM} end=${4:?stop time HH:MM}
@@ -413,25 +490,27 @@ case ${1:-} in
         | sed "s|^$runs/||; s|/.*||" | sort -u | sed 's/^/  /' >&2
       exit 1
     fi
-    script=$script_dir/lab_ppo.sh
+    use_run_instance "$name"
+    script="${instance:+CR_LAB_INSTANCE=$instance }bash $script_dir/lab_ppo.sh"
     # By default keep checking all day, until the checkpoint-aware stop begins.
     retry_minutes=${5:-$(((drain_minute - begin_minute + 1440) % 1440 - 15))}
-    log_file=$runs/schedule.log
+    log_file=$runs/schedule$suffix.log
     {
-      { crontab -l 2>/dev/null || true; } | grep -v "# lab_ppo schedule" || true
-      echo "$((begin_minute % 60)) $((begin_minute / 60)) * * * bash $script resume $name >>$log_file 2>&1 # lab_ppo schedule"
-      echo "$((drain_minute % 60)) $((drain_minute / 60)) * * * bash $script stop $name 11 >>$log_file 2>&1 # lab_ppo schedule"
-      echo "$((end_minute % 60)) $((end_minute / 60)) * * * bash $script stop >>$log_file 2>&1 # lab_ppo schedule"
+      { crontab -l 2>/dev/null || true; } | { grep -v -- "$schedule_tag\$" || true; }
+      echo "$((begin_minute % 60)) $((begin_minute / 60)) * * * $script resume $name >>$log_file 2>&1 $schedule_tag"
+      echo "$((drain_minute % 60)) $((drain_minute / 60)) * * * $script stop $name 11 >>$log_file 2>&1 $schedule_tag"
+      echo "$((end_minute % 60)) $((end_minute / 60)) * * * $script stop $name 0 >>$log_file 2>&1 $schedule_tag"
       for ((offset = 15; offset <= retry_minutes; offset += 15)); do
         retry_minute=$(((begin_minute + offset) % 1440))
-        echo "$((retry_minute % 60)) $((retry_minute / 60)) * * * bash $script ensure $name >>$log_file 2>&1 # lab_ppo schedule"
+        echo "$((retry_minute % 60)) $((retry_minute / 60)) * * * $script ensure $name >>$log_file 2>&1 $schedule_tag"
       done
     } | crontab -
     echo "scheduled $name daily: resume at $begin, retry for $retry_minutes minutes, stop by $end (log: $log_file)"
-    crontab -l | grep "# lab_ppo schedule"
+    crontab -l | grep -- "$schedule_tag\$"
     ;;
   options)
     name=${2:?usage: lab_ppo.sh options NAME [--FLAG [VALUE...]]... [--unset --FLAG]...}
+    use_run_instance "$name"
     if (($# > 2)); then
       edit_options "$runs/$name" "${@:3}"
       echo "saved; the next resume of $name warm-starts from its newest checkpoint with these options"
@@ -441,6 +520,7 @@ case ${1:-} in
     ;;
   ensure)
     name=${2:?usage: lab_ppo.sh ensure NAME}
+    use_run_instance "$name"
     if [[ -n $(supervisor_pids) ]]; then
       log "ensure $name: running"
     elif [[ -e $stop_marker ]]; then
@@ -451,12 +531,13 @@ case ${1:-} in
     fi
     ;;
   unschedule)
-    { crontab -l 2>/dev/null || true; } | { grep -v "# lab_ppo schedule" || true; } | crontab -
-    echo "daily schedule removed"
+    { crontab -l 2>/dev/null || true; } | { grep -v -- "$schedule_tag\$" || true; } | crontab -
+    echo "daily schedule removed${instance:+ for instance $instance}"
     ;;
   status)
-    echo "supervisor: $(supervisor_pids | tr '\n' ' ')"
-    echo "emulators: $(pgrep -u "$user" -fc -- "qemu-system.*-avd crppo_" || true)  free disk: $(df -Ph "$runs" | awk 'NR == 2 {print $4}')"
+    [[ -z ${2:-} ]] || use_run_instance "$2"
+    echo "${instance:+instance $instance  }supervisor: $(supervisor_pids | tr '\n' ' ')"
+    echo "emulators: $(pgrep -u "$user" -fc -- "qemu-system.*-avd ${guest_prefix}_" || true)  free disk: $(df -Ph "$runs" | awk 'NR == 2 {print $4}')"
     if [[ -n ${2:-} ]]; then
       run_dir=$runs/$2
       stage=$(latest_stage "$run_dir")

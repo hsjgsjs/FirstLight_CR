@@ -308,6 +308,41 @@ class UniversalCardPolicyV4(nn.Module):
             raise TypeError("PPO location-head precision mode must be bool")
         self._ppo_location_head_fp32 = enabled
 
+    def freeze_recent_actions(self) -> None:
+        """Keep recent own actions out of this policy for a same-code control run.
+
+        Their paths into existing activations stay exactly zero while every other
+        weight trains, so the frozen model computes what a pre-recent-action model
+        would, whatever recent actions it is shown in training, evaluation or live play.
+        """
+
+        config = self.config
+        widened = (
+            (self.input_projection[0].weight, config.recent_action_dim),
+            (self.spatial_encoder.input.weight, config.recent_action_spatial_channels),
+        )
+        skip = self.recent_action_policy_skip
+        if any(bool(weight[:, -width:].any()) for weight, width in widened) or any(
+            bool(parameter.any()) for parameter in skip.parameters()
+        ):
+            raise ValueError("recent-action paths are already trained; freeze only an upgraded or new model")
+        for name, parameter in self.recent_action_encoder.named_parameters():
+            if not name.startswith("card_encoder."):
+                parameter.requires_grad_(False)
+        for parameter in skip.parameters():
+            parameter.requires_grad_(False)
+
+        def hook(width: int):
+            def zero_new_columns(gradient: Tensor) -> Tensor:
+                gradient = gradient.clone()
+                gradient[:, -width:] = 0
+                return gradient
+
+            return zero_new_columns
+
+        for weight, width in widened:
+            weight.register_hook(hook(width))
+
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
 

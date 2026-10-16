@@ -213,3 +213,34 @@ def test_legacy_optimizer_moments_follow_parameter_names(tmp_path) -> None:
     # The upgraded optimizer can keep training every parameter, new ones included.
     target(_with_recent(_batch(), target.config), target.initial_state(2)).value.sum().backward()
     target_optimizer.step()
+
+
+def test_frozen_recent_actions_keep_the_legacy_function_while_training(tmp_path) -> None:
+    torch.manual_seed(4)
+    model = _model()
+    model.freeze_recent_actions()
+    card_parameter = next(model.card_encoder.parameters())
+    assert card_parameter.requires_grad
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+    batch = _with_recent(_batch(), model.config)
+    for _ in range(3):
+        optimizer.zero_grad()
+        context = model(batch, model.initial_state(2))
+        (context.value.sum() + context.policy_context.square().sum()).backward()
+        optimizer.step()
+    assert not bool(model.input_projection[0].weight[:, -model.config.recent_action_dim :].any())
+    assert not bool(model.spatial_encoder.input.weight[:, -2:].any())
+    assert not any(bool(parameter.any()) for parameter in model.recent_action_policy_skip.parameters())
+    model.eval()
+    plain = _batch()
+    with torch.no_grad():
+        expected = model(plain, model.initial_state(2))
+        actual = model(_with_recent(plain, model.config), model.initial_state(2))
+    torch.testing.assert_close(actual.policy_context, expected.policy_context, rtol=0, atol=0)
+    torch.testing.assert_close(actual.value, expected.value, rtol=0, atol=0)
+
+    trained = _model()
+    with torch.no_grad():
+        trained.recent_action_policy_skip.weight.fill_(0.1)
+    with pytest.raises(ValueError, match="already trained"):
+        trained.freeze_recent_actions()
