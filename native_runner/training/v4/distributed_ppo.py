@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -71,7 +71,52 @@ def _allreduce_gradients(parameters: Sequence[nn.Parameter], *, world_size: int)
                 parameter.grad = gradient
 
 
-def _global_normalize_advantages(advantages: Tensor, valid_mask: Tensor, *, device: torch.device) -> Tensor:
+class RunningAdvantageScaleV4:
+    """Advantage spread pooled over recent updates, frame-weighted, with exponential decay per update.
+
+    Rollout segments cut every lane at the same game phase, so one update can hold only openings, whose
+    advantages are small, and a later one only endings, whose advantages are large. Dividing each update by
+    its own spread scales opening noise up to the size of decisive endings; dividing by the pooled spread
+    keeps the phases in proportion.
+    """
+
+    def __init__(self, decay: float) -> None:
+        if not 0.0 < decay < 1.0:
+            raise ValueError("advantage scale decay must be in (0, 1)")
+        self.decay = float(decay)
+        self.count = 0.0
+        self.total = 0.0
+        self.square_total = 0.0
+
+    def update(self, *, count: float, total: float, square_total: float) -> float:
+        """Fold one update's frame statistics in and return the pooled standard deviation."""
+
+        self.count = self.decay * self.count + count
+        self.total = self.decay * self.total + total
+        self.square_total = self.decay * self.square_total + square_total
+        mean = self.total / self.count
+        return math.sqrt(max(0.0, self.square_total / self.count - mean * mean))
+
+    def state_dict(self) -> dict[str, float]:
+        return {"decay": self.decay, "count": self.count, "total": self.total, "square_total": self.square_total}
+
+    def load_state_dict(self, state: Mapping[str, float]) -> None:
+        if float(state["decay"]) != self.decay:
+            raise ValueError("advantage scale decay changed")
+        self.count = float(state["count"])
+        self.total = float(state["total"])
+        self.square_total = float(state["square_total"])
+
+
+def _global_normalize_advantages(
+    advantages: Tensor,
+    valid_mask: Tensor,
+    *,
+    device: torch.device,
+    running_scale: RunningAdvantageScaleV4 | None = None,
+) -> tuple[Tensor, float]:
+    """Center by this update's mean; scale by its own spread, or by ``running_scale`` when given."""
+
     selected = advantages[valid_mask].to(device=device, dtype=torch.float64)
     statistics = torch.tensor(
         [
@@ -85,10 +130,12 @@ def _global_normalize_advantages(advantages: Tensor, valid_mask: Tensor, *, devi
     _sum(statistics)
     count = statistics[2]
     if float(count) <= 1.0:
-        return advantages
+        return advantages, 1.0
     mean = statistics[0] / count
-    variance = (statistics[1] / count - mean.square()).clamp_min(0.0)
-    return (advantages - mean.cpu().to(advantages.dtype)) / (variance.sqrt().cpu().to(advantages.dtype) + 1e-8)
+    scale = float((statistics[1] / count - mean.square()).clamp_min(0.0).sqrt())
+    if running_scale is not None:
+        scale = running_scale.update(count=float(count), total=float(statistics[0]), square_total=float(statistics[1]))
+    return (advantages - mean.cpu().to(advantages.dtype)) / (scale + 1e-8), scale
 
 
 def _global_rollout_statistics(
@@ -198,6 +245,7 @@ def distributed_ppo_update_v4(
     autocast_dtype: torch.dtype | None = torch.bfloat16,
     expected_policy_state_id: str | None = None,
     validate: bool = False,
+    advantage_scale: RunningAdvantageScaleV4 | None = None,
 ) -> list[dict[str, float]]:
     """Train synchronously across ranks with chunked recurrent backpropagation.
 
@@ -230,7 +278,10 @@ def distributed_ppo_update_v4(
     device = next(model.parameters()).device
     advantages, returns = rollout.advantages_and_returns(gamma=actual.gamma, gae_lambda=actual.gae_lambda)
     rollout_statistics = _global_rollout_statistics(rollout, advantages, returns, device=device)
-    advantages = _global_normalize_advantages(advantages, rollout.valid_mask, device=device)
+    advantages, scale = _global_normalize_advantages(
+        advantages, rollout.valid_mask, device=device, running_scale=advantage_scale
+    )
+    rollout_statistics["advantage_scale"] = scale
 
     local_batches = math.ceil(rollout.batch_size / lane_minibatch_size)
     batch_count_tensor = torch.tensor(local_batches, device=device, dtype=torch.long)
