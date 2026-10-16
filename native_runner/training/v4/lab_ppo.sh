@@ -674,7 +674,8 @@ for stage in sorted(run.glob("train-*")):
         print("   options -", " | ".join(sorted(item.strip() for item in previous - options if item.strip())))
         print("   options +", " | ".join(sorted(item.strip() for item in options - previous if item.strip())))
     previous = options if options is not None else previous
-    print("   updates    vs fixed (n)  self  kl      clip   EV     entropy  adv scale  steps  plays  wasted  first")
+    print("   updates    vs fixed (n)  self  kl      clip   EV     entropy  adv scale  steps  plays  wasted  first"
+          "  grad cos  snr")
     for low in range(metrics[0]["update"], metrics[-1]["update"] + 1, block):
         high = low + block - 1
         part = [row for row in metrics if low <= row["update"] <= high]
@@ -692,7 +693,8 @@ for stage in sorted(run.glob("train-*")):
               f"{median('clip_fraction'):.3f}  {median('value_explained_variance'):5.2f}  {median('entropy'):.3f}    "
               f"{median('advantage_scale'):7.3f}  {median('minibatch_updates'):5.0f}  "
               f"{st.mean(row['active_actions'][owner] for row, owner in seats) if seats else math.nan:5.1f}  "
-              f"{st.median(wasted) if wasted else math.nan:6.1f}  {st.median(first) if first else math.nan:5.0f}")
+              f"{st.median(wasted) if wasted else math.nan:6.1f}  {st.median(first) if first else math.nan:5.0f}  "
+              f"{median('gradient_half_cosine'):8.3f}  {median('gradient_snr'):6.2f}")
 if not shown:
     stages = sorted(path.name for path in run.glob("train-*"))
     print(f"{run.name}: no finished update yet" + (f" (stages: {', '.join(stages)})" if stages else " (no train-* stage; did it start?)"))

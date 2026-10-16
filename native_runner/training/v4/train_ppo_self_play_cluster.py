@@ -1100,6 +1100,15 @@ def main() -> int:
     parser.add_argument("--first-hog-deferral-penalty-episode-cap", type=float, default=0.0)
     parser.add_argument("--target-kl", type=float, default=0.01)
     parser.add_argument(
+        "--gradient-noise-every",
+        type=int,
+        default=0,
+        help=(
+            "every N updates, first compare the policy gradients of two halves of the lanes (gradient_snr, "
+            "gradient_half_cosine in metrics); costs one extra forward and backward pass; 0 turns it off"
+        ),
+    )
+    parser.add_argument(
         "--advantage-normalization",
         choices=("batch", "running"),
         default="batch",
@@ -1137,6 +1146,8 @@ def main() -> int:
     args = parser.parse_args()
     if not args.score_model_delay_offset and args.execution_delay_ticks is None:
         raise ValueError("the model's delay offset reaches the game unless --execution-delay-ticks replaces it")
+    if args.gradient_noise_every < 0:
+        raise ValueError("--gradient-noise-every must be 0 (off) or positive")
     if not 0 <= args.fixed_opponent_opening_natural_percent <= 100:
         raise ValueError("fixed-opponent opening natural percent must be in [0, 100]")
     if (
@@ -1984,6 +1995,7 @@ def main() -> int:
                 expected_policy_state_id=collected_policy_state_id,
                 validate=args.validate,
                 advantage_scale=advantage_scale,
+                gradient_noise=bool(args.gradient_noise_every) and update_step % args.gradient_noise_every == 0,
             )
             bc_metrics = {}
             if expert_bc_sampler is not None and update_step % args.expert_bc_every_updates == 0:
