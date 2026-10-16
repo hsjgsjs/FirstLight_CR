@@ -10,6 +10,8 @@
 #                                     the next resume, by hand or by the schedule, uses them
 #   lab_ppo.sh status [NAME]          processes, latest metrics, checkpoints and free disk
 #   lab_ppo.sh load [NAME]            live CPU (per core group) and GPU use, and where updates spend time
+#   lab_ppo.sh trend NAME [BLOCK]     per stage and every BLOCK (16) updates: win rate against the fixed
+#                                     opponents, PPO step statistics and play habits, and the options changed
 #   lab_ppo.sh stop [NAME MINUTES]    stop the run and clean up engines, workers and /dev/shm; with NAME and
 #                                     MINUTES, first wait up to MINUTES for the next strict checkpoint
 #   lab_ppo.sh schedule NAME HH:MM HH:MM [RETRY_MINUTES]   every day, resume NAME at the first time and
@@ -644,6 +646,49 @@ for opponent in sorted({r["opponent_checkpoint_id"] for r in fixed}, key=lambda 
 PY
       echo "checkpoints: $(find "$run_dir" -path '*/train-*/checkpoints/update-*.pt' 2>/dev/null | wc -l), newest $(newest_checkpoint "$run_dir")"
     fi
+    ;;
+  trend)
+    # Win rate against the fixed opponents over the whole run, next to what the optimizer did at the time.
+    "$python" - "$runs/${2:?usage: lab_ppo.sh trend NAME [BLOCK]}" "${3:-16}" <<'PY'
+import json, math, statistics as st, sys
+from pathlib import Path
+run, block = Path(sys.argv[1]), int(sys.argv[2])
+previous = None
+for stage in sorted(run.glob("train-*")):
+    if not (stage / "metrics.jsonl").exists():
+        continue
+    metrics = [json.loads(line) for line in (stage / "metrics.jsonl").read_text().splitlines()]
+    games = [json.loads(line) for line in (stage / "matches.jsonl").read_text().splitlines()] \
+        if (stage / "matches.jsonl").exists() else []
+    if not metrics:
+        continue
+    print(f"== {stage.name}  updates {metrics[0]['update']}-{metrics[-1]['update']}")
+    saved = run / f"options-{stage.name}.txt"
+    options = set(saved.read_text().split("--")) if saved.exists() else None
+    if options is not None and previous is not None and options != previous:
+        print("   options -", " | ".join(sorted(item.strip() for item in previous - options if item.strip())))
+        print("   options +", " | ".join(sorted(item.strip() for item in options - previous if item.strip())))
+    previous = options if options is not None else previous
+    print("   updates    vs fixed (n)  self  kl      clip   EV     entropy  adv scale  steps  plays  wasted  first")
+    for low in range(metrics[0]["update"], metrics[-1]["update"] + 1, block):
+        high = low + block - 1
+        part = [row for row in metrics if low <= row["update"] <= high]
+        played = [row for row in games if low <= row["update"] <= high]
+        fixed = [row["result"][row["current_owners"][0]] for row in played if row.get("opponent_checkpoint_id")]
+        seats = [(row, owner) for row in played for owner in row["current_owners"]]
+        median = lambda key: st.median(float(row[key]) for row in part if key in row) \
+            if any(key in row for row in part) else math.nan
+        wasted = [row["cumulative_elixir_overflow_wasted"][owner] for row, owner in seats
+                  if row.get("cumulative_elixir_overflow_wasted")]
+        first = [row["first_nonwait_action_tick"][owner] / 20 for row, owner in seats
+                 if row["first_nonwait_action_tick"][owner] is not None]
+        rate = f"{100 * sum(value > 0 for value in fixed) / len(fixed):3.0f}% ({len(fixed):3d})" if fixed else "    -     "
+        print(f"   {low:4d}-{high:<4d}  {rate}  {len(played) - len(fixed):4d}  {median('approx_kl'):.4f}  "
+              f"{median('clip_fraction'):.3f}  {median('value_explained_variance'):5.2f}  {median('entropy'):.3f}    "
+              f"{median('advantage_scale'):7.3f}  {median('minibatch_updates'):5.0f}  "
+              f"{st.mean(row['active_actions'][owner] for row, owner in seats) if seats else math.nan:5.1f}  "
+              f"{st.median(wasted) if wasted else math.nan:6.1f}  {st.median(first) if first else math.nan:5.0f}")
+PY
     ;;
   load)
     # Live CPU use per core group and GPU use over 5 seconds, then where recent updates spent their time.
