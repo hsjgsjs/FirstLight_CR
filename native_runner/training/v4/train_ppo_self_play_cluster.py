@@ -31,7 +31,7 @@ from .checkpoint import CHECKPOINT_SCHEMA_V4, load_actor_critic_checkpoint, save
 from .cluster_self_play import ClusterCollectionV4, ClusterMatchAssignmentV4
 from .deck_pool import DeckIdentityV4, DeckPoolManifestV4
 from .decoding import ShadowCandidateLegality
-from .distributed_ppo import distributed_ppo_update_v4
+from .distributed_ppo import RunningAdvantageScaleV4, distributed_ppo_update_v4
 from .ppo_expert_bc import load_expert_sampler_v4, distributed_expert_bc_update_v4, expert_bc_contract_v4
 from .factory import build_production_model_v4
 from .league import PolicyLeagueV4
@@ -1090,6 +1090,21 @@ def main() -> int:
     parser.add_argument("--first-hog-deferral-penalty", type=float, default=0.0)
     parser.add_argument("--first-hog-deferral-penalty-episode-cap", type=float, default=0.0)
     parser.add_argument("--target-kl", type=float, default=0.01)
+    parser.add_argument(
+        "--advantage-normalization",
+        choices=("batch", "running"),
+        default="batch",
+        help=(
+            "scale advantages by each update's own spread (batch) or by the spread pooled over recent updates "
+            "(running), which keeps opening and ending segments in proportion"
+        ),
+    )
+    parser.add_argument(
+        "--advantage-normalization-decay",
+        type=float,
+        default=0.95,
+        help="per-update decay of the pooled advantage statistics for --advantage-normalization running",
+    )
     parser.add_argument("--ppo-epochs", type=int, default=2)
     parser.add_argument("--lane-minibatch-size", type=int, default=256)
     parser.add_argument("--lane-microbatch-size", type=int, default=96)
@@ -1526,7 +1541,16 @@ def main() -> int:
         resume_contract["expert_bc"] = expert_bc_contract
     if args.freeze_recent_actions:
         resume_contract["freeze_recent_actions"] = True
+    advantage_scale = None
+    if args.advantage_normalization == "running":
+        resume_contract["advantage_normalization"] = ["running", args.advantage_normalization_decay]
+        advantage_scale = RunningAdvantageScaleV4(args.advantage_normalization_decay)
     resume_extra = current_payload.get("extra")
+    # Strict resumes and warm starts alike carry the pooled statistics on when the checkpoint has them.
+    if advantage_scale is not None and isinstance(resume_extra, Mapping):
+        scale_state = resume_extra.get("advantage_scale_state")
+        if isinstance(scale_state, Mapping) and float(scale_state["decay"]) == advantage_scale.decay:
+            advantage_scale.load_state_dict(scale_state)
     if args.resume_checkpoint is not None:
         if not isinstance(resume_extra, Mapping) or (resume_extra.get("strict_boundary") is not True):
             raise ValueError("resume checkpoint is not a strict PPO boundary")
@@ -1945,6 +1969,7 @@ def main() -> int:
                 config=ppo_config,
                 expected_policy_state_id=collected_policy_state_id,
                 validate=args.validate,
+                advantage_scale=advantage_scale,
             )
             bc_metrics = {}
             if expert_bc_sampler is not None and update_step % args.expert_bc_every_updates == 0:
@@ -2035,6 +2060,9 @@ def main() -> int:
                             "league_state": league.to_dict(),
                             "league_rng_state": league_rng.getstate(),
                             "next_batch_index": batch_index + 1,
+                            "advantage_scale_state": (
+                                None if advantage_scale is None else advantage_scale.state_dict()
+                            ),
                         },
                     )
                     _publish_strict_checkpoint(args.output_dir, checkpoint_path)
