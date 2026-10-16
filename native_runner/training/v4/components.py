@@ -28,6 +28,7 @@ from .tensors import (
     EFFECT_PARENT_CHILD,
     EFFECT_PARENT_TOWER,
     PreviousActionV4,
+    RecentActionsV4,
     RelationEdgesV4,
     TowerSetV4,
 )
@@ -709,8 +710,17 @@ class SpatialScatterEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.child_value = nn.Linear(config.child_dim, config.learned_scatter_channels)
-        input_channels = config.explicit_spatial_channels + config.learned_scatter_channels + 3
+        input_channels = (
+            config.explicit_spatial_channels
+            + config.learned_scatter_channels
+            + 3
+            + config.recent_action_spatial_channels
+        )
         self.input = nn.Conv2d(input_channels, config.spatial_hidden_channels, 3, padding=1)
+        # Recent-action planes are the last input channels and start with no
+        # contribution, so an upgraded checkpoint computes exactly what it did.
+        with torch.no_grad():
+            self.input.weight[:, -config.recent_action_spatial_channels :].zero_()
         self.blocks = nn.Sequential(
             *(ResidualSpatialBlock(config.spatial_hidden_channels) for _ in range(config.spatial_res_blocks))
         )
@@ -822,10 +832,17 @@ class SpatialScatterEncoder(nn.Module):
         child_extent: Tensor,
         child_radius: Tensor,
         child_mask: Tensor,
+        recent_action_planes: Tensor,
     ) -> tuple[Tensor, Tensor]:
         learned = self.scatter(child_memory, child_position, child_extent, child_radius, child_mask)
         coordinates = self.coordinate_planes(explicit_planes).unsqueeze(0).expand(explicit_planes.shape[0], -1, -1, -1)
-        spatial = self.blocks(self.input(torch.cat((explicit_planes, learned, coordinates), dim=1)))
+        spatial = self.blocks(
+            self.input(
+                torch.cat(
+                    (explicit_planes, learned, coordinates, recent_action_planes.to(explicit_planes.dtype)), dim=1
+                )
+            )
+        )
         average = spatial.mean(dim=(2, 3))
         maximum = spatial.amax(dim=(2, 3))
         return spatial, self.summary(torch.cat((average, maximum), dim=-1))
@@ -955,6 +972,104 @@ class PreviousActionEncoder(nn.Module):
         )
         action = action * previous.action_mask.unsqueeze(-1)
         return self.norm(self.pool(action, previous.action_mask) + self.count(previous.micro_action_count))
+
+
+class RecentActionEncoder(nn.Module):
+    """Summarize the actor's own recent commands and place them on the arena grid."""
+
+    def __init__(
+        self, config: ModelConfigV4, card_encoder: GlobalCardEncoder, mechanic_catalog: MechanicProfileCatalogV1
+    ) -> None:
+        super().__init__()
+        if config.recent_action_spatial_channels != 2:
+            raise ValueError("recent actions use exactly two spatial planes: queued and executed")
+        self.config = config
+        self.card_encoder = card_encoder
+        self.variant = nn.Embedding(2, 16)
+        self.visible = nn.Linear(config.card_semantic_dim, 64)
+        self.effective = nn.Linear(config.card_semantic_dim, 64)
+        self.ability = nn.Embedding(config.ability_vocab_size, 32)
+        self.ability_mechanics = nn.Linear(config.mechanic_profile_dim, 32)
+        ability_profile_ids = list(mechanic_catalog.ability_profile_ids)
+        ability_profile_ids.extend([0] * (config.ability_vocab_size - len(ability_profile_ids)))
+        self.register_buffer(
+            "ability_profile_ids", torch.tensor(ability_profile_ids, dtype=torch.long), persistent=False
+        )
+        self.target = mlp(3, 32, 32)
+        self.source = mlp(3, 32, 32)
+        self.timing = mlp(config.recent_action_feature_dim, 32, 32)
+        self.action = mlp(16 + 64 + 64 + 32 + 32 + 32 + 32, 128, config.recent_action_dim)
+        self.pool = LearnedSetPool(config.recent_action_dim, config.recent_action_dim)
+        self.known = nn.Embedding(2, config.recent_action_dim)
+        self.norm = nn.LayerNorm(config.recent_action_dim)
+
+    def _target_xy(self, recent: RecentActionsV4) -> tuple[Tensor, Tensor, Tensor]:
+        valid = recent.mask & (recent.target_cell >= 0)
+        safe = recent.target_cell.clamp_min(0)
+        x = safe.remainder(self.config.board_width)
+        y = torch.div(safe, self.config.board_width, rounding_mode="floor")
+        return x, y, valid
+
+    def planes(self, recent: RecentActionsV4, *, dtype: torch.dtype) -> Tensor:
+        """Queued and recently executed own targets, each fading over the retention horizon."""
+
+        config = self.config
+        _x, _y, valid = self._target_xy(recent)
+        cells = config.board_width * config.board_height
+        one_hot = nn.functional.one_hot(recent.target_cell.clamp_min(0), cells).to(dtype) * valid.unsqueeze(-1)
+        executed = recent.features[..., 1].to(dtype)
+        queued_weight = (1.0 - executed) * (1.0 - recent.features[..., 0].to(dtype).clamp(0.0, 1.0))
+        executed_weight = executed * (1.0 - recent.features[..., 2].to(dtype).clamp(0.0, 1.0))
+        weights = torch.stack((queued_weight, executed_weight), dim=1)
+        planes = torch.einsum("bck,bkn->bcn", weights, one_hot)
+        return planes.view(-1, 2, config.board_height, config.board_width)
+
+    def forward(self, recent: RecentActionsV4, *, profile_memory: Tensor) -> Tensor:
+        x, y, valid = self._target_xy(recent)
+        dtype = recent.features.dtype
+        target_features = torch.stack(
+            (
+                x.to(dtype) / max(1, self.config.board_width - 1),
+                y.to(dtype) / max(1, self.config.board_height - 1),
+                valid.to(dtype),
+            ),
+            dim=-1,
+        )
+        source_features = torch.cat(
+            (
+                torch.stack(
+                    (
+                        recent.source_position[..., 0] / self.config.board_width,
+                        recent.source_position[..., 1] / self.config.board_height,
+                    ),
+                    dim=-1,
+                ),
+                recent.source_mask.unsqueeze(-1).to(recent.source_position.dtype),
+            ),
+            dim=-1,
+        )
+        normal_form = torch.zeros_like(recent.effective_form)
+        action = self.action(
+            torch.cat(
+                (
+                    self.variant(recent.variant.clamp_min(0)),
+                    self.visible(self.card_encoder(recent.visible_card_vocab_id, normal_form, profile_memory)),
+                    self.effective(
+                        self.card_encoder(recent.effective_card_vocab_id, recent.effective_form, profile_memory)
+                    ),
+                    self.ability(recent.ability_vocab_id)
+                    + self.ability_mechanics(
+                        nn.functional.embedding(self.ability_profile_ids[recent.ability_vocab_id], profile_memory)
+                    ),
+                    self.target(target_features),
+                    self.source(source_features),
+                    self.timing(recent.features),
+                ),
+                dim=-1,
+            )
+        )
+        action = action * recent.mask.unsqueeze(-1)
+        return self.norm(self.pool(action, recent.mask) + self.known(recent.known.long()))
 
 
 class CandidateEncoder(nn.Module):

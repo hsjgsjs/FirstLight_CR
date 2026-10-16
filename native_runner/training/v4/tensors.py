@@ -557,6 +557,93 @@ class RelationEdgesV4(TensorRecordV4):
 
 
 @dataclass(slots=True)
+class RecentActionsV4(TensorRecordV4):
+    """The actor's own recent card/Ability commands; ``known`` is false for data without them."""
+
+    variant: Tensor
+    visible_card_vocab_id: Tensor
+    effective_card_vocab_id: Tensor
+    effective_form: Tensor
+    ability_vocab_id: Tensor
+    target_cell: Tensor
+    source_position: Tensor
+    source_mask: Tensor
+    features: Tensor
+    mask: Tensor
+    known: Tensor
+
+    @classmethod
+    def empty(cls, batch_size: int, config: ModelConfigV4, *, known: bool) -> RecentActionsV4:
+        shape = (batch_size, config.max_recent_actions)
+        return cls(
+            variant=torch.zeros(shape, dtype=torch.long),
+            visible_card_vocab_id=torch.zeros(shape, dtype=torch.long),
+            effective_card_vocab_id=torch.zeros(shape, dtype=torch.long),
+            effective_form=torch.zeros(shape, dtype=torch.long),
+            ability_vocab_id=torch.zeros(shape, dtype=torch.long),
+            target_cell=torch.full(shape, -1, dtype=torch.long),
+            source_position=torch.zeros(*shape, 2),
+            source_mask=torch.zeros(shape, dtype=torch.bool),
+            features=torch.zeros(*shape, config.recent_action_feature_dim),
+            mask=torch.zeros(shape, dtype=torch.bool),
+            known=torch.full((batch_size,), known, dtype=torch.bool),
+        )
+
+    def validate(
+        self, config: ModelConfigV4, *, batch_size: int, card_vocab_size: int, ability_vocab_size: int
+    ) -> None:
+        shape = (batch_size, config.max_recent_actions)
+        _validate_fields(self, "recent_actions", (batch_size,), booleans={"known": ()})
+        _validate_fields(
+            self,
+            "recent_actions",
+            shape,
+            integers="variant visible_card_vocab_id effective_card_vocab_id effective_form "
+            "ability_vocab_id target_cell",
+            booleans={"mask": (), "source_mask": ()},
+            floats={"source_position": (2,), "features": (config.recent_action_feature_dim,)},
+        )
+        if torch.any(self.mask & ~self.known.unsqueeze(-1)):
+            raise ValueError("unknown recent actions cannot contain entries")
+        for name in ("visible_card_vocab_id", "effective_card_vocab_id"):
+            _validate_vocab_ids(
+                getattr(self, name), self.mask, vocab_size=card_vocab_size, label=f"recent_actions.{name}"
+            )
+        _require_range(
+            self.variant[self.mask],
+            CANDIDATE_DEPLOY,
+            CANDIDATE_ABILITY,
+            "recent action variant is invalid",
+            inclusive_max=True,
+        )
+        _require_range(
+            self.effective_form[self.mask], 0, config.form_type_count, "recent action form is outside its vocabulary"
+        )
+        _require_range(
+            self.ability_vocab_id[self.mask],
+            0,
+            ability_vocab_size,
+            "recent action ability ID is outside its vocabulary",
+        )
+        _require_range(
+            self.target_cell[self.mask],
+            -1,
+            config.board_width * config.board_height,
+            "recent action target cell is invalid",
+        )
+        if not torch.equal(self.source_mask, self.source_mask & self.mask):
+            raise ValueError("recent action source mask must stay inside the entry mask")
+        _validate_padding(
+            self,
+            "recent_actions",
+            self.mask,
+            "variant visible_card_vocab_id effective_card_vocab_id effective_form ability_vocab_id "
+            "source_position source_mask features",
+        )
+        _validate_padding(self, "recent_actions", self.mask, "target_cell", target_cell=-1)
+
+
+@dataclass(slots=True)
 class PreviousActionV4(TensorRecordV4):
     gate: Tensor
     micro_action_count: Tensor
@@ -779,6 +866,7 @@ class UniversalSemanticBatchV4(TensorRecordV4):
     relation_edges: RelationEdgesV4
     explicit_spatial_planes: Tensor
     previous_action: PreviousActionV4
+    recent_actions: RecentActionsV4
     candidates: ActionCandidatesV4
 
     @property
@@ -877,6 +965,9 @@ class UniversalSemanticBatchV4(TensorRecordV4):
         self.previous_action.validate(
             config, batch_size=batch_size, card_vocab_size=card_vocab_size, ability_vocab_size=ability_vocab_size
         )
+        self.recent_actions.validate(
+            config, batch_size=batch_size, card_vocab_size=card_vocab_size, ability_vocab_size=ability_vocab_size
+        )
         self.candidates.validate(
             config,
             batch_size=batch_size,
@@ -964,6 +1055,7 @@ class EncodedObservationV4(TensorRecordV4):
     scalar_summary: Tensor
     event_summary: Tensor
     previous_action_summary: Tensor
+    recent_action_summary: Tensor
     candidate_memory: Tensor
     candidate_summary: Tensor
 

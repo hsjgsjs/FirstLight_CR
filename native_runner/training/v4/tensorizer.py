@@ -70,6 +70,7 @@ from .tensors import (
     EFFECT_PARENT_TOWER,
     GATE_WAIT,
     PreviousActionV4,
+    RecentActionsV4,
     RelationEdgesV4,
     TARGET_GRID,
     TARGET_NONE,
@@ -339,6 +340,7 @@ class UniversalObservationTensorizerV4:
         self._opponent_evolution_revealed: set[int] = set()
         self._ability_state_by_source_entity: dict[int, AbilityRuntimeStateV1] = {}
         self._previous_action = self._empty_previous_action()
+        self._recent_actions: list[dict[str, object]] = []
         self._episode_id: str | None = None
         self._episode_start_tick: int | None = None
         self._last_tensorized_tick: int | None = None
@@ -359,6 +361,7 @@ class UniversalObservationTensorizerV4:
         self._opponent_evolution_revealed.clear()
         self._ability_state_by_source_entity.clear()
         self._previous_action = self._empty_previous_action()
+        self._recent_actions = []
 
     def _validate_observation_identity(self, observation: ObservationV1) -> None:
         if observation.tier == ObservationTier.ORACLE:
@@ -461,7 +464,98 @@ class UniversalObservationTensorizerV4:
             previous.target_cell[0, step] = sequence.target_cell[row, step].cpu()
             previous.delay_offset_bin[0, step] = sequence.delay_offset_bin[row, step].cpu()
             previous.action_mask[0, step] = True
+            if self._last_tensorized_tick is not None:
+                self._recent_actions.append(
+                    {
+                        "variant": int(previous.variant[0, step]),
+                        "visible_card_vocab_id": int(previous.visible_card_vocab_id[0, step]),
+                        "effective_card_vocab_id": int(previous.effective_card_vocab_id[0, step]),
+                        "effective_form": int(previous.effective_form[0, step]),
+                        "ability_vocab_id": int(previous.ability_vocab_id[0, step]),
+                        "target_cell": int(previous.target_cell[0, step]),
+                        "source_position": previous.source_position[0, step].clone(),
+                        "source_mask": bool(previous.source_mask[0, step]),
+                        "decision_tick": self._last_tensorized_tick,
+                        "executed_tick": None,
+                    }
+                )
         self._previous_action = previous
+        del self._recent_actions[: max(0, len(self._recent_actions) - self.config.max_recent_actions)]
+
+    def _update_recent_actions(self, observation: ObservationV1) -> None:
+        """Resolve this actor's own commands from its execution and rejection events, then expire them."""
+
+        horizon = self.config.recent_action_horizon_ticks
+        tick = int(observation.tick)
+        for event in sorted(observation.events, key=lambda item: item.tick):
+            if event.owner != self.actor_owner or not event.event_type.startswith("action_"):
+                continue
+            card = event.card_id is not None
+            variant = CANDIDATE_DEPLOY if card else CANDIDATE_ABILITY
+            card_vocab = self.catalog.vocab_id(int(event.card_id)) if card else None
+            if event.event_type == "action_executed":
+                # A card play can be reported twice (command receipt and public play).
+                if card and any(
+                    entry["executed_tick"] is not None
+                    and entry["visible_card_vocab_id"] == card_vocab
+                    and abs(int(event.tick) - int(entry["executed_tick"])) <= 20
+                    for entry in self._recent_actions
+                ):
+                    continue
+            elif event.event_type not in ("action_rejected", "action_unattested", "action_canceled_terminal"):
+                continue
+            match = next(
+                (
+                    entry
+                    for entry in self._recent_actions
+                    if entry["executed_tick"] is None
+                    and entry["variant"] == variant
+                    and int(entry["decision_tick"]) <= int(event.tick)
+                    and (not card or entry["visible_card_vocab_id"] == card_vocab)
+                ),
+                None,
+            )
+            if match is None:
+                continue
+            if event.event_type == "action_executed":
+                match["executed_tick"] = int(event.tick)
+            else:
+                self._recent_actions.remove(match)
+        self._recent_actions = [
+            entry
+            for entry in self._recent_actions
+            if (
+                tick - int(entry["executed_tick"]) <= horizon
+                if entry["executed_tick"] is not None
+                else tick - int(entry["decision_tick"]) <= 3 * horizon
+            )
+        ]
+
+    def _recent_action_record(self, tick: int) -> RecentActionsV4:
+        horizon = float(self.config.recent_action_horizon_ticks)
+        record = RecentActionsV4.empty(1, self.config, known=True)
+        for row, entry in enumerate(self._recent_actions[-self.config.max_recent_actions :]):
+            for name in (
+                "variant",
+                "visible_card_vocab_id",
+                "effective_card_vocab_id",
+                "effective_form",
+                "ability_vocab_id",
+                "target_cell",
+            ):
+                getattr(record, name)[0, row] = int(entry[name])  # type: ignore[arg-type]
+            record.source_mask[0, row] = bool(entry["source_mask"])
+            if entry["source_mask"]:
+                record.source_position[0, row] = entry["source_position"]  # type: ignore[assignment]
+            elapsed = max(0, tick - int(entry["decision_tick"]))  # type: ignore[arg-type]
+            executed = entry["executed_tick"]
+            record.features[0, row, 0] = min(elapsed, 2 * horizon) / horizon
+            record.features[0, row, 1] = float(executed is not None)
+            if executed is not None:
+                record.features[0, row, 2] = min(max(0, tick - int(executed)), horizon) / horizon  # type: ignore[arg-type]
+            record.features[0, row, 3] = float(entry["variant"] == CANDIDATE_ABILITY)
+            record.mask[0, row] = True
+        return record
 
     def _owner_type(self, owner: int | None) -> int:
         if owner is None:
@@ -2099,6 +2193,7 @@ class UniversalObservationTensorizerV4:
         self._frame_archetype_id_cache.clear()
         self._frame_child_kind_cache.clear()
         self._remember_public_evolution_forms(model_observation)
+        self._update_recent_actions(model_observation)
         own_cards, opponent_cards, card_to_row = self._card_sets(model_observation)
         towers, tower_token_by_entity = self._towers(model_observation)
         (groups, group_index_by_entity, child_index_by_entity, group_overflow, child_overflow) = self._groups(
@@ -2145,6 +2240,7 @@ class UniversalObservationTensorizerV4:
             # its tensors.  The existing record is therefore already an
             # immutable snapshot for this batch and needs no per-field clone.
             previous_action=self._previous_action,
+            recent_actions=self._recent_action_record(int(observation.tick)),
             candidates=candidates,
         )
         if validate:

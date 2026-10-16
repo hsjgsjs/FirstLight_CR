@@ -15,7 +15,15 @@ import torch
 from torch import Tensor
 
 from .imitation import ILSequenceV4, IL_TIME_FIELDS, collate_il_sequences
-from .tensors import ActionSequenceV4, TARGET_GRID, TensorRecordV4, UniversalSemanticBatchV4, concatenate_tensor_records
+from .config import ModelConfigV4
+from .tensors import (
+    ActionSequenceV4,
+    RecentActionsV4,
+    TARGET_GRID,
+    TensorRecordV4,
+    UniversalSemanticBatchV4,
+    concatenate_tensor_records,
+)
 
 if TYPE_CHECKING:
     from .producer import ReplayProductionResultV4
@@ -177,7 +185,11 @@ def _restore_record(record_type: type[_RecordT], *, prefix: str, tensors: Mappin
     for item in fields(record_type):
         key = f"{prefix}.{item.name}"
         annotation = hints[item.name]
-        if isinstance(annotation, type) and issubclass(annotation, TensorRecordV4):
+        if annotation is RecentActionsV4 and f"{key}.known" not in tensors:
+            # Shards written before recent own actions existed: mark them unknown, never empty.
+            rows = int(values["match_scalars"].shape[0])
+            values[item.name] = RecentActionsV4.empty(rows, ModelConfigV4(), known=False)
+        elif isinstance(annotation, type) and issubclass(annotation, TensorRecordV4):
             values[item.name] = _restore_record(annotation, prefix=key, tensors=tensors)
         else:
             try:
