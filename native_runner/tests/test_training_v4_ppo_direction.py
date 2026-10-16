@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from native_runner.tests.test_training_v4_model import _batch, _model
-from native_runner.training.v4.distributed_ppo import distributed_ppo_update_v4
+from native_runner.training.v4.distributed_ppo import _gradient_noise_statistics, distributed_ppo_update_v4
 from native_runner.training.v4.learning import evaluate_recurrent_sequence
 from native_runner.training.v4.ppo import PPOConfigV4, StoredRolloutV4
 from native_runner.training.v4.tensors import GATE_ACT, GATE_WAIT, ActionSequenceV4
@@ -42,10 +42,11 @@ def _evaluate(model, batch, actions):
     )
 
 
-def _train(model, batch, actions, rewards, *, updates=6):
-    """On-policy PPO updates on one-step episodes that end with the given rewards."""
+def _train(model, batch, actions, rewards, *, updates=6, gradient_noise=False):
+    """On-policy PPO updates on one-step episodes that end with the given rewards; returns the last metrics."""
     lanes = batch.batch_size
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, eps=1e-5, weight_decay=0.0)
+    metrics = []
     for _ in range(updates):
         with torch.no_grad():
             behavior = _evaluate(model, batch, actions)
@@ -66,7 +67,7 @@ def _train(model, batch, actions, rewards, *, updates=6):
             continue_temperature=model.ppo_continue_temperature,
             policy_state_id="direction",
         )
-        distributed_ppo_update_v4(
+        metrics = distributed_ppo_update_v4(
             model,
             optimizer,
             rollout,
@@ -75,7 +76,9 @@ def _train(model, batch, actions, rewards, *, updates=6):
             sequence_chunk_steps=1,
             config=PPOConfigV4(clip_range=0.1, value_clip_range=0.1, entropy_coefficient=0.0, max_grad_norm=0.5),
             autocast_dtype=None,
+            gradient_noise=gradient_noise,
         )
+    return metrics
 
 
 def _states(count):
@@ -148,3 +151,45 @@ def test_unscored_delay_offset_stays_out_of_the_ratio_and_gets_no_gradient() -> 
     _train(model, batch, actions, [1.0 if delay < 2 else -1.0 for delay in delays], updates=2)
     for before, parameter in zip(head, model.delay_offset_head.parameters(), strict=True):
         torch.testing.assert_close(parameter.detach(), before, rtol=0.0, atol=0.0)
+
+
+def test_gradient_noise_statistics() -> None:
+    signal = torch.tensor([1.0, 0.0, 0.0, 0.0])
+    same = _gradient_noise_statistics(signal, signal)
+    assert same["gradient_half_cosine"] == pytest.approx(1.0)
+    assert same["gradient_snr"] > 1e6
+    opposite = _gradient_noise_statistics(signal, -signal)
+    assert opposite["gradient_half_cosine"] == pytest.approx(-1.0)
+    # Orthogonal halves: no shared direction at all.
+    assert _gradient_noise_statistics(signal, torch.tensor([0.0, 1.0, 0.0, 0.0]))["gradient_snr"] == 0.0
+    # Shared part (2, 0), noise (0, +-1): the dot product estimates |G|^2 = 3, the difference a half's noise
+    # power 2, so the whole batch has noise 1 and snr = 3.
+    shared = _gradient_noise_statistics(torch.tensor([2.0, 1.0]), torch.tensor([2.0, -1.0]))
+    assert shared["gradient_snr"] == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize("agree", [True, False])
+def test_half_gradients_agree_when_the_halves_teach_the_same_thing(agree: bool) -> None:
+    model = _production_like_model()
+    batch = _states(8)
+    gates = [GATE_ACT, GATE_WAIT] * 4
+    actions = _actions(gates, [0] * 8, [0] * 8)
+    first = [1.0 if gate == GATE_ACT else -1.0 for gate in gates[:4]]
+    rewards = first + (first if agree else [-reward for reward in first])
+    metrics = _train(model, batch, actions, rewards, updates=1, gradient_noise=True)
+    cosine = metrics[0]["gradient_half_cosine"]
+    assert cosine == pytest.approx(1.0 if agree else -1.0, abs=1e-4)
+    assert all(row["gradient_half_cosine"] == cosine for row in metrics)
+
+
+def test_gradient_noise_measurement_leaves_the_update_unchanged() -> None:
+    results = []
+    for gradient_noise in (False, True):
+        model = _production_like_model()
+        batch = _states(8)
+        actions = _actions([GATE_ACT, GATE_WAIT] * 4, [0, 1, 0, 1, 0, 0, 0, 0], [0] * 8)
+        metrics = _train(model, batch, actions, [1.0, -1.0, -1.0, 1.0] * 2, updates=2, gradient_noise=gradient_noise)
+        assert ("gradient_snr" in metrics[0]) == gradient_noise
+        results.append(model.state_dict())
+    for name, value in results[0].items():
+        torch.testing.assert_close(results[1][name], value, rtol=0.0, atol=0.0)

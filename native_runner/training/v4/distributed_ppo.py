@@ -199,6 +199,28 @@ def _global_rollout_statistics(
     }
 
 
+def _gradient_noise_statistics(first: Tensor, second: Tensor) -> dict[str, float]:
+    """Agreement of two independent half-batch gradients taken at the same parameters.
+
+    Each half is the true gradient G plus independent noise, so first . second estimates |G|^2 and
+    |first - second|^2 / 2 the noise power of one half. ``gradient_snr`` is signal over noise power for the
+    whole batch (half the noise of one half): below 1, one update moves more by chance than by evidence,
+    and about 1 / snr times as many games per update would bring them level.
+    """
+
+    first = first.double()
+    second = second.double()
+    dot = float(first @ second)
+    first_norm = float(first.norm())
+    second_norm = float(second.norm())
+    difference = float((first - second).square().sum())
+    return {
+        "gradient_half_cosine": dot / max(first_norm * second_norm, 1e-30),
+        "gradient_snr": 4.0 * dot / max(difference, 1e-30),
+        "gradient_half_norm": 0.5 * (first_norm + second_norm),
+    }
+
+
 def _check_temperatures(model: UniversalCardPolicyV4, rollout: StoredRolloutV4) -> None:
     for actual, expected, label in (
         (model.ppo_gate_temperature, rollout.gate_temperature, "gate"),
@@ -246,6 +268,7 @@ def distributed_ppo_update_v4(
     expected_policy_state_id: str | None = None,
     validate: bool = False,
     advantage_scale: RunningAdvantageScaleV4 | None = None,
+    gradient_noise: bool = False,
 ) -> list[dict[str, float]]:
     """Train synchronously across ranks with chunked recurrent backpropagation.
 
@@ -254,6 +277,9 @@ def distributed_ppo_update_v4(
     and a one-lane shard imbalance do not bias the update. Model parameters are
     fixed while all time chunks of a minibatch are evaluated; hidden state is
     carried forward and detached only at chunk boundaries (ordinary TBPTT).
+
+    With ``gradient_noise``, the policy-loss gradient is first measured, without a step, on two disjoint
+    halves of the lanes at the rollout's own parameters; see ``_gradient_noise_statistics``.
     """
 
     rollout.validate()
@@ -291,15 +317,26 @@ def distributed_ppo_update_v4(
     metrics: list[dict[str, float]] = []
     stop_for_kl = False
 
-    for epoch in range(epochs):
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(0x51F0_0000 + epoch * 4099 + rank)
-        permutation = _balanced_lane_permutation(
-            rollout.valid_mask, minibatch_size=lane_minibatch_size, generator=generator
-        )
-        for minibatch in range(global_batches):
-            start_lane = minibatch * lane_minibatch_size
-            indices = permutation[start_lane : start_lane + lane_minibatch_size]
+    halves: list[Tensor] = []
+
+    def rounds():
+        if gradient_noise:
+            # Contiguous halves keep the two seats of a self-play game (adjacent lanes) together.
+            lanes = torch.arange(rollout.batch_size)
+            yield [("half", lanes[: rollout.batch_size // 2]), ("half", lanes[rollout.batch_size // 2 :])]
+        for epoch in range(epochs):
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(0x51F0_0000 + epoch * 4099 + rank)
+            permutation = _balanced_lane_permutation(
+                rollout.valid_mask, minibatch_size=lane_minibatch_size, generator=generator
+            )
+            yield [
+                ("train", permutation[minibatch * lane_minibatch_size : (minibatch + 1) * lane_minibatch_size])
+                for minibatch in range(global_batches)
+            ]
+
+    for batches in rounds():
+        for kind, indices in batches:
             has_local_data = bool(indices.numel())
             if has_local_data:
                 local_valid = (
@@ -467,7 +504,9 @@ def distributed_ppo_update_v4(
                             value_sum = 0.5 * (raw_value * weight).sum()
                             entropy_sum = (evaluated_entropy * weight).sum()
                             loss_sum = policy_sum + actual.value_coefficient * value_sum
-                            if actual.entropy_coefficient:
+                            if kind == "half":
+                                loss_sum = policy_sum
+                            elif actual.entropy_coefficient:
                                 loss_sum = loss_sum - actual.entropy_coefficient * entropy_sum
                             loss = loss_sum * (world_size / global_valid.to(policy_sum.dtype))
                         loss.backward()
@@ -502,6 +541,17 @@ def distributed_ppo_update_v4(
             gradient_sync_started = time.perf_counter()
             _allreduce_gradients(parameters, world_size=world_size)
             gradient_sync_seconds = time.perf_counter() - gradient_sync_started
+            if kind == "half":
+                halves.append(
+                    torch.cat(
+                        [parameter.grad.reshape(-1).float() for parameter in parameters if parameter.requires_grad]
+                    )
+                )
+                optimizer.zero_grad(set_to_none=True)
+                if len(halves) == 2:
+                    rollout_statistics.update(_gradient_noise_statistics(*halves))
+                    halves.clear()
+                continue
             gradient_norm = 0.0
             if actual.max_grad_norm is not None:
                 gradient_norm = float(nn.utils.clip_grad_norm_(parameters, actual.max_grad_norm))
