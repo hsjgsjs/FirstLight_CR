@@ -226,6 +226,7 @@ class UniversalCardPolicyV4(nn.Module):
         )
         self._ppo_rollout_sampling = True
         self._ppo_location_head_fp32 = False
+        self._ppo_score_delay_offset = True
         self._initialize_action_priors()
 
     def _initialize_action_priors(self) -> None:
@@ -302,6 +303,18 @@ class UniversalCardPolicyV4(nn.Module):
         if not isinstance(enabled, bool):
             raise TypeError("PPO rollout sampling mode must be bool")
         self._ppo_rollout_sampling = enabled
+
+    def set_ppo_score_delay_offset(self, enabled: bool) -> None:
+        """Whether the chosen delay offset counts in the action log-probability and entropy.
+
+        Off when the environment replaces the offset (``--execution-delay-ticks``, as on a live client): the
+        choice never reaches the game, so scoring it would only feed noise into the PPO ratio and the
+        decoder it shares with the card and location heads. The offset is still sampled and conditions the
+        later micro-actions, so actions and observations are unchanged.
+        """
+        if not isinstance(enabled, bool):
+            raise TypeError("PPO delay-offset scoring mode must be bool")
+        self._ppo_score_delay_offset = enabled
 
     def set_ppo_location_head_fp32(self, enabled: bool) -> None:
         if not isinstance(enabled, bool):
@@ -781,18 +794,20 @@ class UniversalCardPolicyV4(nn.Module):
             continue_log_prob=continue_log_prob,
             continue_entropy=continue_entropy,
         )
+        # Summed in the original order, so the default stays bit-identical to earlier rollouts.
+        delay_weight = 1.0 if self._ppo_score_delay_offset else 0.0
         total_log_prob = (
             gate_log_prob
             + candidate_log_prob.sum(dim=-1)
             + target_log_prob.sum(dim=-1)
-            + delay_offset_log_prob.sum(dim=-1)
+            + delay_weight * delay_offset_log_prob.sum(dim=-1)
             + continue_log_prob
         )
         total_entropy = (
             gate_entropy
             + candidate_entropy.sum(dim=-1)
             + target_entropy.sum(dim=-1)
-            + delay_offset_entropy.sum(dim=-1)
+            + delay_weight * delay_offset_entropy.sum(dim=-1)
             + continue_entropy
         )
         return PolicyOutputV4(

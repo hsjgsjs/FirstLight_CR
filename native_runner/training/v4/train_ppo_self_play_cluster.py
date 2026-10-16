@@ -923,6 +923,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--score-model-delay-offset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "count the model's own delay-offset choice in the PPO ratio; with --execution-delay-ticks that "
+            "choice never reaches the game, so --no-score-model-delay-offset keeps its noise out of the update"
+        ),
+    )
+    parser.add_argument(
         "--min-play-gap-ticks",
         type=parse_play_gap_ticks,
         help=(
@@ -1126,6 +1135,8 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--validate", action="store_true")
     args = parser.parse_args()
+    if not args.score_model_delay_offset and args.execution_delay_ticks is None:
+        raise ValueError("the model's delay offset reaches the game unless --execution-delay-ticks replaces it")
     if not 0 <= args.fixed_opponent_opening_natural_percent <= 100:
         raise ValueError("fixed-opponent opening natural percent must be in [0, 100]")
     if (
@@ -1351,6 +1362,7 @@ def main() -> int:
     # BF16 location logits are unusually sensitive to those GEMM/conv shapes,
     # so keep this small head in FP32 while the rest of PPO remains autocast.
     current_model.set_ppo_location_head_fp32(True)
+    current_model.set_ppo_score_delay_offset(args.score_model_delay_offset)
     optimizer = torch.optim.AdamW(current_model.parameters(), lr=args.learning_rate, eps=1e-5, weight_decay=0.0)
     if args.resume_checkpoint is None:
         current_payload = load_actor_critic_checkpoint(
@@ -1521,6 +1533,8 @@ def main() -> int:
     # Omit the optional key when disabled to preserve old undelayed strict resumes.
     if args.execution_delay_ticks is not None:
         resume_contract["execution_delay_ticks"] = list(args.execution_delay_ticks)
+    if not args.score_model_delay_offset:
+        resume_contract["score_model_delay_offset"] = False
     # Likewise omitted when off so existing strict resumes keep matching.
     if game_elixir_overflow is not None:
         resume_contract["game_elixir_overflow"] = list(game_elixir_overflow)
