@@ -47,7 +47,7 @@ To add selected human demonstrations to an existing PPO model, use the audited g
 
 The first 200-update trial's reported results and limits are recorded in [the experiment note (Chinese)](human_bc_trial_200_zh.md). The [temporal reasoning plan (Chinese)](temporal_reasoning_plan_zh.md) describes proposed input and auxiliary-task changes; those architecture changes are not part of the current training implementation.
 
-The current sparring project's stages, checkpoint lineage, results, and open work are maintained in [the training progress journal (Chinese)](sparring_journey_zh.md). It is a manually maintained record of reported runs, not a live connection to the training server.
+The current sparring project's stages, checkpoint lineage, results, and open work are maintained in [the training progress journal (Chinese)](sparring_journey_zh.md). As of 2026-10-16 the project has moved from the human-likeness phase to improving strength; the planned input, auxiliary-task, and opponent-pool changes and their order are in [the strength plan (Chinese)](strength_plan_zh.md), and fixed-condition model comparisons use [the round robin (Chinese)](round_robin_zh.md). It is a manually maintained record of reported runs, not a live connection to the training server.
 
 ## 4. Native trajectory playback
 

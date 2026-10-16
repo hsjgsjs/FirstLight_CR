@@ -9,7 +9,13 @@ import uuid
 
 import torch
 
-from .config import UNIVERSAL_ACTION_VERSION, UNIVERSAL_OBSERVATION_VERSION, UNIVERSAL_POLICY_VERSION
+from .config import (
+    LEGACY_OBSERVATION_VERSION,
+    LEGACY_POLICY_VERSION,
+    UNIVERSAL_ACTION_VERSION,
+    UNIVERSAL_OBSERVATION_VERSION,
+    UNIVERSAL_POLICY_VERSION,
+)
 from .model import UniversalCardPolicyV4
 
 
@@ -36,6 +42,125 @@ def checkpoint_contract(model: UniversalCardPolicyV4) -> dict[str, Any]:
         "model_config": asdict(model.config),
         "catalog_ids": _catalog_ids(model),
     }
+
+
+# Model config fields and parameters introduced with recent own actions.
+RECENT_ACTION_CONFIG_FIELDS = frozenset(
+    {
+        "max_recent_actions",
+        "recent_action_horizon_ticks",
+        "recent_action_feature_dim",
+        "recent_action_dim",
+        "recent_action_spatial_channels",
+    }
+)
+RECENT_ACTION_PARAMETER_PREFIXES = ("recent_action_encoder.", "recent_action_policy_skip.")
+# Existing tensors that gained trailing input columns/channels for recent actions.
+RECENT_ACTION_WIDENED = {"input_projection.0.weight": 1, "spatial_encoder.input.weight": 1}
+
+
+def legacy_checkpoint_contract(model: UniversalCardPolicyV4) -> dict[str, Any]:
+    """The contract a checkpoint saved before recent own actions carries."""
+
+    contract = checkpoint_contract(model)
+    contract["policy_version"] = LEGACY_POLICY_VERSION
+    contract["observation_version"] = LEGACY_OBSERVATION_VERSION
+    contract["model_config"] = {
+        key: value for key, value in contract["model_config"].items() if key not in RECENT_ACTION_CONFIG_FIELDS
+    }
+    return contract
+
+
+def _parameter_aliases(model: UniversalCardPolicyV4) -> dict[str, list[str]]:
+    """Every state-dict name that refers to the same tensor (shared card encoders)."""
+
+    by_tensor: dict[int, list[str]] = {}
+    for name, tensor in (*model.named_parameters(remove_duplicate=False), *model.named_buffers(remove_duplicate=False)):
+        by_tensor.setdefault(id(tensor), []).append(name)
+    return {name: names for names in by_tensor.values() for name in names}
+
+
+def upgrade_legacy_model_state(
+    model: UniversalCardPolicyV4, legacy_state: Mapping[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """Embed a pre-recent-action state dict so the upgraded model computes the same outputs.
+
+    New modules keep their initialization; every path from them into existing
+    activations starts at zero (the widened input columns, the spatial input
+    channels and the policy skip), so outputs are unchanged and gradients still
+    reach the new weights.
+    """
+
+    current = model.state_dict()
+    aliases = _parameter_aliases(model)
+    upgraded: dict[str, torch.Tensor] = {}
+    for name, fresh in current.items():
+        if name in legacy_state:
+            old = legacy_state[name]
+            if tuple(old.shape) == tuple(fresh.shape):
+                upgraded[name] = old
+                continue
+            axis = RECENT_ACTION_WIDENED.get(name)
+            if axis is None or old.ndim != fresh.ndim or old.shape[axis] >= fresh.shape[axis]:
+                raise ValueError(f"legacy checkpoint tensor {name} has an incompatible shape")
+            widened = torch.zeros_like(fresh, device=old.device, dtype=old.dtype)
+            widened.narrow(axis, 0, old.shape[axis]).copy_(old)
+            upgraded[name] = widened
+            continue
+        shared = next((alias for alias in aliases.get(name, ()) if alias in legacy_state), None)
+        if shared is not None:
+            upgraded[name] = legacy_state[shared]
+        elif name.startswith(RECENT_ACTION_PARAMETER_PREFIXES):
+            upgraded[name] = fresh
+        else:
+            raise ValueError(f"legacy checkpoint is missing tensor {name}")
+    unexpected = sorted(set(legacy_state).difference(current))
+    if unexpected:
+        raise ValueError(f"legacy checkpoint has unknown tensors: {unexpected[:3]}")
+    return upgraded
+
+
+def upgrade_legacy_optimizer_state(
+    model: UniversalCardPolicyV4,
+    optimizer: torch.optim.Optimizer,
+    legacy_state: Mapping[str, torch.Tensor],
+    legacy_optimizer_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Map Adam moments by parameter name; new parameters start without state."""
+
+    names = {id(parameter): name for name, parameter in model.named_parameters()}
+    fresh = optimizer.state_dict()
+    if len(fresh["param_groups"]) != len(legacy_optimizer_state["param_groups"]):
+        raise ValueError("legacy optimizer has a different parameter-group layout")
+    state: dict[int, Any] = {}
+    groups = []
+    for live_group, fresh_group, old_group in zip(
+        optimizer.param_groups, fresh["param_groups"], legacy_optimizer_state["param_groups"], strict=True
+    ):
+        retained = [
+            (parameter, new_index)
+            for parameter, new_index in zip(live_group["params"], fresh_group["params"], strict=True)
+            if names[id(parameter)] in legacy_state
+        ]
+        if len(retained) != len(old_group["params"]):
+            raise ValueError("legacy optimizer parameter count does not match the legacy model")
+        for (parameter, new_index), old_index in zip(retained, old_group["params"], strict=True):
+            old = legacy_optimizer_state["state"].get(old_index)
+            if old is None:
+                continue
+            moved = {}
+            for key, value in old.items():
+                if isinstance(value, torch.Tensor) and value.ndim > 0 and tuple(value.shape) != tuple(parameter.shape):
+                    axis = RECENT_ACTION_WIDENED.get(names[id(parameter)])
+                    if axis is None:
+                        raise ValueError(f"legacy optimizer state for {names[id(parameter)]} has the wrong shape")
+                    widened = torch.zeros(parameter.shape, dtype=value.dtype, device=value.device)
+                    widened.narrow(axis, 0, value.shape[axis]).copy_(value)
+                    value = widened
+                moved[key] = value
+            state[new_index] = moved
+        groups.append({**{k: v for k, v in old_group.items() if k != "params"}, "params": fresh_group["params"]})
+    return {"state": state, "param_groups": groups}
 
 
 def save_actor_critic_checkpoint(
@@ -100,7 +225,17 @@ def load_actor_critic_checkpoint(
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     if not isinstance(payload, dict) or payload.get("schema") != CHECKPOINT_SCHEMA_V4:
         raise ValueError("unsupported V4 actor-critic checkpoint")
-    if payload.get("contract") != checkpoint_contract(model):
+    legacy = payload.get("contract") == legacy_checkpoint_contract(model)
+    if legacy:
+        legacy_state = payload["model_state_dict"]
+        payload["model_state_dict"] = upgrade_legacy_model_state(model, legacy_state)
+        if optimizer is not None and payload.get("optimizer_state_dict") is not None:
+            payload["optimizer_state_dict"] = upgrade_legacy_optimizer_state(
+                model, optimizer, legacy_state, payload["optimizer_state_dict"]
+            )
+        payload["contract"] = checkpoint_contract(model)
+        payload["upgraded_from_contract"] = legacy_checkpoint_contract(model)
+    elif payload.get("contract") != checkpoint_contract(model):
         raise ValueError("checkpoint model/catalog contract does not match")
     model.load_state_dict(payload["model_state_dict"], strict=True)
     model.set_ppo_gate_temperature(float(payload["ppo_gate_temperature"]))

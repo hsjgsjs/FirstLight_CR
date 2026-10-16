@@ -21,6 +21,7 @@ from .components import (
     LocalChildSetEncoder,
     MechanicProfileEncoder,
     PreviousActionEncoder,
+    RecentActionEncoder,
     RelationTransformerV4,
     SpatialScatterEncoder,
     TowerEncoder,
@@ -143,6 +144,7 @@ class UniversalCardPolicyV4(nn.Module):
         self.scalar_encoder = GenericScalarEncoder(config)
         self.event_encoder = EventSetEncoder(config, self.card_encoder)
         self.previous_action_encoder = PreviousActionEncoder(config, self.card_encoder, mechanic_profile_catalog)
+        self.recent_action_encoder = RecentActionEncoder(config, self.card_encoder, mechanic_profile_catalog)
         self.candidate_encoder = CandidateEncoder(
             config,
             self.card_encoder,
@@ -157,16 +159,24 @@ class UniversalCardPolicyV4(nn.Module):
             + config.event_summary_dim
             + config.previous_action_dim
             + config.candidate_summary_dim
+            + config.recent_action_dim
         )
-        if core_input_width != 896:
-            raise ValueError("V4 core concatenation must have width 896")
+        if core_input_width != 896 + config.recent_action_dim:
+            raise ValueError("V4 core concatenation must have width 896 plus the recent-action summary")
         self.input_projection = mlp(core_input_width, config.lstm_input_dim)
+        # The recent-action summary occupies the last core columns and, like its
+        # policy skip below, starts with no contribution (exact checkpoint upgrade).
+        with torch.no_grad():
+            self.input_projection[0].weight[:, -config.recent_action_dim :].zero_()
         self.lstm_core = nn.LSTMCell(config.lstm_input_dim, config.lstm_hidden_dim)
         self.core_output_norm = nn.LayerNorm(config.lstm_hidden_dim)
 
         self.scene_policy_skip = nn.Linear(config.token_dim, config.lstm_hidden_dim)
         self.spatial_policy_skip = nn.Linear(config.spatial_summary_dim, config.lstm_hidden_dim)
         self.candidate_policy_skip = nn.Linear(config.candidate_summary_dim, config.lstm_hidden_dim)
+        self.recent_action_policy_skip = nn.Linear(config.recent_action_dim, config.lstm_hidden_dim)
+        nn.init.zeros_(self.recent_action_policy_skip.weight)
+        nn.init.zeros_(self.recent_action_policy_skip.bias)
         self.policy_context_norm = nn.LayerNorm(config.lstm_hidden_dim)
 
         self.scene_value_skip = nn.Linear(config.token_dim, config.lstm_hidden_dim)
@@ -298,6 +308,41 @@ class UniversalCardPolicyV4(nn.Module):
             raise TypeError("PPO location-head precision mode must be bool")
         self._ppo_location_head_fp32 = enabled
 
+    def freeze_recent_actions(self) -> None:
+        """Keep recent own actions out of this policy for a same-code control run.
+
+        Their paths into existing activations stay exactly zero while every other
+        weight trains, so the frozen model computes what a pre-recent-action model
+        would, whatever recent actions it is shown in training, evaluation or live play.
+        """
+
+        config = self.config
+        widened = (
+            (self.input_projection[0].weight, config.recent_action_dim),
+            (self.spatial_encoder.input.weight, config.recent_action_spatial_channels),
+        )
+        skip = self.recent_action_policy_skip
+        if any(bool(weight[:, -width:].any()) for weight, width in widened) or any(
+            bool(parameter.any()) for parameter in skip.parameters()
+        ):
+            raise ValueError("recent-action paths are already trained; freeze only an upgraded or new model")
+        for name, parameter in self.recent_action_encoder.named_parameters():
+            if not name.startswith("card_encoder."):
+                parameter.requires_grad_(False)
+        for parameter in skip.parameters():
+            parameter.requires_grad_(False)
+
+        def hook(width: int):
+            def zero_new_columns(gradient: Tensor) -> Tensor:
+                gradient = gradient.clone()
+                gradient[:, -width:] = 0
+                return gradient
+
+            return zero_new_columns
+
+        for weight, width in widened:
+            weight.register_hook(hook(width))
+
     def parameter_count(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters())
 
@@ -359,12 +404,14 @@ class UniversalCardPolicyV4(nn.Module):
             batch.groups.child_extent,
             batch.groups.child_radius,
             batch.groups.child_mask,
+            self.recent_action_encoder.planes(batch.recent_actions, dtype=batch.explicit_spatial_planes.dtype),
         )
         scalar_summary = self.scalar_encoder(batch.match_scalars)
         event_summary = self.event_encoder(
             batch.events, group_memory=group_memory, token_memory=token_memory, profile_memory=profile_memory
         )
         previous_action_summary = self.previous_action_encoder(batch.previous_action, profile_memory=profile_memory)
+        recent_action_summary = self.recent_action_encoder(batch.recent_actions, profile_memory=profile_memory)
         candidate_memory, candidate_summary = self.candidate_encoder(
             batch.candidates,
             own_card_memory=own_card_memory,
@@ -384,6 +431,7 @@ class UniversalCardPolicyV4(nn.Module):
             scalar_summary=scalar_summary,
             event_summary=event_summary,
             previous_action_summary=previous_action_summary,
+            recent_action_summary=recent_action_summary,
             candidate_memory=candidate_memory,
             candidate_summary=candidate_summary,
         )
@@ -416,6 +464,7 @@ class UniversalCardPolicyV4(nn.Module):
                     encoded.event_summary,
                     encoded.previous_action_summary,
                     encoded.candidate_summary,
+                    encoded.recent_action_summary,
                 ),
                 dim=-1,
             )
@@ -428,6 +477,7 @@ class UniversalCardPolicyV4(nn.Module):
             + self.scene_policy_skip(encoded.scene_state)
             + self.spatial_policy_skip(encoded.spatial_summary)
             + self.candidate_policy_skip(encoded.candidate_summary)
+            + self.recent_action_policy_skip(encoded.recent_action_summary)
         )
         value_context = self.value_context_norm(
             normalized

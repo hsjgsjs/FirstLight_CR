@@ -3,7 +3,7 @@
 import random
 
 
-DEFAULT_PLAY_GAP_TICKS = (8, 12)
+DEFAULT_PLAY_GAP_TICKS = (6, 10)
 
 
 def parse_play_gap_ticks(value: str) -> tuple[int, int]:
@@ -11,7 +11,7 @@ def parse_play_gap_ticks(value: str) -> tuple[int, int]:
     try:
         bounds = (int(low), int(high or low))
     except ValueError:
-        raise ValueError("play gap must be N or MIN-MAX ticks, e.g. 8-12") from None
+        raise ValueError("play gap must be N or MIN-MAX ticks, e.g. 6-10") from None
     if not 1 <= bounds[0] <= bounds[1] <= 200:
         raise ValueError("play gap must be 1 <= MIN <= MAX <= 200 ticks")
     return bounds

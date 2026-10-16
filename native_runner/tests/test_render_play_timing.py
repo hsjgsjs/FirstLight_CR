@@ -10,7 +10,7 @@ from native_runner.training.v4.render_timing import SpacedRenderNativeV4
 
 def test_gap_clock_preserves_first_play_and_independent_owners():
     clock = PlayGapClock((8, 8))
-    assert DEFAULT_PLAY_GAP_TICKS == (8, 12)
+    assert DEFAULT_PLAY_GAP_TICKS == (6, 10)
     assert clock.next_tick(0, 101) == 101
     clock.commit(0, 101)
     assert clock.next_tick(0, 102) == 109
@@ -18,7 +18,7 @@ def test_gap_clock_preserves_first_play_and_independent_owners():
     assert clock.next_tick(0, 150) == 150
     variable = PlayGapClock(seed=7)
     variable.commit(0, 100)
-    assert {variable.next_tick(0, 101) for _ in range(100)} == set(range(108, 113))
+    assert {variable.next_tick(0, 101) for _ in range(100)} == set(range(106, 111))
 
 
 def test_renderer_spaces_compound_and_later_commands_using_receipts(monkeypatch):

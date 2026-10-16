@@ -106,7 +106,7 @@ bash native_runner/training/v4/lab_ppo.sh stop                      # 停止并�
 bash native_runner/training/v4/lab_ppo.sh resume spar-week1         # 中断后从最新的检查点续训
 ```
 
-- **启动前**会先清理上次残留的模拟器、worker、训练器和 `/dev/shm/firstlight-ppo-local-*`；**退出时**（训练结束、`stop`、出错）也会自动清理。只动自己账号下、名字是 `crppo_*` 的模拟器，不碰别人的。
+- **启动前**会先清理本实例上次残留的模拟器、worker、训练器和 `/dev/shm/firstlight-ppo-local-*`；**退出时**（训练结束、`stop`、出错）也会自动清理。只动自己账号下、本实例的进程（默认实例的模拟器名是 `crppo_*`），不碰别人的，也不碰另一个实例（见「同一台机器跑两个训练」）。
 - **默认单卡**（GPU 0），CPU 按 `CR_LAB_ENGINE_CPUS` / `CR_LAB_WORKER_CPUS` / `CR_LAB_CONTROL_CPUS` 分配（默认值见脚本开头，按自己的核数调整）。有第二块卡时，可以在训练中途拿来评测。改用双卡：`CR_LAB_TRAIN_GPUS=0,1`；双卡之间通信出问题时再加 `NCCL_P2P_DISABLE=1`。
 - **训练参数**默认是第 6 节的对练配置，实际用的参数存在 `runs/名字/trainer-options.txt`，续训时会自动沿用。要换参数用 `options`（见下面「中途改参数」），不用换名字。
 - **检查点**：每打完一批对局存一个完整检查点（约 48 MB，大约每 8 次更新一个）。脚本只保留最新 3 个，再加每 1000 次更新的第一个，一周大约 1–2 GB。对手池快照每 200 次更新一个。
@@ -119,6 +119,24 @@ bash native_runner/training/v4/lab_ppo.sh resume spar-week1         # 中断后�
   - 「GPU inference」是 GPU 推理的时间；「trainer batching」是训练器拼批（训练器的核）；「waiting for engines」是在等引擎推进和 worker 解析画面（引擎和 worker 的核）；「optimization」是 GPU 训练。
   - 等引擎的时间占比最大，并且 engines 或 workers 那组核接近 100%：说明瓶颈在 CPU。
   - GPU inference 占比最大，并且 GPU 利用率高：说明瓶颈在 GPU 推理。
+
+### 同一台机器跑两个训练（双卡）
+
+训练器的瓶颈是单线程推理循环（见第 4 节），CPU 和 GPU 都远没跑满，所以两块卡各跑一个独立训练，总吞吐接近翻倍。第二个训练加 `CR_LAB_INSTANCE=1`，并给它另外的 CPU 和 GPU：
+
+```bash
+# 实例 0（默认）：GPU 0，CPU 0–19
+bash native_runner/training/v4/lab_ppo.sh start 名字A 200
+# 实例 1：GPU 1，另一段 CPU（按自己的核数调整，不要和实例 0 重叠）
+CR_LAB_INSTANCE=1 CR_LAB_TRAIN_GPUS=1 \
+CR_LAB_ENGINE_CPUS=20-27 CR_LAB_WORKER_CPUS=28-35 CR_LAB_CONTROL_CPUS=36-39 \
+bash native_runner/training/v4/lab_ppo.sh start 名字B 200
+```
+
+- 实例 1 使用自己的引擎端口（28200 起）、worker 端口（29901）、模拟器名（`crppo1_*`）和控制台端口（5570 起）、`/dev/shm/firstlight-ppo-local1-*`、节点目录 `runs/lab-node-1`、停止标记和定时任务；它的启动、清理、`stop`、`status`、`ensure` 都只动自己的进程。默认实例的名字、端口与以前完全相同。
+- 实例记在 `runs/名字/launch-env` 里：`resume 名字`、`stop 名字 分钟`、`status 名字`、`schedule 名字 …` 会自动用该运行所在的实例。不带名字的 `stop` 只停默认实例；停实例 1 用 `CR_LAB_INSTANCE=1 bash … stop` 或 `bash … stop 名字B 0`。
+- 每个实例 8 个引擎约需 32 GB 内存；每个实例最多 8 台模拟器（32 个引擎），否则控制台端口会和另一个实例重叠。
+- 两个实例必须用**同一份**代码。不要在一个旧代码的训练运行时拉取新代码再启动另一个：旧版脚本的清理会停掉所有训练器和 worker，新旧代码的进程也不能混用。
 
 ### 每天定时运行
 
@@ -145,7 +163,7 @@ tail runs/schedule.log                                                      # �
 
 ```bash
 bash native_runner/training/v4/lab_ppo.sh options spar16-gw                                   # 查看当前参数，一行一个
-bash native_runner/training/v4/lab_ppo.sh options spar16-gw --min-play-gap-ticks 8-12          # 新增或替换一项
+bash native_runner/training/v4/lab_ppo.sh options spar16-gw --min-play-gap-ticks 6-10          # 新增或替换一项
 bash native_runner/training/v4/lab_ppo.sh options spar16-gw --unset --game-elixir-overflow-grace   # 删除一项
 ```
 
@@ -222,7 +240,7 @@ python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --game
 
 - **做通用对练模型，不做专精。** 对练要什么卡组都能打、打法正常。
 - **训练时加入执行延迟。** 学习者和对手都加，延迟在 18–24 tick 之间随机。
-- **两张牌不能同时落地。** `--min-play-gap-ticks 8-12`：同一方连续两次出牌或技能，落地至少相隔随机 8–12 tick（1 tick = 50 ms，即 400–600 ms）。原来一次决策最多能出 2 张牌，而且同一 tick 落地；相邻两次决策各自抽延迟，也可能几乎同时落地。新开的训练默认带上；已有的训练用 `options 名字 --min-play-gap-ticks 8-12` 加上，下一次续训自动热启动。评测器、离线人机对战、离线双模型对战和实战接管也支持同名参数，默认 8–12 tick。离线对战按引擎回执中的执行时间排队；实战接管按游戏 tick 等待下一次点击。双方时钟独立，首次出牌不额外等待。已有训练的保存参数不会自动迁移。
+- **两张牌不能同时落地。** `--min-play-gap-ticks 6-10`：同一方连续两次出牌或技能，落地至少相隔随机 6–10 tick（1 tick = 50 ms，即 300–500 ms）。2026-10-16 起默认值由 8–12 改为 6–10：高分局人类录像里几乎没有 300 ms 以内的连续出牌。原来一次决策最多能出 2 张牌，而且同一 tick 落地；相邻两次决策各自抽延迟，也可能几乎同时落地。新开的训练默认带上；已有的训练用 `options 名字 --min-play-gap-ticks 6-10` 加上，下一次续训自动热启动。评测器、离线人机对战、离线双模型对战和实战接管也支持同名参数，默认 6–10 tick。离线对战按引擎回执中的执行时间排队；实战接管按游戏 tick 等待下一次点击。双方时钟独立，首次出牌不额外等待。已有训练的保存参数不会自动迁移。
 - **对手**：自我对战 40%；固定对手 60%，从冻结的 General、Active IL、速猪专精 1 里均匀抽。原版 IL 占 0%（只作为锚点登记，不上场）。原版 IL 很被动，打它学到的是等对方犯错。
 - **连续满费溢出惩罚关闭**：`--personal-elixir-overflow-penalty 0 --personal-elixir-overflow-grace 0`。不开启按连续满费段计算的惩罚。
 - **整局圣水浪费惩罚开启**：`--game-elixir-overflow-penalty 0.01 --game-elixir-overflow-grace 3`。从学习者**第一张牌真正下出之后**开始，把整局满格浪费的圣水累加，超过 3 点后每多浪费 1 点扣 0.01。降到 10 以下不会重置这个整局累计值；首牌前的等待不算在内。`status` 会显示「after the first card」这一行。

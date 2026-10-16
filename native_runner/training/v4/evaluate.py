@@ -873,7 +873,7 @@ def main(argv=None):
         "--min-play-gap-ticks",
         type=parse_play_gap_ticks,
         default=DEFAULT_PLAY_GAP_TICKS,
-        help="land each side's consecutive plays and abilities at least MIN-MAX ticks apart (default: 8-12 = 400-600 ms)",
+        help="land each side's consecutive plays and abilities at least MIN-MAX ticks apart (default: 6-10 = 300-500 ms)",
     )
     parser.add_argument(
         "--gate-temperature-a",

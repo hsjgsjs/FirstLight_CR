@@ -5,7 +5,7 @@ from dataclasses import fields, replace
 import pytest
 import torch
 
-from native_runner.training.v4.tensors import ActiveEffectSetV4, ActionCandidatesV4, ActionSequenceV4, BattleGroupSetV4, CardSetV4, EventSetV4, GATE_ACT, PreviousActionV4, RelationEdgesV4, TARGET_GRID, TARGET_NONE, TowerSetV4, UniversalSemanticBatchV4, target_cell_from_xy, target_xy_from_cell
+from native_runner.training.v4.tensors import ActiveEffectSetV4, ActionCandidatesV4, ActionSequenceV4, BattleGroupSetV4, CardSetV4, EventSetV4, GATE_ACT, PreviousActionV4, RecentActionsV4, RelationEdgesV4, TARGET_GRID, TARGET_NONE, TowerSetV4, UniversalSemanticBatchV4, target_cell_from_xy, target_xy_from_cell
 from native_runner.training.v4.mechanics import ACTIVE_EFFECT_RUNTIME_FEATURE_NAMES, EffectSemanticCatalogV1, MechanicProfileCatalogV1
 from native_runner.training.v4.catalog import AbilityCatalogV1, CardCatalogV1, EntityArchetypeCatalogV1
 from native_runner.training.v4.config import ModelConfigV4
@@ -269,6 +269,7 @@ def _batch(batch_size: int = 2) -> UniversalSemanticBatchV4:
             config.board_width,
         ),
         previous_action=previous,
+        recent_actions=RecentActionsV4.empty(batch_size, config, known=True),
         candidates=candidates,
     )
 

@@ -920,7 +920,7 @@ def main() -> int:
         type=parse_play_gap_ticks,
         help=(
             "land each policy's consecutive card plays and abilities at least MIN-MAX ticks apart (drawn per "
-            "play; a tick is 50 ms, so 8-12 is 400-600 ms), as a human cannot tap two cards at once"
+            "play; a tick is 50 ms, so 6-10 is 300-500 ms), as a human cannot tap two cards at once"
         ),
     )
     parser.add_argument(
@@ -993,6 +993,11 @@ def main() -> int:
     parser.add_argument("--updates", type=int, default=2)
     parser.add_argument("--rollout-segment-seconds", type=int, default=40)
     parser.add_argument("--snapshot-every", type=int, default=8)
+    parser.add_argument(
+        "--freeze-recent-actions",
+        action="store_true",
+        help="control runs: keep the recent own action paths at zero so the policy trains as before they existed",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--gamma", type=float, default=0.9997)
     parser.add_argument("--gae-lambda", type=float, default=0.98)
@@ -1343,6 +1348,8 @@ def main() -> int:
             current_model.ppo_continue_temperature, args.continue_temperature, rel_tol=0.0, abs_tol=1e-12
         ):
             raise ValueError("resume checkpoint continue temperature changed")
+    if args.freeze_recent_actions:
+        current_model.freeze_recent_actions()
     source_checkpoint_id = str(current_payload["checkpoint_id"])
     behavior_state_id = source_checkpoint_id
     actor_model = current_model
@@ -1477,6 +1484,8 @@ def main() -> int:
     # Omit the optional key when disabled to preserve old no-BC strict resumes.
     if expert_bc_contract is not None:
         resume_contract["expert_bc"] = expert_bc_contract
+    if args.freeze_recent_actions:
+        resume_contract["freeze_recent_actions"] = True
     resume_extra = current_payload.get("extra")
     if args.resume_checkpoint is not None:
         if not isinstance(resume_extra, Mapping) or (resume_extra.get("strict_boundary") is not True):

@@ -7,8 +7,12 @@ from dataclasses import dataclass, fields
 from ..card_features import CARD_MECHANIC_FEATURE_NAMES, CARD_STATIC_FEATURE_NAMES
 
 
-UNIVERSAL_POLICY_VERSION = "universal-card-policy.v4"
-UNIVERSAL_OBSERVATION_VERSION = "universal-semantic-observation.v4"
+UNIVERSAL_POLICY_VERSION = "universal-card-policy.v4.1"
+UNIVERSAL_OBSERVATION_VERSION = "universal-semantic-observation.v4.1"
+# Checkpoints saved before recent own actions were added. They load through the
+# zero-contribution upgrade in ``checkpoint.py`` and behave exactly as before.
+LEGACY_POLICY_VERSION = "universal-card-policy.v4"
+LEGACY_OBSERVATION_VERSION = "universal-semantic-observation.v4"
 UNIVERSAL_ACTION_VERSION = "universal-candidate-action.v4"
 UNIVERSAL_CARD_CATALOG_VERSION = "universal-card-catalog.v3"
 
@@ -205,6 +209,16 @@ SHADOW_FEATURE_NAMES = (
     "has_legal_candidate",
 )
 
+# The actor's own card and Ability commands from recent decisions. Elapsed time is
+# measured from the decision tick, which training and live play both know exactly;
+# the sampled execution delay is never an input.
+RECENT_ACTION_FEATURE_NAMES = (
+    "elapsed_since_decision_over_horizon",
+    "executed",
+    "elapsed_since_execution_over_horizon",
+    "is_ability",
+)
+
 SPATIAL_PAIR_FEATURE_NAMES = (
     "dx_over_board_width",
     "dy_over_board_height",
@@ -301,6 +315,13 @@ class ModelConfigV4:
     previous_action_dim: int = 128
     candidate_dim: int = 256
     candidate_summary_dim: int = 128
+    # Recent own commands: queued and recently executed, at most this many,
+    # retained until this many ticks after execution (60 ticks = 3 s).
+    max_recent_actions: int = 4
+    recent_action_horizon_ticks: int = 60
+    recent_action_feature_dim: int = len(RECENT_ACTION_FEATURE_NAMES)
+    recent_action_dim: int = 64
+    recent_action_spatial_channels: int = 2
 
     # The only persistent neural recurrent core.
     lstm_input_dim: int = 512
