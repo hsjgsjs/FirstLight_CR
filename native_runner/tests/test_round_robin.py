@@ -110,6 +110,21 @@ class RoundRobinTests(unittest.TestCase):
         split_summary = round_robin_summary(pairs, self.names, anchor=self.names[0], bootstrap_samples=20)
         self.assertEqual(split_summary, round_robin_summary(full, self.names, anchor=self.names[0], bootstrap_samples=20))
 
+    def test_identity_equals_its_saved_form(self):
+        root = self.root / "repo"
+        (root / "native_runner").mkdir(parents=True)
+        (root / "round_robin.example.json").write_text(
+            (Path(__file__).resolve().parents[2] / "round_robin.example.json").read_text(encoding="utf-8"))
+        for name in ("a.pt", "b.pt", "pool.json"):
+            (root / name).write_bytes(name.encode())
+        write_json(root / "config.json", dict(models={"A": str(root / "a.pt"), "B": str(root / "b.pt")}, anchor="A",
+                                              deck_pool=str(root / "pool.json")))
+        import native_runner.round_robin as module
+        with patch.object(module, "ROOT", root), patch.object(module, "load_env", lambda: None):
+            identity = module.study_identity(module.read_options(SimpleNamespace(config=root / "config.json")))
+        write_json(root / "study.json", identity)
+        self.assertEqual(json.loads((root / "study.json").read_text(encoding="utf-8")), identity)
+
     def test_resume_ignores_incomplete_attempt_and_recovers_full_retry(self):
         partial = self.run_directory("rr-partial")
         path = partial / "shard-00/pair-00/matches.jsonl"

@@ -135,10 +135,13 @@ def study_identity(options):
         if "tests" not in path.parts:
             source.update(str(path.relative_to(ROOT)).encode())
             source.update(path.read_bytes())
-    return dict(schema="round-robin.v1", models={name: digest(Path(path)) for name, path in options["models"].items()},
-                model_order=list(options["models"]), anchor=options["anchor"], gameplay=gameplay,
-                match=asdict(base_match(options)), deck_pool_sha256=digest(Path(options["deck_pool"])),
-                schedule="natural-4-v1", source_sha256=source.hexdigest())
+    identity = dict(schema="round-robin.v1", models={name: digest(Path(path)) for name, path in options["models"].items()},
+                    model_order=list(options["models"]), anchor=options["anchor"], gameplay=gameplay,
+                    match=asdict(base_match(options)), deck_pool_sha256=digest(Path(options["deck_pool"])),
+                    schedule="natural-4-v1", source_sha256=source.hexdigest())
+    # In its JSON form (tuples become lists), so it compares equal to a saved study.json and a rerun skips
+    # the blocks that earlier runs completed.
+    return json.loads(json.dumps(identity))
 
 
 def read_rows(path):
