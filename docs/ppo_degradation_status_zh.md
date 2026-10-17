@@ -55,15 +55,14 @@
 
 ```bash
 python - spar16-hog-sanity spar16-snr-a <<'PY'
-import json, shlex, sys
+import json, sys
 from pathlib import Path
 HOG = 26000021
 for name in sys.argv[1:]:
-    run = Path("runs", name)
-    options = shlex.split((run / "trainer-options.txt").read_text())
-    pool = json.loads(Path(options[options.index("--deck-pool") + 1]).read_text())
+    stage = sorted(Path("runs", name).glob("train-*"))[-1]
+    config = json.loads((stage / "config.json").read_text())
+    pool = json.loads(Path(config["deck_pool"]).read_text())
     hog_decks = {d["deck_id"] for d in pool["decks"] if HOG in d["card_ids"]}
-    stage = sorted(run.glob("train-*"))[-1]
     rows = [json.loads(l) for l in (stage / "matches.jsonl").read_text().splitlines() if l.strip()]
     print(f"== {name} {stage.name}  卡组池 {len(pool['decks'])} 个，含野猪 {len(hog_decks)} 个")
     print("   updates   学习方带野猪座位  每局野猪  零野猪比例   对手带野猪座位  对手每局野猪")
