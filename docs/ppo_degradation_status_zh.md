@@ -1,6 +1,6 @@
-# PPO“一学就退化”排查现状（2026-10-16 夜）
+# PPO“一学就退化”排查现状（2026-10-17 更新）
 
-本文是排查的交接记录：已确认什么、正在跑什么、明早看什么、下一步怎么决定。详细数据与推理见[实力提升计划](strength_plan_zh.md)第 8 节，各选项用法见[实验室训练](lab_training_zh.md)第 4、6 节。
+本文是排查的交接记录：已确认什么、跑过什么、结果说明什么、下一步怎么决定。详细数据与推理见[实力提升计划](strength_plan_zh.md)第 8 节，各选项用法见[实验室训练](lab_training_zh.md)第 4、6 节。
 
 ## 1. 问题
 
@@ -21,100 +21,108 @@
 | 优势值链路接错 | 没有发现 bug | 逐项核对并用记录协议测试复现：GAE 的终局与截断、分段处的价值自举（与下一段首步逐位相同）、局中结束的线终值为 0、不出手期间奖励累加到上一步、自博弈两座位各用自己的奖励、分段循环状态（第一轮比率恰为 1）、强制开局只作用于冻结对手 |
 | 锚太松 | 只是放大因素 | 人类 BC 每次更新、系数 0.2 只把下滑放慢：41/45/40/39/33/31%，101–104 次降到 23% |
 
-## 3. 剩下的嫌疑（按可能性排序）
+## 3. 剩下的嫌疑（按可能性排序，10-17 按梯度信噪比的结果重排）
 
-1. **价值裁剪过紧，价值头跟不上**
-   - 机制：价值裁剪等于策略裁剪 0.1，每次更新每个状态的价值最多移动约 0.1，而回报在 ±1 左右。一个分段只有 160 次决策，(γλ)^160 ≈ 0.04，大部分分段的优势值几乎全由价值头决定。
-   - 放大因素：“同相位”使收尾段每 8 次更新才出现一次，价值头更难跟上。
-   - 后果：价值头落后时，优势值会一致地偏，策略追着价值头的错误走。
-   - 吻合的迹象：后期收尾段 EV 跌到 −0.41、−0.12。
-   - 对策：已新增 `--value-clip-range`（`0` 关闭）。
-2. **噪声：每次更新的数据太少**
+1. **噪声：每次更新的数据太少**（首要）
    - 规模：原项目 1,528 局并发，每次更新约 340 局；本实验室每次更新约 8 局结束。
-   - 收尾段：只剩少数加时局，仍然走满 4 轮完整步长。
-   - 对策：用 `--gradient-noise-every` 测量，再决定是否加长分段、攒段，或按有效帧数缩小步长。
-3. **没有东西稳住落点分布**
+   - 实测：`snr` 约 0.05，`grad cos` 接近 0，见第 4 节。
+   - 对策：加长分段、攒段，或缩小步长，见第 5 节。
+2. **没有东西稳住落点分布**
    - 熵系数固定为 0，落点温度 1.0。
-   - 吻合的迹象：漂移分析中落点头漂移最大。
+   - 吻合的迹象：漂移分析中落点头漂移最大；噪声可能主要集中在落点头。
+3. **价值裁剪过紧，价值头跟不上**（降为次要）
+   - 机制：价值裁剪等于策略裁剪 0.1，回报在 ±1 左右；一个分段 (γλ)^160 ≈ 0.04，优势值主要由价值头决定。
+   - 降级原因：价值头一致地偏会让 `grad cos` 明显为正，实测接近 0。
+   - 对策：`--value-clip-range 0` 已可用。
 
-## 4. 正在跑的实验
+## 4. 10-16 夜的实验与结果
 
 三组都从 recent u200 出发，设置与 `spar16-anchor-a` 相同（人类 BC 每次更新、系数 0.2，`running` 归一化），只改列出的一项：
 
-| 运行 | 改动 | 回答的问题 |
+| 运行 | 改动 | 结果 |
 |---|---|---|
-| `spar16-snr-a` | `--gradient-noise-every 2` | 基准组的梯度信噪比是多少 |
-| `spar16-shape-a`（已停，被野猪测试替换） | `--shaping-beta 0.2` | 塔血奖励加密有没有用（早期读数：snr 约 0，胜率 26%，样本太少） |
-| `spar16-hog-sanity` | `--hog-deploy-reward 0.3 --hog-deploy-reward-episode-cap 1.5` | 流水线能否学会一个即时、密集的奖励 |
+| `spar16-snr-a` | `--gradient-noise-every 2` | 400 次更新，胜率 32% → 约 8%；`grad cos` 全程在 ±0.09 内（均值约 0.01），`snr` 约 0.0–0.16 |
+| `spar16-shape-a`（早停） | `--shaping-beta 0.2` | 样本太少，不下结论 |
+| `spar16-hog-sanity` | `--hog-deploy-reward 0.3 --hog-deploy-reward-episode-cap 1.5` | 按全部座位平均，每局野猪 0.2–0.8 次，400 次更新没有上升趋势；待按卡组复核（见下） |
 
-早期读数（13 次更新）：snr-a 的 `grad cos` 在 0.22 和 0.01 之间，`snr` 在 0.54 和 0.04 之间。
+**梯度信噪比的含义**
 
-## 5. 明早看什么
+- `snr` 估计的是“真实梯度的平方范数 / 一次更新里噪声的平方范数”。0.05 意味着更新方向与真实梯度的夹角余弦只有约 √0.05 ≈ 0.22，更新的绝大部分是噪声。
+- 系统偏差（例如价值头一致地偏）会让两半数据的梯度指向同一错误方向，`grad cos` 应明显为正。实测接近 0，所以不是偏差主导，价值裁剪降为次要嫌疑。
+- 结论：**每次更新的数据太少，步子又是整步，参数在做随机游走，离开起点的好位置**。这与旧设置（学习率 1e-5、每批 1 轮，步子约小 12 倍）胜率不动、新设置胜率下滑都吻合，也与原项目（每次更新的数据约多 40 倍，信噪比约 2）能练出来吻合。
 
-```bash
-bash native_runner/training/v4/lab_ppo.sh trend spar16-snr-a 16
-bash native_runner/training/v4/lab_ppo.sh trend spar16-hog-sanity 16
-```
-
-**野猪测试**：每 8 次更新统计一次每局下了几次野猪骑士。脚本按 `hog_deploy_reward_total / 0.3` 换算，每局上限 5 次：
+**野猪测试要按卡组复核**：学习方的卡组从整个卡组池抽取，大多数卡组没有野猪，按全部座位平均会把信号稀释掉。下面的脚本只统计带野猪的卡组，用每局实际下野猪次数（不受奖励上限截断），并以冻结对手的带野猪座位作对照。两个运行都跑，`spar16-snr-a` 没有野猪奖励，作为对照组：
 
 ```bash
-python - runs/spar16-hog-sanity <<'PY'
-import json, sys
+python - spar16-hog-sanity spar16-snr-a <<'PY'
+import json, shlex, sys
 from pathlib import Path
-stage = sorted(Path(sys.argv[1]).glob("train-*"))[-1]
-rows = [json.loads(l) for l in (stage / "matches.jsonl").read_text().splitlines()]
-for low in range(1, max(r["update"] for r in rows) + 1, 8):
-    seats = [(r, o) for r in rows if low <= r["update"] < low + 8 for o in r["current_owners"]]
-    if seats:
-        hogs = sum(r.get("hog_deploy_reward_total", [0, 0])[o] for r, o in seats) / 0.3 / len(seats)
-        print(f"u{low:3d}-{low+7:<3d}  每局野猪 {hogs:4.2f}  ({len(seats)} 个座位)")
+HOG = 26000021
+for name in sys.argv[1:]:
+    run = Path("runs", name)
+    options = shlex.split((run / "trainer-options.txt").read_text())
+    pool = json.loads(Path(options[options.index("--deck-pool") + 1]).read_text())
+    hog_decks = {d["deck_id"] for d in pool["decks"] if HOG in d["card_ids"]}
+    stage = sorted(run.glob("train-*"))[-1]
+    rows = [json.loads(l) for l in (stage / "matches.jsonl").read_text().splitlines() if l.strip()]
+    print(f"== {name} {stage.name}  卡组池 {len(pool['decks'])} 个，含野猪 {len(hog_decks)} 个")
+    print("   updates   学习方带野猪座位  每局野猪  零野猪比例   对手带野猪座位  对手每局野猪")
+    for low in range(1, max(r["update"] for r in rows) + 1, 50):
+        mine, theirs = [], []
+        for r in rows:
+            if not low <= r["update"] < low + 50:
+                continue
+            decks = (r["deck0_id"], r["deck1_id"])
+            for owner in (0, 1):
+                if decks[owner] in hog_decks:
+                    (mine if owner in r["current_owners"] else theirs).append(r["hog_deployments"][owner])
+        def show(xs):
+            return f"{len(xs):5d}  {sum(xs)/len(xs):8.2f}" if xs else f"{0:5d}  {'-':>8}"
+        zero = f"{sum(x == 0 for x in mine)/len(mine):8.0%}" if mine else f"{'-':>8}"
+        print(f"   {low:3d}-{low+49:<3d}   {show(mine)}  {zero}          {show(theirs)}")
 PY
 ```
 
-**梯度信噪比**：列出每次测量的原始读数，并按熵区分开局段和收尾段（熵高于 0.3 视为收尾段）：
+| 结果 | 含义 |
+|---|---|
+| hog-sanity 学习方每局野猪明显上升，snr-a 不升 | 流水线能学会密集奖励；胜负信号只是太稀、太吵 |
+| 两组都不升 | 连密集奖励也被噪声淹没，或者奖励没正确归到动作上，需要再查 |
 
-```bash
-python - <<'PY'
-import json
-from pathlib import Path
-for name in ("spar16-snr-a",):
-    stage = sorted(Path("runs", name).glob("train-*"))[-1]
-    print("==", name, stage.name)
-    for line in (stage / "metrics.jsonl").read_text().splitlines():
-        row = json.loads(line)
-        if "gradient_snr" in row:
-            phase = "收尾" if row.get("entropy", 0) > 0.3 else "开局"
-            print(f"  u{row['update']:3d} {phase}  cos {row['gradient_half_cosine']:6.3f}  snr {row['gradient_snr']:6.2f}  EV {row['value_explained_variance']:5.2f}")
-PY
-```
+## 5. 下一步：加大每次更新的数据量
 
-## 6. 判断与下一步
+不用改代码的办法是加长分段：`--rollout-segment-seconds 160`，每次更新的决策数是现在的 4 倍，大部分对局在两段内结束，同相位问题也随之变轻。代价是每次更新的墙钟时间约为 4 倍。另一组只把学习率降到 1e-5，看下滑是否随步长平方减慢（噪声）还是线性减慢（偏差）。
 
-| 观察 | 含义 | 下一步 |
-|---|---|---|
-| 野猪次数在 20–30 次更新内明显上升 | 流水线能把奖励正确归到动作上 | 问题在价值头或信号规模 |
-| 野猪次数不涨或下降 | 流水线有 bug | 回到代码查 |
-| `grad cos` 明显为正，胜率仍下滑 | 方向一致地偏 | 价值裁剪是首要嫌疑，跑 vclip0 |
-| `grad cos` 接近 0，`snr` 远小于 1 | 噪声为主 | 加长分段（`--rollout-segment-seconds` 120–160）、攒段或缩小步长，同时也试 vclip0 |
-
-不论哪种情况，下一组实验都是 `spar16-vclip0`：与 snr-a 相同，只加 `--value-clip-range 0`。命令里的 `<当前空出来的运行>` 换成刚停掉的那组，例如 `spar16-hog-sanity`；新运行要用它的 `launch-env`（实例），起点仍取 snr-a 的 u200：
+两组都与 snr-a 相同，起点都是 snr-a 的 u200。`spar16-seg160` 沿用 snr-a 的实例，`spar16-lr1e5` 沿用 hog-sanity 的实例：
 
 ```bash
 git pull
-bash native_runner/training/v4/lab_ppo.sh stop <当前空出来的运行>
-mkdir -p runs/spar16-vclip0/logs
-cp runs/spar16-snr-a/trainer-options.txt runs/spar16-vclip0/
-grep -v '^CR_PPO_CHECKPOINT=' runs/<当前空出来的运行>/launch-env > runs/spar16-vclip0/launch-env
-grep '^CR_PPO_CHECKPOINT=' runs/spar16-snr-a/launch-env >> runs/spar16-vclip0/launch-env
-bash native_runner/training/v4/lab_ppo.sh options spar16-vclip0 --value-clip-range 0
-CR_LAB_WARM_START_OPTIMIZER=1 bash native_runner/training/v4/lab_ppo.sh resume spar16-vclip0 400
-bash native_runner/training/v4/lab_ppo.sh watch spar16-vclip0
+bash native_runner/training/v4/lab_ppo.sh stop spar16-snr-a
+bash native_runner/training/v4/lab_ppo.sh stop spar16-hog-sanity
+for name in spar16-seg160 spar16-lr1e5; do
+  mkdir -p runs/$name/logs
+  cp runs/spar16-snr-a/trainer-options.txt runs/$name/
+done
+cp runs/spar16-snr-a/launch-env runs/spar16-seg160/
+grep -v '^CR_PPO_CHECKPOINT=' runs/spar16-hog-sanity/launch-env > runs/spar16-lr1e5/launch-env
+grep '^CR_PPO_CHECKPOINT=' runs/spar16-snr-a/launch-env >> runs/spar16-lr1e5/launch-env
+bash native_runner/training/v4/lab_ppo.sh options spar16-seg160 --rollout-segment-seconds 160
+bash native_runner/training/v4/lab_ppo.sh options spar16-lr1e5 --learning-rate 1e-5
+for name in spar16-seg160 spar16-lr1e5; do
+  CR_LAB_WARM_START_OPTIMIZER=1 bash native_runner/training/v4/lab_ppo.sh resume $name 400
+  bash native_runner/training/v4/lab_ppo.sh watch $name
+done
 ```
 
-有效的标准：收尾段 EV 不再崩，胜率不再一路下滑。
+如果 seg160 显存不够，改成 120。
 
-## 7. 本轮新增的工具
+| 观察 | 含义 | 下一步 |
+|---|---|---|
+| seg160 的 `snr` 升到约 0.15–0.2，胜率按对局数算下滑明显变慢 | 噪声随数据量下降，方向对 | 加一个“攒几段再更新”的选项，继续加大每次更新的数据量 |
+| seg160 的 `snr` 不升 | 噪声不随样本数下降，来源在别处（例如落点头） | 按头分别测信噪比 |
+| lr1e5 的下滑约为 snr-a 的 1/9 | 噪声主导 | 小步长长期跑可以不退化，但学得慢 |
+| lr1e5 的下滑约为 snr-a 的 1/3 | 有系统偏差 | 回到价值裁剪（`--value-clip-range 0`） |
+
+## 6. 本轮新增的工具
 
 | 工具 | 用途 |
 |---|---|
