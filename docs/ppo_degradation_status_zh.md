@@ -1,4 +1,4 @@
-# PPO“一学就退化”排查现状（2026-10-17 更新）
+# PPO“一学就退化”排查现状（2026-10-19 更新）
 
 本文是排查的交接记录：已确认什么、跑过什么、结果说明什么、下一步怎么决定。详细数据与推理见[实力提升计划](strength_plan_zh.md)第 8 节，各选项用法见[实验室训练](lab_training_zh.md)第 4、6 节。
 
@@ -37,7 +37,7 @@
 
 ## 4. 10-16 夜的实验与结果
 
-三组都从 General 460 出发（各运行日志里的 `starting from` 为准），设置与 `spar16-anchor-a` 相同（人类 BC 每次更新、系数 0.2，`running` 归一化），只改列出的一项：
+snr-a 从 `spar16-recent-v1` 第 200 次更新出发（已按 `config.json` 核对；其余组以各自 `config.json` 的 `source_checkpoint` 为准，见第 5 节），三组设置与 `spar16-anchor-a` 相同（人类 BC 每次更新、系数 0.2，`running` 归一化），只改列出的一项：
 
 | 运行 | 改动 | 结果 |
 |---|---|---|
@@ -87,67 +87,72 @@ PY
 | hog-sanity 学习方每局野猪明显上升，snr-a 不升 | 流水线能学会密集奖励；胜负信号只是太稀、太吵 |
 | 两组都不升 | 连密集奖励也被噪声淹没，或者奖励没正确归到动作上，需要再查 |
 
-## 5. 下一步：加大每次更新的数据量
+## 5. 10-19：seg160 / lr1e5 作废，改做攒批的剂量实验
 
-不用改代码的办法是加长分段：`--rollout-segment-seconds 160`，每次更新的决策数是现在的 4 倍，大部分对局在两段内结束，同相位问题也随之变轻。代价是每次更新的墙钟时间约为 4 倍。另一组只把学习率降到 1e-5，看下滑是否随步长平方减慢（噪声）还是线性减慢（偏差）。
+### 起点弄错了
 
-两组都与 snr-a 相同，起点都是 snr-a 的起点 General 460。`spar16-seg160` 沿用 snr-a 的实例，`spar16-lr1e5` 沿用 hog-sanity 的实例：
+`spar16-seg160`（`--rollout-segment-seconds 160`）和 `spar16-lr1e5`（`--learning-rate 1e-5`）本想与 snr-a 同起点对照，实际从 General 460 出发，而 snr-a 等各组的起点是 `spar16-recent-v1` 第 200 次更新。两者不能比较，结论作废：
+
+- General 460 在没人先出牌时会一直等到约 120 秒（双倍圣水）才开局，这是已知行为。新 run 的自博弈和不强制开局的固定对手局因此僵持到 120 秒，学习方第一张牌约 120 秒、每局溢出约 41 圣水；snr-a 同类对局约 10 秒、溢出约 0。
+- 原因：`supervisor.log` 的 `starting from` 只打印启动时的 `CR_PPO_CHECKPOINT` 环境变量，launch-env 被后来的操作改写后就不再反映当初的起点。训练器实际加载的文件以阶段目录的 `config.json` 为准：
 
 ```bash
-git pull
-for name in spar16-snr-a spar16-hog-sanity; do
-  bash native_runner/training/v4/lab_ppo.sh unwatch $name
-  bash native_runner/training/v4/lab_ppo.sh stop $name
-done
-crontab -l | grep lab_ppo   # 应该没有输出；还有旧的 schedule 就用 CR_LAB_INSTANCE=N lab_ppo.sh unschedule 清掉
-for name in spar16-seg160 spar16-lr1e5; do
-  mkdir -p runs/$name/logs
-  cp runs/spar16-snr-a/trainer-options.txt runs/$name/
-done
-cp runs/spar16-snr-a/launch-env runs/spar16-seg160/
-grep -v '^CR_PPO_CHECKPOINT=' runs/spar16-hog-sanity/launch-env > runs/spar16-lr1e5/launch-env
-grep '^CR_PPO_CHECKPOINT=' runs/spar16-snr-a/launch-env >> runs/spar16-lr1e5/launch-env
-bash native_runner/training/v4/lab_ppo.sh options spar16-seg160 --rollout-segment-seconds 160
-bash native_runner/training/v4/lab_ppo.sh options spar16-lr1e5 --learning-rate 1e-5
-for name in spar16-seg160 spar16-lr1e5; do
-  CR_LAB_WARM_START_OPTIMIZER=1 bash native_runner/training/v4/lab_ppo.sh resume $name 400
-  bash native_runner/training/v4/lab_ppo.sh watch $name
-done
+python - <<'PY2'
+import json
+from pathlib import Path
+for config in sorted(Path("runs").glob("spar16-*/train-*/config.json")):
+    c = json.loads(config.read_text())
+    print(config.parts[1], config.parts[2], c.get("initial_update_step"), c.get("source_checkpoint"))
+PY2
 ```
 
-旧 run 的 watch 必须先去掉：新 run 和旧 run 共用实例，`resume` 会清掉实例的停止标记，新 run 一挂，旧 watch 就可能把旧 run 拉起来。如果 seg160 显存不够，改成 120。
+- seg160 也测不了原来的问题：加长分段不增加同时进行的独立对局线（每次更新仍约 90 条），只让每条线多走几步，所以 `snr` 不升是预料之中的。
 
-| 观察 | 含义 | 下一步 |
-|---|---|---|
-| seg160 的 `snr` 升到约 0.15–0.2，胜率按对局数算下滑明显变慢 | 噪声随数据量下降，方向对 | 用 `--accumulate-batches` 继续加大每次更新的数据量（见下） |
-| seg160 的 `snr` 不升 | 噪声不随样本数下降，来源在别处（例如落点头） | 按头分别测信噪比 |
-| lr1e5 的下滑约为 snr-a 的 1/9 | 噪声主导 | 小步长长期跑可以不退化，但学得慢 |
-| lr1e5 的下滑约为 snr-a 的 1/3 | 有系统偏差 | 回到价值裁剪（`--value-clip-range 0`） |
+### 为什么继续查数据量
+
+不论起点、惩罚、自博弈怎么改都会下滑，人类 BC 只能放慢；所有运行的 `grad cos`、`snr` 都接近 0。与此吻合的解释是：每次更新的方向几乎全是噪声，Adam 又把每一步缩放到约等于学习率的固定大小，参数从起点的好位置随机游走，平均只会变差。每次更新的独立对局数是原仓库的约 1/40。
 
 ### 攒批：`--accumulate-batches N`
 
-加长分段最多只能让一次更新用上一整批（所有对局线各打完一局，默认 8 个引擎 × 8 条线 = 64 局）。要接近原仓库每次更新约 340 局，需要跨批攒数据。`--accumulate-batches N` 在策略不变的情况下连收 N 个完整批次，再用全部数据做一次更新：
+`--accumulate-batches N` 在策略不变的情况下连收 N 个完整批次（所有对局线各打完一局，默认 8 个引擎 × 8 条线 = 64 局），再用全部数据做一次更新：
 
 - 每段数据仍按原样计算优势（段尾用价值自举），只是拼成更多对局线一起更新；批次之间换对手、换卡组照常进行。
 - 每次更新都落在批次结束处，所以每次更新都存一个可严格续训的检查点。
-- 同时要把 `--lane-minibatch-size` 调大（例如 4096），每轮才是一步大步，而不是几步小步；GPU 显存只由 `--lane-microbatch-size` 决定，不受影响。
-- 代价是内存：一次更新的数据全部留在内存里，拼接时短暂占两份。先用 `N = 1`，跑起来后看 `free -g`，再加到 2–5。
+- 同时要把 `--lane-minibatch-size` 调大（4096），每轮才是一步大步，而不是几步小步；GPU 显存只由 `--lane-microbatch-size` 决定，不受影响。
+- 代价是内存：一次更新的数据全部留在内存里，拼接时短暂占两份。N = 4 约为现在单次更新的 20 倍，第一次更新完成前看 `free -g`，不够就降到 2。
 - 信噪比的两半各取每一段的一半对局线，所以两半混有同样的早段和晚段，`snr` 和之前可以直接比较。
 
-seg160 确认方向后，用它空出的实例开一组（起点仍是 General 460，与之前各组相同）：
+### 实验：acc1 与 acc4 并行
+
+两组起点都与 snr-a 相同（命令从 snr-a 的 `config.json` 读出），选项与 snr-a 相同，只加攒批。acc1 每次更新约 64 局、约 4 分钟；acc4 约 256 局、约 15 分钟，接近原仓库的规模。分别沿用 seg160、lr1e5 的实例：
 
 ```bash
 git pull
-bash native_runner/training/v4/lab_ppo.sh unwatch spar16-seg160
-bash native_runner/training/v4/lab_ppo.sh stop spar16-seg160
-mkdir -p runs/spar16-acc1/logs
-cp runs/spar16-seg160/trainer-options.txt runs/spar16-seg160/launch-env runs/spar16-acc1/
-bash native_runner/training/v4/lab_ppo.sh options spar16-acc1 --accumulate-batches 1 --lane-minibatch-size 4096 --gradient-noise-every 1
-CR_LAB_WARM_START_OPTIMIZER=1 bash native_runner/training/v4/lab_ppo.sh resume spar16-acc1 200
-bash native_runner/training/v4/lab_ppo.sh watch spar16-acc1
+for name in spar16-seg160 spar16-lr1e5; do
+  bash native_runner/training/v4/lab_ppo.sh unwatch $name
+  bash native_runner/training/v4/lab_ppo.sh stop $name
+done
+START=$(python -c "import json,glob;print(json.load(open(sorted(glob.glob('runs/spar16-snr-a/train-*/config.json'))[0]))['source_checkpoint'])")
+echo "起点: $START"
+for pair in "spar16-acc1 1 spar16-seg160" "spar16-acc4 4 spar16-lr1e5"; do
+  set -- $pair
+  mkdir -p runs/$1/logs
+  cp runs/spar16-snr-a/trainer-options.txt runs/$1/
+  grep -v '^CR_PPO_CHECKPOINT=' runs/$3/launch-env > runs/$1/launch-env
+  echo "CR_PPO_CHECKPOINT=$START" >> runs/$1/launch-env
+  bash native_runner/training/v4/lab_ppo.sh options $1 --accumulate-batches $2 --lane-minibatch-size 4096 --gradient-noise-every 1
+  CR_LAB_WARM_START_OPTIMIZER=1 bash native_runner/training/v4/lab_ppo.sh resume $1 400
+  bash native_runner/training/v4/lab_ppo.sh watch $1
+done
 ```
 
-每次更新要等一整批打完，更新次数会少很多，`trend` 用小一点的块（例如 `trend spar16-acc1 4`）。
+启动后确认 `config.json` 的 `source_checkpoint` 与 snr-a 相同。每次更新要等整批打完，`trend` 用小一点的块（例如 `trend spar16-acc4 4`）。参照：snr-a 前 100 次更新胜率 30% → 22%。
+
+| 观察 | 含义 | 下一步 |
+|---|---|---|
+| `snr` 随 N 上升，下滑随之变慢，acc4 持平或上升 | 数据量不够就是原因 | 在速度与效果之间选 N |
+| `snr` 上升，胜率仍按 snr-a 的速度下滑 | 方向确定但错误，问题在奖励或优势 | 对照：在对局之间打乱胜负再训练，看是否同样下滑 |
+| `snr` 不随 N 上升 | 噪声来自对局数以外 | 按头分别测信噪比 |
 
 ## 6. 本轮新增的工具
 
