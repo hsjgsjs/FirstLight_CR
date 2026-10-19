@@ -37,7 +37,7 @@
 
 ## 4. 10-16 夜的实验与结果
 
-三组都从 recent u200 出发，设置与 `spar16-anchor-a` 相同（人类 BC 每次更新、系数 0.2，`running` 归一化），只改列出的一项：
+三组都从 General 460 出发（各运行日志里的 `starting from` 为准），设置与 `spar16-anchor-a` 相同（人类 BC 每次更新、系数 0.2，`running` 归一化），只改列出的一项：
 
 | 运行 | 改动 | 结果 |
 |---|---|---|
@@ -91,7 +91,7 @@ PY
 
 不用改代码的办法是加长分段：`--rollout-segment-seconds 160`，每次更新的决策数是现在的 4 倍，大部分对局在两段内结束，同相位问题也随之变轻。代价是每次更新的墙钟时间约为 4 倍。另一组只把学习率降到 1e-5，看下滑是否随步长平方减慢（噪声）还是线性减慢（偏差）。
 
-两组都与 snr-a 相同，起点都是 snr-a 的 u200。`spar16-seg160` 沿用 snr-a 的实例，`spar16-lr1e5` 沿用 hog-sanity 的实例：
+两组都与 snr-a 相同，起点都是 snr-a 的起点 General 460。`spar16-seg160` 沿用 snr-a 的实例，`spar16-lr1e5` 沿用 hog-sanity 的实例：
 
 ```bash
 git pull
