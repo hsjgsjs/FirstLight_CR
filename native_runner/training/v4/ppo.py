@@ -8,7 +8,14 @@ import torch
 from torch import Tensor
 
 from .learning import generalized_advantage_estimate
-from .tensors import ActionSequenceV4, GATE_ACT, RecurrentPolicyStateV4, UniversalSemanticBatchV4
+from .tensors import (
+    ActionSequenceV4,
+    GATE_ACT,
+    RecurrentPolicyStateV4,
+    UniversalSemanticBatchV4,
+    concatenate_padded_tensor_records,
+    concatenate_tensor_records,
+)
 
 
 def _time_batch(value: Tensor, shape: tuple[int, int], label: str) -> None:
@@ -133,6 +140,92 @@ class StoredRolloutV4:
             gamma=gamma,
             gae_lambda=gae_lambda,
         )
+
+
+def concatenate_rollout_lanes_v4(rollouts: tuple[StoredRolloutV4, ...]) -> tuple[StoredRolloutV4, int]:
+    """Join rollouts of one behavior policy into one batch of lanes for a single PPO update.
+
+    Each lane keeps its own initial recurrent state, so segments of the same game simply become separate
+    lanes, exactly as each segment would be on its own. Shorter rollouts are padded in time with invalid
+    steps (zero reward and value, a repeat of their last row), which the update and GAE already ignore.
+    The lanes are ordered as the first half of every rollout, then the second halves, and the returned
+    split index separates the two, so a two-halves gradient comparison sees the same mix of segments in
+    both halves rather than early segments against late ones.
+    """
+
+    if not rollouts:
+        raise ValueError("at least one rollout is required")
+    first = rollouts[0]
+    for rollout in rollouts:
+        rollout.validate()
+        if rollout.policy_state_id != first.policy_state_id or (
+            rollout.gate_temperature,
+            rollout.action_temperature,
+            rollout.continue_temperature,
+        ) != (first.gate_temperature, first.action_temperature, first.continue_temperature):
+            raise ValueError("accumulated rollouts must come from one behavior policy")
+    time_steps = max(rollout.time_steps for rollout in rollouts)
+    first_halves: list[tuple[StoredRolloutV4, int, int]] = []
+    second_halves: list[tuple[StoredRolloutV4, int, int]] = []
+    for rollout in rollouts:
+        half = rollout.batch_size // 2
+        if half:
+            first_halves.append((rollout, 0, half))
+        second_halves.append((rollout, half, rollout.batch_size - half))
+    parts = first_halves + second_halves
+    split = sum(length for _, _, length in first_halves)
+
+    def lane_tensor(name: str) -> Tensor:
+        pieces = []
+        for rollout, start, length in parts:
+            value = getattr(rollout, name)
+            if value is None:
+                value = torch.zeros_like(rollout.valid_mask)
+            value = value[:, start : start + length]
+            if value.shape[0] < time_steps:
+                value = torch.cat((value, value.new_zeros((time_steps - value.shape[0], length))))
+            pieces.append(value)
+        return torch.cat(pieces, dim=1)
+
+    def at_step(items: tuple, step: int):
+        return items[min(step, len(items) - 1)]
+
+    observations = tuple(
+        concatenate_padded_tensor_records(
+            tuple(at_step(rollout.observations, step).narrow_batch(start, length) for rollout, start, length in parts)
+        )
+        for step in range(time_steps)
+    )
+    actions = tuple(
+        concatenate_tensor_records(
+            tuple(at_step(rollout.actions, step).narrow_batch(start, length) for rollout, start, length in parts)
+        )
+        for step in range(time_steps)
+    )
+    joined = StoredRolloutV4(
+        observations=observations,  # type: ignore[arg-type]
+        actions=actions,  # type: ignore[arg-type]
+        episode_start=lane_tensor("episode_start"),
+        valid_mask=lane_tensor("valid_mask"),
+        behavior_log_prob=lane_tensor("behavior_log_prob"),
+        behavior_value=lane_tensor("behavior_value"),
+        next_value=lane_tensor("next_value"),
+        rewards=lane_tensor("rewards"),
+        terminated=lane_tensor("terminated"),
+        truncated=lane_tensor("truncated"),
+        initial_state=concatenate_tensor_records(
+            tuple(rollout.initial_state.narrow_batch(start, length) for rollout, start, length in parts)
+        ),  # type: ignore[arg-type]
+        gate_temperature=first.gate_temperature,
+        action_temperature=first.action_temperature,
+        continue_temperature=first.continue_temperature,
+        policy_state_id=first.policy_state_id,
+        forced_gate_mask=(
+            None if all(rollout.forced_gate_mask is None for rollout in rollouts) else lane_tensor("forced_gate_mask")
+        ),
+    )
+    joined.validate()
+    return joined, split
 
 
 @dataclass(frozen=True, slots=True)

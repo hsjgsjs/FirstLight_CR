@@ -269,6 +269,7 @@ def distributed_ppo_update_v4(
     validate: bool = False,
     advantage_scale: RunningAdvantageScaleV4 | None = None,
     gradient_noise: bool = False,
+    gradient_noise_split: int | None = None,
 ) -> list[dict[str, float]]:
     """Train synchronously across ranks with chunked recurrent backpropagation.
 
@@ -279,7 +280,8 @@ def distributed_ppo_update_v4(
     carried forward and detached only at chunk boundaries (ordinary TBPTT).
 
     With ``gradient_noise``, the policy-loss gradient is first measured, without a step, on two disjoint
-    halves of the lanes at the rollout's own parameters; see ``_gradient_noise_statistics``.
+    halves of the lanes at the rollout's own parameters; see ``_gradient_noise_statistics``. The halves are
+    lanes before and after ``gradient_noise_split`` (default: the middle lane).
     """
 
     rollout.validate()
@@ -323,7 +325,10 @@ def distributed_ppo_update_v4(
         if gradient_noise:
             # Contiguous halves keep the two seats of a self-play game (adjacent lanes) together.
             lanes = torch.arange(rollout.batch_size)
-            yield [("half", lanes[: rollout.batch_size // 2]), ("half", lanes[rollout.batch_size // 2 :])]
+            split = rollout.batch_size // 2 if gradient_noise_split is None else int(gradient_noise_split)
+            if not 0 <= split <= rollout.batch_size:
+                raise ValueError("gradient noise split lies outside the rollout lanes")
+            yield [("half", lanes[:split]), ("half", lanes[split:])]
         for epoch in range(epochs):
             generator = torch.Generator(device="cpu")
             generator.manual_seed(0x51F0_0000 + epoch * 4099 + rank)

@@ -119,10 +119,35 @@ done
 
 | 观察 | 含义 | 下一步 |
 |---|---|---|
-| seg160 的 `snr` 升到约 0.15–0.2，胜率按对局数算下滑明显变慢 | 噪声随数据量下降，方向对 | 加一个“攒几段再更新”的选项，继续加大每次更新的数据量 |
+| seg160 的 `snr` 升到约 0.15–0.2，胜率按对局数算下滑明显变慢 | 噪声随数据量下降，方向对 | 用 `--accumulate-batches` 继续加大每次更新的数据量（见下） |
 | seg160 的 `snr` 不升 | 噪声不随样本数下降，来源在别处（例如落点头） | 按头分别测信噪比 |
 | lr1e5 的下滑约为 snr-a 的 1/9 | 噪声主导 | 小步长长期跑可以不退化，但学得慢 |
 | lr1e5 的下滑约为 snr-a 的 1/3 | 有系统偏差 | 回到价值裁剪（`--value-clip-range 0`） |
+
+### 攒批：`--accumulate-batches N`
+
+加长分段最多只能让一次更新用上一整批（所有对局线各打完一局，默认 8 个引擎 × 8 条线 = 64 局）。要接近原仓库每次更新约 340 局，需要跨批攒数据。`--accumulate-batches N` 在策略不变的情况下连收 N 个完整批次，再用全部数据做一次更新：
+
+- 每段数据仍按原样计算优势（段尾用价值自举），只是拼成更多对局线一起更新；批次之间换对手、换卡组照常进行。
+- 每次更新都落在批次结束处，所以每次更新都存一个可严格续训的检查点。
+- 同时要把 `--lane-minibatch-size` 调大（例如 4096），每轮才是一步大步，而不是几步小步；GPU 显存只由 `--lane-microbatch-size` 决定，不受影响。
+- 代价是内存：一次更新的数据全部留在内存里，拼接时短暂占两份。先用 `N = 1`，跑起来后看 `free -g`，再加到 2–5。
+- 信噪比的两半各取每一段的一半对局线，所以两半混有同样的早段和晚段，`snr` 和之前可以直接比较。
+
+seg160 确认方向后，用它空出的实例开一组（起点仍是 General 460，与之前各组相同）：
+
+```bash
+git pull
+bash native_runner/training/v4/lab_ppo.sh unwatch spar16-seg160
+bash native_runner/training/v4/lab_ppo.sh stop spar16-seg160
+mkdir -p runs/spar16-acc1/logs
+cp runs/spar16-seg160/trainer-options.txt runs/spar16-seg160/launch-env runs/spar16-acc1/
+bash native_runner/training/v4/lab_ppo.sh options spar16-acc1 --accumulate-batches 1 --lane-minibatch-size 4096 --gradient-noise-every 1
+CR_LAB_WARM_START_OPTIMIZER=1 bash native_runner/training/v4/lab_ppo.sh resume spar16-acc1 200
+bash native_runner/training/v4/lab_ppo.sh watch spar16-acc1
+```
+
+每次更新要等一整批打完，更新次数会少很多，`trend` 用小一点的块（例如 `trend spar16-acc1 4`）。
 
 ## 6. 本轮新增的工具
 
@@ -133,4 +158,5 @@ done
 | `policy_drift.py` | 在人类录像状态上，按头逐项测量策略相对基准检查点的漂移 |
 | `--gradient-noise-every N` | 测梯度信噪比；只测量，不改变训练结果 |
 | `--value-clip-range X` | 调整价值裁剪；`0` 关闭 |
+| `--accumulate-batches N` | 连收 N 个完整批次再更新一次，加大每次更新的数据量 |
 | `--no-score-model-delay-offset` | 不把延迟头计入 PPO 比率（备用） |
