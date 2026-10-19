@@ -47,7 +47,7 @@ from .matchmaking import (
     MatchmakerConfigV4,
 )
 from .model import UniversalCardPolicyV4
-from .ppo import PPOConfigV4, StoredRolloutV4
+from .ppo import PPOConfigV4, StoredRolloutV4, concatenate_rollout_lanes_v4
 from .ppo_runtime import ppo_environment_config_v4, ppo_ruleset_id_v4, validate_reward_parameters_v4
 from .tensors import GATE_ACT, GATE_WAIT
 
@@ -94,6 +94,21 @@ def _set_temperatures(
     model.set_ppo_gate_temperature(gate_temperature)
     model.set_ppo_action_temperature(DEFAULT_ACTION_TEMPERATURE)
     model.set_ppo_continue_temperature(continue_temperature)
+
+
+def _sampler_batch_rows(reports: Sequence[Mapping[str, object]]) -> tuple[tuple[str, str, float], ...]:
+    """(matchup, opponent deck, learner result) of each finished game, as the hard-opponent sampler records them."""
+    rows = []
+    for report in reports:
+        learner_owner = int(report["current_owners"][0])  # type: ignore[index]
+        rows.append(
+            (
+                str(report["policy_matchup"]),
+                str(report["deck1_id"] if learner_owner == 0 else report["deck0_id"]),
+                float(report["result"][learner_owner]),  # type: ignore[index]
+            )
+        )
+    return tuple(rows)
 
 
 def _rollout_behavior_counts(rollout: StoredRolloutV4, model: UniversalCardPolicyV4) -> torch.Tensor:
@@ -1018,6 +1033,17 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--updates", type=int, default=2)
     parser.add_argument("--rollout-segment-seconds", type=int, default=40)
+    parser.add_argument(
+        "--accumulate-batches",
+        type=int,
+        default=0,
+        help=(
+            "collect N whole batches (every segment, until every resident game has ended) with the policy held "
+            "fixed, then make one update from all of it, so every update is a strict checkpoint boundary; "
+            "0 (default) updates after every segment. Raise --lane-minibatch-size with it, or each epoch "
+            "takes several smaller steps instead of one large one"
+        ),
+    )
     parser.add_argument("--snapshot-every", type=int, default=8)
     parser.add_argument(
         "--freeze-recent-actions",
@@ -1166,6 +1192,8 @@ def main() -> int:
         raise ValueError("the model's delay offset reaches the game unless --execution-delay-ticks replaces it")
     if args.gradient_noise_every < 0:
         raise ValueError("--gradient-noise-every must be 0 (off) or positive")
+    if args.accumulate_batches < 0:
+        raise ValueError("--accumulate-batches must be 0 (off) or positive")
     if not 0 <= args.fixed_opponent_opening_natural_percent <= 100:
         raise ValueError("fixed-opponent opening natural percent must be in [0, 100]")
     if (
@@ -1866,6 +1894,30 @@ def main() -> int:
             collect_actor_wave, segment_assignments, segment_history_models, segment_policy_state_id, publish_segment
         )
 
+    def close_segment_session() -> None:
+        """After a None resume, wait for the collector to stop and forget its session."""
+        nonlocal segment_assignments, segment_history_models
+        nonlocal segment_collections, segment_resumes
+        nonlocal segment_executor, segment_future
+        if segment_future is not None:
+            segment_future.result()
+        if segment_executor is not None:
+            segment_executor.shutdown(wait=True)
+        segment_future = None
+        segment_executor = None
+        segment_collections = None
+        segment_resumes = None
+        segment_assignments = None
+        segment_history_models = None
+
+    def resume_segment_collector(policy_state_id: str | None) -> None:
+        """Let the resident matches continue under policy_state_id, or stop them with None."""
+        if segment_resumes is None:
+            raise RuntimeError("segmented collector session is unavailable")
+        if segment_actor_stream is not None:
+            torch.cuda.current_stream(device).synchronize()
+        segment_resumes.put(policy_state_id)
+
     def next_segment_collection() -> ClusterCollectionV4:
         if segment_collections is None or segment_future is None:
             raise RuntimeError("segmented collector session is unavailable")
@@ -1889,108 +1941,164 @@ def main() -> int:
         for update_step in range(initial_update_step + 1, args.updates + 1):
             dist.barrier()
             cycle_started = time.perf_counter()
-            if segment_assignments is None or segment_history_models is None:
-                raise RuntimeError("segmented collector metadata is incomplete")
-            collected = next_segment_collection()
-            history_models = segment_history_models
-            collected_policy_state_id = collected.rollout.policy_state_id
-            _release_rollout_cuda_graphs((actor_model, anchor_model, *history_models.values()), device=actor_device)
-            gathered = _gather_objects(
-                {"reports": collected.reports, "timing": collected.timing}, rank=rank, world_size=world_size
-            )
-            if rank == 0:
-                assert gathered is not None and league is not None
-                reports = tuple(
-                    report
-                    for shard in gathered
-                    for report in shard["reports"]  # type: ignore[index]
+            # One update consumes one segment, or with --accumulate-batches every segment of N whole batches,
+            # collected with the policy held fixed.
+            pieces: list[StoredRolloutV4] = []
+            gathered_pieces: list[list[Mapping[str, object]]] = []
+            update_reports: list[Mapping[str, object]] = []
+            session_reports: list[Mapping[str, object]] = []
+            collection_counts: dict[str, float] = {
+                "collection_episode_start_count": 0,
+                "collection_truncated_count": 0,
+                "collection_boundary_bootstrap_count": 0,
+                "collection_initial_hidden_abs_max": 0.0,
+            }
+            sessions_done = 0
+            while True:
+                if segment_assignments is None or segment_history_models is None:
+                    raise RuntimeError("segmented collector metadata is incomplete")
+                collected = next_segment_collection()
+                history_models = segment_history_models
+                collected_policy_state_id = collected.rollout.policy_state_id
+                _release_rollout_cuda_graphs((actor_model, anchor_model, *history_models.values()), device=actor_device)
+                gathered = _gather_objects(
+                    {"reports": collected.reports, "timing": collected.timing}, rank=rank, world_size=world_size
                 )
-                rejected = sum(sum(int(value) for value in report["rejected_actions"]) for report in reports)
-                truncated = sum(bool(report["truncated"]) for report in reports)
-                collection_ok = (
-                    all(
-                        float(shard["timing"]["owner_frames"]) > 0  # type: ignore[index]
+                if rank == 0:
+                    assert gathered is not None and league is not None
+                    reports = tuple(
+                        report
+                        for shard in gathered
+                        for report in shard["reports"]  # type: ignore[index]
+                    )
+                    rejected = sum(sum(int(value) for value in report["rejected_actions"]) for report in reports)
+                    truncated = sum(bool(report["truncated"]) for report in reports)
+                    collection_ok = (
+                        all(
+                            float(shard["timing"]["owner_frames"]) > 0  # type: ignore[index]
+                            for shard in gathered
+                        )
+                        and truncated == 0
+                        # A delayed play can meet a board that changed meanwhile; count those, don't abort.
+                        and (rejected == 0 or args.execution_delay_ticks is not None)
+                    )
+                    failure = (
+                        None
+                        if collection_ok
+                        else {
+                            "matches": len(reports),
+                            "rejected_actions": rejected,
+                            "truncated": truncated,
+                            "rejection_details": tuple(
+                                {
+                                    "sequence": report["sequence"],
+                                    "engine_index": report["engine_index"],
+                                    "env_id": report["env_id"],
+                                    "details": report["rejection_details"],
+                                }
+                                for report in reports
+                                if report["rejection_details"]
+                            ),
+                        }
+                    )
+                    if collection_ok:
+                        for report in reports:
+                            checkpoint_id = report["opponent_checkpoint_id"]
+                            if checkpoint_id is not None:
+                                learner_owner = int(report["current_owners"][0])
+                                league.record_result(str(checkpoint_id), float(report["result"][learner_owner]))
+                    segment_session_can_resume = all(
+                        float(shard["timing"].get("live_engines", 1)) > 0  # type: ignore[index]
                         for shard in gathered
                     )
-                    and truncated == 0
-                    # A delayed play can meet a board that changed meanwhile; count those, don't abort.
-                    and (rejected == 0 or args.execution_delay_ticks is not None)
-                )
-                failure = (
-                    None
-                    if collection_ok
-                    else {
-                        "matches": len(reports),
-                        "rejected_actions": rejected,
-                        "truncated": truncated,
-                        "rejection_details": tuple(
-                            {
-                                "sequence": report["sequence"],
-                                "engine_index": report["engine_index"],
-                                "env_id": report["env_id"],
-                                "details": report["rejection_details"],
-                            }
-                            for report in reports
-                            if report["rejection_details"]
-                        ),
-                    }
-                )
-                if collection_ok:
-                    for report in reports:
-                        checkpoint_id = report["opponent_checkpoint_id"]
-                        if checkpoint_id is not None:
-                            learner_owner = int(report["current_owners"][0])
-                            league.record_result(str(checkpoint_id), float(report["result"][learner_owner]))
-                segment_session_can_resume = all(
-                    float(shard["timing"].get("live_engines", 1)) > 0  # type: ignore[index]
-                    for shard in gathered
-                )
+                else:
+                    reports = ()
+                    collection_ok = False
+                    failure = None
+                    segment_session_can_resume = False
+                collection_status = _broadcast_object((collection_ok, failure, segment_session_can_resume))
+                if collection_status[0] is not True:
+                    raise RuntimeError(f"cluster collection failed audit: {collection_status[1]}")
+                segment_session_can_resume = bool(collection_status[2])
+                if rank == 0:
+                    assert gathered is not None
+                    collection_seconds_for_event = max(float(shard["timing"]["total_seconds"]) for shard in gathered)
+                    collection_owner_frames_for_event = sum(int(shard["timing"]["owner_frames"]) for shard in gathered)
+                    collection_episode_start_count = sum(
+                        int(shard["timing"].get("episode_start_count", 0)) for shard in gathered
+                    )
+                    collection_truncated_count = sum(
+                        int(shard["timing"].get("truncated_count", 0)) for shard in gathered
+                    )
+                    collection_boundary_bootstrap_count = sum(
+                        int(shard["timing"].get("boundary_bootstrap_count", 0)) for shard in gathered
+                    )
+                    collection_initial_hidden_abs_max = max(
+                        float(shard["timing"].get("initial_hidden_abs_max", 0.0)) for shard in gathered
+                    )
+                    print(
+                        {
+                            "event": "ppo_collection_complete",
+                            "update": update_step,
+                            "completed_games": len(reports),
+                            "collection_seconds": collection_seconds_for_event,
+                            "collection_owner_frames": collection_owner_frames_for_event,
+                            "collection_owner_frames_per_second": (
+                                collection_owner_frames_for_event / collection_seconds_for_event
+                            ),
+                            "collection_episode_start_count": (collection_episode_start_count),
+                            "collection_truncated_count": collection_truncated_count,
+                            "collection_boundary_bootstrap_count": (collection_boundary_bootstrap_count),
+                            "collection_initial_hidden_abs_max": (collection_initial_hidden_abs_max),
+                            "native_rejected_actions": rejected,
+                        },
+                        flush=True,
+                    )
+                if rank == 0:
+                    assert gathered is not None
+                    gathered_pieces.append(gathered)
+                    update_reports.extend(reports)
+                    session_reports.extend(reports)
+                    for key, value in (
+                        ("collection_episode_start_count", collection_episode_start_count),
+                        ("collection_truncated_count", collection_truncated_count),
+                        ("collection_boundary_bootstrap_count", collection_boundary_bootstrap_count),
+                    ):
+                        collection_counts[key] += value
+                    collection_counts["collection_initial_hidden_abs_max"] = max(
+                        collection_counts["collection_initial_hidden_abs_max"], collection_initial_hidden_abs_max
+                    )
+                pieces.append(collected.rollout)
+                del collected
+                if not args.accumulate_batches:
+                    break
+                if segment_session_can_resume:
+                    resume_segment_collector(actor_state_id)
+                    continue
+                sessions_done += 1
+                if sessions_done >= args.accumulate_batches:
+                    break
+                # A batch ended before the update: close it as a batch end would, then keep collecting.
+                if rank == 0 and learner_opponent_sampler is not None:
+                    learner_opponent_sampler.record_completed_batch(_sampler_batch_rows(session_reports))
+                session_reports.clear()
+                resume_segment_collector(None)
+                close_segment_session()
+                batch_index += 1
+                start_segment_session(actor_state_id)
+            reports = tuple(update_reports)
+            accumulated_segments = len(pieces)
+            if accumulated_segments == 1:
+                learner_rollout = pieces[0]
+                gradient_noise_split = None
             else:
-                reports = ()
-                collection_ok = False
-                failure = None
-                segment_session_can_resume = False
-            collection_status = _broadcast_object((collection_ok, failure, segment_session_can_resume))
-            if collection_status[0] is not True:
-                raise RuntimeError(f"cluster collection failed audit: {collection_status[1]}")
-            segment_session_can_resume = bool(collection_status[2])
-            if rank == 0:
-                assert gathered is not None
-                collection_seconds_for_event = max(float(shard["timing"]["total_seconds"]) for shard in gathered)
-                collection_owner_frames_for_event = sum(int(shard["timing"]["owner_frames"]) for shard in gathered)
-                collection_episode_start_count = sum(
-                    int(shard["timing"].get("episode_start_count", 0)) for shard in gathered
-                )
-                collection_truncated_count = sum(int(shard["timing"].get("truncated_count", 0)) for shard in gathered)
-                collection_boundary_bootstrap_count = sum(
-                    int(shard["timing"].get("boundary_bootstrap_count", 0)) for shard in gathered
-                )
-                collection_initial_hidden_abs_max = max(
-                    float(shard["timing"].get("initial_hidden_abs_max", 0.0)) for shard in gathered
-                )
-                print(
-                    {
-                        "event": "ppo_collection_complete",
-                        "update": update_step,
-                        "completed_games": len(reports),
-                        "collection_seconds": collection_seconds_for_event,
-                        "collection_owner_frames": collection_owner_frames_for_event,
-                        "collection_owner_frames_per_second": (
-                            collection_owner_frames_for_event / collection_seconds_for_event
-                        ),
-                        "collection_episode_start_count": (collection_episode_start_count),
-                        "collection_truncated_count": collection_truncated_count,
-                        "collection_boundary_bootstrap_count": (collection_boundary_bootstrap_count),
-                        "collection_initial_hidden_abs_max": (collection_initial_hidden_abs_max),
-                        "native_rejected_actions": rejected,
-                    },
-                    flush=True,
-                )
+                learner_rollout, gradient_noise_split = concatenate_rollout_lanes_v4(tuple(pieces))
+            pieces.clear()
+            gc.collect()
 
             learner_input_state_id = behavior_state_id
             current_model.eval()
             torch.cuda.reset_peak_memory_stats(device)
-            learner_rollout = collected.rollout
             rollout_gate_temperature = float(learner_rollout.gate_temperature)
             source_owner_frames_local = int(learner_rollout.valid_mask.sum())
             behavior_counts = _rollout_behavior_counts(learner_rollout, current_model).to(device)
@@ -1999,10 +2107,6 @@ def main() -> int:
                 behavior_counts.cpu(), delay_offset_ms=current_model.config.delay_offset_ms
             )
             update_started = time.perf_counter()
-            # Reports and timing were gathered above; the learner consumes every
-            # valid lane and can release the collection wrapper before optimization.
-            del collected
-            gc.collect()
             update_metrics = distributed_ppo_update_v4(
                 current_model,
                 optimizer,
@@ -2016,6 +2120,7 @@ def main() -> int:
                 validate=args.validate,
                 advantage_scale=advantage_scale,
                 gradient_noise=bool(args.gradient_noise_every) and update_step % args.gradient_noise_every == 0,
+                gradient_noise_split=gradient_noise_split,
             )
             bc_metrics = {}
             if expert_bc_sampler is not None and update_step % args.expert_bc_every_updates == 0:
@@ -2057,18 +2162,8 @@ def main() -> int:
             if rank == 0:
                 assert matchmaker is not None and league is not None and league_rng is not None
                 if learner_opponent_sampler is not None and not segment_session_can_resume:
-                    completed_batch_reports = (*batch_reports, *reports)
                     learner_opponent_sampler.record_completed_batch(
-                        tuple(
-                            (
-                                str(report["policy_matchup"]),
-                                str(
-                                    report["deck1_id"] if int(report["current_owners"][0]) == 0 else report["deck0_id"]
-                                ),
-                                float(report["result"][int(report["current_owners"][0])]),
-                            )
-                            for report in completed_batch_reports
-                        )
+                        _sampler_batch_rows((*batch_reports, *session_reports))
                     )
                 behavior_state_id = uuid.uuid4().hex
                 if update_step % args.snapshot_every == 0:
@@ -2129,14 +2224,16 @@ def main() -> int:
                 total_matches = len(reports)
                 batch_reports.extend(reports)
                 effective_end_to_end_seconds = float(cycle_seconds)
-                collection_seconds = max(
-                    float(shard["timing"]["total_seconds"])  # type: ignore[index]
-                    for shard in gathered  # type: ignore[union-attr]
+                # Per segment, the slowest rank sets the time; accumulated segments add up (sizes and means
+                # take their largest segment value).
+                collection_seconds = sum(
+                    max(float(shard["timing"]["total_seconds"]) for shard in piece)  # type: ignore[index]
+                    for piece in gathered_pieces
                 )
                 collection_phase_seconds = {
-                    f"collection_{name}": max(
-                        float(shard["timing"][name])  # type: ignore[index]
-                        for shard in gathered  # type: ignore[union-attr]
+                    f"collection_{name}": (sum if name.endswith("_seconds") or name == "inference_batches" else max)(
+                        max(float(shard["timing"][name]) for shard in piece)  # type: ignore[index]
+                        for piece in gathered_pieces
                     )
                     for name in (
                         "reset_seconds",
@@ -2163,7 +2260,8 @@ def main() -> int:
                     )
                     if all(
                         name in shard["timing"]  # type: ignore[operator]
-                        for shard in gathered  # type: ignore[union-attr]
+                        for piece in gathered_pieces
+                        for shard in piece
                     )
                 }
                 batch_completed_games += total_matches
@@ -2194,10 +2292,8 @@ def main() -> int:
                     "learner_lanes": int(learner_lanes),
                     "collection_seconds": collection_seconds,
                     "collection_owner_frames_per_second": (float(owner_frames) / max(collection_seconds, 1e-9)),
-                    "collection_episode_start_count": (collection_episode_start_count),
-                    "collection_truncated_count": collection_truncated_count,
-                    "collection_boundary_bootstrap_count": (collection_boundary_bootstrap_count),
-                    "collection_initial_hidden_abs_max": (collection_initial_hidden_abs_max),
+                    **collection_counts,
+                    "accumulated_segments": accumulated_segments,
                     **collection_phase_seconds,
                     "native_rejected_actions": sum(
                         sum(int(value) for value in report["rejected_actions"]) for report in reports
@@ -2240,22 +2336,12 @@ def main() -> int:
             del update_metrics
             gc.collect()
             if segment_resumes is not None:
-                if segment_actor_stream is not None:
-                    torch.cuda.current_stream(device).synchronize()
                 resume_state_id = (
                     behavior_state_id if update_step < args.updates and segment_session_can_resume else None
                 )
-                segment_resumes.put(resume_state_id)
+                resume_segment_collector(resume_state_id)
                 if resume_state_id is None and segment_future is not None:
-                    segment_future.result()
-                    if segment_executor is not None:
-                        segment_executor.shutdown(wait=True)
-                    segment_future = None
-                    segment_executor = None
-                    segment_collections = None
-                    segment_resumes = None
-                    segment_assignments = None
-                    segment_history_models = None
+                    close_segment_session()
                     if update_step < args.updates:
                         batch_index += 1
                         batch_completed_games = 0
