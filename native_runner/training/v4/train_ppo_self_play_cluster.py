@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor
+import copy
 from dataclasses import replace
 import gc
 import json
@@ -12,6 +13,7 @@ import os
 from pathlib import Path
 import random
 import socket
+import threading
 import time
 import uuid
 from typing import Any, Mapping, Sequence
@@ -455,7 +457,9 @@ def _rank_rng_state(device: torch.device) -> dict[str, object]:
     return {"python": random.getstate(), "torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state(device)}
 
 
-def _set_rank_rng_state(state: Mapping[str, object], *, device: torch.device) -> None:
+def _set_rank_rng_state(state: Mapping[str, object], *, device: torch.device, cuda: bool = True) -> None:
+    """Restore a rank's random state; cuda=False leaves the GPU generator to a collector sampling with it."""
+
     python_state = state.get("python")
     torch_state = state.get("torch")
     cuda_state = state.get("cuda")
@@ -463,7 +467,8 @@ def _set_rank_rng_state(state: Mapping[str, object], *, device: torch.device) ->
         raise ValueError("PPO rank RNG state is invalid")
     random.setstate(python_state)  # type: ignore[arg-type]
     torch.set_rng_state(torch_state.cpu())
-    torch.cuda.set_rng_state(cuda_state.cpu(), device)
+    if cuda:
+        torch.cuda.set_rng_state(cuda_state.cpu(), device)
 
 
 def _restore_rank_rng_state(payload: Mapping[str, object], *, rank: int, world_size: int, device: torch.device) -> None:
@@ -574,6 +579,32 @@ def _release_rollout_cuda_graphs(models: Sequence[UniversalCardPolicyV4], *, dev
         model.__dict__.pop("_ppo_rollout_cuda_graph_pool_v4", None)
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def _sync_actor_model(actor: UniversalCardPolicyV4, source: UniversalCardPolicyV4) -> None:
+    """Copy the learner's weights and sampling settings into the collector's own model, in place.
+
+    In place, so rollout CUDA graphs captured on the actor stay valid; call it only while no collection runs.
+    """
+
+    with torch.no_grad():
+        for (name, target), (source_name, value) in zip(
+            actor.named_parameters(), source.named_parameters(), strict=True
+        ):
+            if name != source_name:
+                raise RuntimeError("actor and learner models differ in structure")
+            target.copy_(value)
+        for (name, target), (source_name, value) in zip(actor.named_buffers(), source.named_buffers(), strict=True):
+            if name != source_name:
+                raise RuntimeError("actor and learner models differ in structure")
+            target.copy_(value)
+    actor.set_ppo_gate_temperature(source.ppo_gate_temperature)
+    actor.set_ppo_action_temperature(source.ppo_action_temperature)
+    actor.set_ppo_continue_temperature(source.ppo_continue_temperature)
+    actor.set_ppo_rollout_sampling(source._ppo_rollout_sampling)
+    actor.set_ppo_score_delay_offset(source._ppo_score_delay_offset)
+    actor.set_ppo_location_head_fp32(source._ppo_location_head_fp32)
+    actor._inference_delay_offset_max_ms = source._inference_delay_offset_max_ms
 
 
 def _parse_cpu_list(value: str) -> tuple[int, ...]:
@@ -1044,6 +1075,16 @@ def main() -> int:
             "takes several smaller steps instead of one large one"
         ),
     )
+    parser.add_argument(
+        "--overlap-collection",
+        action="store_true",
+        help=(
+            "with --accumulate-batches, single rank only: start the next update's first batch while this update "
+            "optimizes, played by a copy of the policy that collected this update's data, so the engines do not "
+            "wait for the GPU. Each update then learns from data one update old; the PPO ratio is taken against "
+            "the policy that played"
+        ),
+    )
     parser.add_argument("--snapshot-every", type=int, default=8)
     parser.add_argument(
         "--freeze-recent-actions",
@@ -1194,6 +1235,8 @@ def main() -> int:
         raise ValueError("--gradient-noise-every must be 0 (off) or positive")
     if args.accumulate_batches < 0:
         raise ValueError("--accumulate-batches must be 0 (off) or positive")
+    if args.overlap_collection and not args.accumulate_batches:
+        raise ValueError("--overlap-collection requires --accumulate-batches")
     if not 0 <= args.fixed_opponent_opening_natural_percent <= 100:
         raise ValueError("fixed-opponent opening natural percent must be in [0, 100]")
     if (
@@ -1352,6 +1395,8 @@ def main() -> int:
     dist.all_reduce(device_probe)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+    if args.overlap_collection and world_size != 1:
+        raise ValueError("--overlap-collection runs on a single rank")
     actor_device = device
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
@@ -1470,6 +1515,11 @@ def main() -> int:
     source_checkpoint_id = str(current_payload["checkpoint_id"])
     behavior_state_id = source_checkpoint_id
     actor_model = current_model
+    if args.overlap_collection:
+        # The collector keeps playing while the learner steps, so it plays with weights of its own.
+        actor_model = build_production_model_v4(device=actor_device)
+        actor_model.requires_grad_(False)
+        _sync_actor_model(actor_model, current_model)
     segment_actor_stream = torch.cuda.Stream(device=actor_device)
     actor_state_id = behavior_state_id
     anchor_model, anchor_payload = _load_frozen_model(
@@ -1614,6 +1664,8 @@ def main() -> int:
         resume_contract["expert_bc"] = expert_bc_contract
     if args.freeze_recent_actions:
         resume_contract["freeze_recent_actions"] = True
+    if args.overlap_collection:
+        resume_contract["overlap_collection"] = True
     advantage_scale = None
     if args.advantage_normalization == "running":
         resume_contract["advantage_normalization"] = ["running", args.advantage_normalization_decay]
@@ -1866,6 +1918,8 @@ def main() -> int:
     segment_resumes: Queue[str | None] | None = None
     segment_assignments: tuple[ClusterMatchAssignmentV4, ...] | None = None
     segment_history_models: dict[str, UniversalCardPolicyV4] | None = None
+    segment_policy_state_id: str | None = None
+    segment_stop: threading.Event | None = None
     segment_session_can_resume = True
     resume_rng_pending = args.resume_checkpoint is not None
 
@@ -1873,6 +1927,7 @@ def main() -> int:
         nonlocal segment_assignments, segment_history_models
         nonlocal segment_collections, segment_resumes
         nonlocal segment_executor, segment_future
+        nonlocal segment_policy_state_id, segment_stop
         nonlocal resume_rng_pending
         if segment_executor is not None or segment_future is not None:
             raise RuntimeError("segmented collector session is already running")
@@ -1880,13 +1935,20 @@ def main() -> int:
         if resume_rng_pending:
             _restore_rank_rng_state(current_payload, rank=rank, world_size=world_size, device=device)
             resume_rng_pending = False
-        collection_queue: Queue[ClusterCollectionV4] = Queue(maxsize=1)
+        session_policy_state_id = segment_policy_state_id
+        stop = threading.Event()
+        segment_stop = stop
+        # Overlapped sessions run on while the learner optimizes, so their segments queue up unread.
+        collection_queue: Queue[ClusterCollectionV4] = Queue(maxsize=0 if args.overlap_collection else 1)
         resume_queue: Queue[str | None] = Queue(maxsize=1)
         segment_collections = collection_queue
         segment_resumes = resume_queue
 
         def publish_segment(collection: ClusterCollectionV4) -> str | None:
             collection_queue.put(collection)
+            if args.overlap_collection:
+                # A whole batch is one fixed policy: continue at once, unless the run is ending.
+                return None if stop.is_set() else session_policy_state_id
             return resume_queue.get()
 
         segment_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"ppo-rank-{rank}-segment-session")
@@ -1895,10 +1957,12 @@ def main() -> int:
         )
 
     def close_segment_session() -> None:
-        """After a None resume, wait for the collector to stop and forget its session."""
+        """After a None resume (or, overlapped, the batch's last segment), wait for the collector to stop and
+        forget its session."""
         nonlocal segment_assignments, segment_history_models
         nonlocal segment_collections, segment_resumes
         nonlocal segment_executor, segment_future
+        nonlocal segment_policy_state_id, segment_stop
         if segment_future is not None:
             segment_future.result()
         if segment_executor is not None:
@@ -1909,6 +1973,8 @@ def main() -> int:
         segment_resumes = None
         segment_assignments = None
         segment_history_models = None
+        segment_policy_state_id = None
+        segment_stop = None
 
     def resume_segment_collector(policy_state_id: str | None) -> None:
         """Let the resident matches continue under policy_state_id, or stop them with None."""
@@ -1935,6 +2001,8 @@ def main() -> int:
     batch_end_to_end_seconds = 0.0
     batch_reports: list[Mapping[str, object]] = []
     batch_segments: list[Mapping[str, object]] = []
+    # Overlapped: what the strict checkpoint restores to replay the batch that was started before the update.
+    overlap_resume_state: dict[str, object] | None = None
     run_failed = True
     try:
         start_segment_session(actor_state_id)
@@ -1960,7 +2028,11 @@ def main() -> int:
                 collected = next_segment_collection()
                 history_models = segment_history_models
                 collected_policy_state_id = collected.rollout.policy_state_id
-                _release_rollout_cuda_graphs((actor_model, anchor_model, *history_models.values()), device=actor_device)
+                if not args.overlap_collection:
+                    # Overlapped, the collector may still be playing; its graphs go when its session closes.
+                    _release_rollout_cuda_graphs(
+                        (actor_model, anchor_model, *history_models.values()), device=actor_device
+                    )
                 gathered = _gather_objects(
                     {"reports": collected.reports, "timing": collected.timing}, rank=rank, world_size=world_size
                 )
@@ -2073,9 +2145,46 @@ def main() -> int:
                 if not args.accumulate_batches:
                     break
                 if segment_session_can_resume:
-                    resume_segment_collector(actor_state_id)
+                    if not args.overlap_collection:
+                        resume_segment_collector(actor_state_id)
                     continue
                 sessions_done += 1
+                if args.overlap_collection:
+                    # The free-running collector has stopped by itself at its batch's end.
+                    if rank == 0 and learner_opponent_sampler is not None:
+                        learner_opponent_sampler.record_completed_batch(_sampler_batch_rows(session_reports))
+                    session_reports.clear()
+                    close_segment_session()
+                    _release_rollout_cuda_graphs(
+                        (actor_model, anchor_model, *history_models.values()), device=actor_device
+                    )
+                    if sessions_done < args.accumulate_batches:
+                        batch_index += 1
+                        start_segment_session(collected_policy_state_id)
+                        continue
+                    update_batch_index = batch_index
+                    if update_step < args.updates:
+                        # Hand the engines the next update's first batch before optimizing. The checkpoint
+                        # after this update restores the state from here, so a resume replays that batch.
+                        overlap_rank_rng_states: list[object | None] = [None for _ in range(world_size)]
+                        dist.all_gather_object(overlap_rank_rng_states, _rank_rng_state(device))
+                        if rank == 0:
+                            assert matchmaker is not None and league_rng is not None
+                            overlap_resume_state = {
+                                "rank_rng_states": overlap_rank_rng_states,
+                                "matchmaker_state": copy.deepcopy(matchmaker.state_dict()),
+                                "learner_opponent_sampler_state": (
+                                    None
+                                    if learner_opponent_sampler is None
+                                    else copy.deepcopy(learner_opponent_sampler.state_dict())
+                                ),
+                                "league_rng_state": league_rng.getstate(),
+                            }
+                        _sync_actor_model(actor_model, current_model)
+                        torch.cuda.current_stream(device).synchronize()
+                        batch_index += 1
+                        start_segment_session(behavior_state_id)
+                    break
                 if sessions_done >= args.accumulate_batches:
                     break
                 # A batch ended before the update: close it as a batch end would, then keep collecting.
@@ -2086,6 +2195,8 @@ def main() -> int:
                 close_segment_session()
                 batch_index += 1
                 start_segment_session(actor_state_id)
+            if not args.overlap_collection:
+                update_batch_index = batch_index
             reports = tuple(update_reports)
             accumulated_segments = len(pieces)
             if accumulated_segments == 1:
@@ -2100,6 +2211,9 @@ def main() -> int:
             current_model.eval()
             torch.cuda.reset_peak_memory_stats(device)
             rollout_gate_temperature = float(learner_rollout.gate_temperature)
+            if args.overlap_collection:
+                # The data are one update old, sampled at that update's gate temperature; score them alike.
+                current_model.set_ppo_gate_temperature(rollout_gate_temperature)
             source_owner_frames_local = int(learner_rollout.valid_mask.sum())
             behavior_counts = _rollout_behavior_counts(learner_rollout, current_model).to(device)
             dist.all_reduce(behavior_counts, op=dist.ReduceOp.SUM)
@@ -2161,7 +2275,11 @@ def main() -> int:
 
             if rank == 0:
                 assert matchmaker is not None and league is not None and league_rng is not None
-                if learner_opponent_sampler is not None and not segment_session_can_resume:
+                if (
+                    learner_opponent_sampler is not None
+                    and not segment_session_can_resume
+                    and not args.overlap_collection
+                ):
                     learner_opponent_sampler.record_completed_batch(
                         _sampler_batch_rows((*batch_reports, *session_reports))
                     )
@@ -2200,7 +2318,9 @@ def main() -> int:
                             ),
                             "league_state": league.to_dict(),
                             "league_rng_state": league_rng.getstate(),
-                            "next_batch_index": batch_index + 1,
+                            "next_batch_index": update_batch_index + 1,
+                            # Overlapped: the state before the in-flight batch was drawn, so a resume replays it.
+                            **(overlap_resume_state or {}),
                             "advantage_scale_state": (
                                 None if advantage_scale is None else advantage_scale.state_dict()
                             ),
@@ -2280,7 +2400,7 @@ def main() -> int:
                     "rollout_gate_temperature": rollout_gate_temperature,
                     "next_gate_temperature": next_gate_temperature,
                     "completed_games_this_segment": total_matches,
-                    "batch_index": batch_index,
+                    "batch_index": update_batch_index,
                     "batch_completed_games": batch_completed_games,
                     "batch_progress_fraction": (batch_completed_games / (engine_count * lanes)),
                     "batch_complete": not segment_session_can_resume,
@@ -2329,13 +2449,22 @@ def main() -> int:
                         wandb_metrics.update(_batch_wandb_metrics(batch_segments, batch_reports))
                     wandb_run.log(wandb_metrics, step=update_step)
                 finally:
-                    _set_rank_rng_state(logging_rng_state, device=device)
+                    # Overlapped, the collector is sampling on the GPU now; rewinding it would replay its draws.
+                    _set_rank_rng_state(logging_rng_state, device=device, cuda=not args.overlap_collection)
                 print(json.dumps(metric, sort_keys=True), flush=True)
             # Release the consumed rollout before resuming the resident matches.
             del learner_rollout
             del update_metrics
             gc.collect()
-            if segment_resumes is not None:
+            overlap_resume_state = None
+            if args.overlap_collection:
+                # The next update's first batch is already being played; only the batch counters restart.
+                batch_completed_games = 0
+                batch_collection_seconds = 0.0
+                batch_end_to_end_seconds = 0.0
+                batch_reports.clear()
+                batch_segments.clear()
+            elif segment_resumes is not None:
                 resume_state_id = (
                     behavior_state_id if update_step < args.updates and segment_session_can_resume else None
                 )
@@ -2352,6 +2481,8 @@ def main() -> int:
                         start_segment_session(behavior_state_id)
         run_failed = False
     finally:
+        if segment_stop is not None:
+            segment_stop.set()
         if segment_resumes is not None and segment_future is not None and not (segment_future.done()):
             try:
                 segment_resumes.put_nowait(None)

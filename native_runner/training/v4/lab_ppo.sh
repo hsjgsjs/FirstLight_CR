@@ -767,6 +767,8 @@ print(f"    GPU inference       {share(model)}   ({mean('collection_inference_ba
 print(f"    trainer batching    {share(assembly)}   (CPU, trainer cores)")
 print(f"    waiting for engines {share(waiting)}   (CPU, engine and worker cores)")
 print(f"  optimization (GPU)    {share(optimize)}")
+if collect + optimize > 1.05 * total:
+    print("  (--overlap-collection: collection runs during optimization, so the shares add up to more than 100%)")
 print(f"  per engine: native step {mean('collection_native_step_seconds'):.1f}s, observation parsing {mean('collection_tensorize_seconds'):.1f}s")
 PY
     fi
