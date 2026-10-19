@@ -540,6 +540,11 @@ case ${1:-} in
       log "ensure $name: stopped on purpose at $(<"$stop_marker"); not restarting"
     else
       log "ensure $name: not running and not stopped on purpose; resuming"
+      # Values this process read from .env are not explicit; drop them so the resume reads launch-env
+      # (otherwise a run without a checkpoint yet restarts from the .env CR_PPO_CHECKPOINT).
+      for variable in "${launch_vars[@]}" CR_PPO_EXTRA_ARGS; do
+        [[ $explicit_vars == *" $variable "* || $variable == CR_LAB_INSTANCE ]] || unset "$variable"
+      done
       exec bash "$script_dir/lab_ppo.sh" resume "$name"
     fi
     ;;
