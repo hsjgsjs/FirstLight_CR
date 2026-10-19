@@ -58,3 +58,18 @@ def test_overlap_needs_accumulated_batches(monkeypatch: pytest.MonkeyPatch, tmp_
 
     with pytest.raises(ValueError, match="--overlap-collection requires --accumulate-batches"):
         trainer.main()
+
+
+@pytest.mark.parametrize("keep_previous", [False, True])
+def test_publishing_a_checkpoint_keeps_older_ones_only_when_the_launcher_prunes(tmp_path, keep_previous) -> None:
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    for update in (1, 2, 3):
+        (checkpoints / f"update-{update:08d}.pt").write_bytes(b"x")
+
+    trainer._publish_strict_checkpoint(tmp_path, checkpoints / "update-00000003.pt", keep_previous=keep_previous)
+
+    remaining = sorted(path.name for path in checkpoints.iterdir())
+    kept = (1, 2, 3) if keep_previous else (3,)
+    assert remaining == [f"update-{update:08d}.pt" for update in kept]
+    assert (tmp_path / "latest.pt").resolve() == (checkpoints / "update-00000003.pt").resolve()
