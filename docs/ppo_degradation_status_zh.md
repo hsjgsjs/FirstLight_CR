@@ -118,7 +118,8 @@ PY2
 
 - 每段数据仍按原样计算优势（段尾用价值自举），只是拼成更多对局线一起更新；批次之间换对手、换卡组照常进行。
 - 每次更新都落在批次结束处，所以每次更新都存一个可严格续训的检查点。
-- 同时要把 `--lane-minibatch-size` 调大（4096），每轮才是一步大步，而不是几步小步；GPU 显存只由 `--lane-microbatch-size` 决定，不受影响。
+- 同时要把 `--lane-minibatch-size` 调大（4096），每轮才是一步大步，而不是几步小步。
+- GPU 显存由一次前向的对局线数决定，即 `min(更新的对局线数, --lane-microbatch-size)`。不攒批时一次更新只有约 90 条线，碰不到微批上限 256；攒批后线数远超 256，每次前向按 256 条算，显存约为原来的 3 倍，22 GB 的卡会爆。所以攒批时要把 `CR_PPO_LANE_MICROBATCH_SIZE` 降到 96（约等于原来一次前向的线数）。梯度在所有微批上累加后才走一步，所以这只影响速度，不影响结果。
 - 代价是内存：一次更新的数据全部留在内存里，拼接时短暂占两份。N = 4 约为现在单次更新的 20 倍，第一次更新完成前看 `free -g`，不够就降到 2。
 - 信噪比的两半各取每一段的一半对局线，所以两半混有同样的早段和晚段，`snr` 和之前可以直接比较。
 
@@ -143,6 +144,26 @@ for pair in "spar16-acc1 1 spar16-seg160" "spar16-acc4 4 spar16-lr1e5"; do
   bash native_runner/training/v4/lab_ppo.sh options $1 --accumulate-batches $2 --lane-minibatch-size 4096 --gradient-noise-every 1
   CR_LAB_WARM_START_OPTIMIZER=1 bash native_runner/training/v4/lab_ppo.sh resume $1 400
   bash native_runner/training/v4/lab_ppo.sh watch $1
+done
+```
+
+#### 第一次启动失败的两个原因（已修复）
+
+1. **显存不够**：两组都在第一次更新时报 `CUDA out of memory`，原因见上文微批一条。
+2. **watch 重启换了起点**：`ensure` 读过 `.env` 后再调用 `resume`，`resume` 把 `.env` 里的 `CR_PPO_CHECKPOINT`（General 460）当成命令行显式给的值，盖过了 `launch-env`，还把它写回了 `launch-env`。只在还没有检查点时出现（有检查点时从检查点续训）。`ensure` 现在会先丢掉从 `.env` 读到的值。
+
+重新启动（训练选项不变；命令行给的两个值优先，并会写进 `launch-env`，之后 watch 重启也用它们）：
+
+```bash
+git pull
+START=$(python -c "import json,glob;print(json.load(open(sorted(glob.glob('runs/spar16-snr-a/train-*/config.json'))[0]))['source_checkpoint'])")
+echo "起点: $START"
+for name in spar16-acc1 spar16-acc4; do
+  bash native_runner/training/v4/lab_ppo.sh unwatch $name
+  bash native_runner/training/v4/lab_ppo.sh stop $name
+  CR_PPO_CHECKPOINT=$START CR_PPO_LANE_MICROBATCH_SIZE=96 CR_LAB_WARM_START_OPTIMIZER=1 \
+    bash native_runner/training/v4/lab_ppo.sh resume $name 400
+  bash native_runner/training/v4/lab_ppo.sh watch $name
 done
 ```
 
