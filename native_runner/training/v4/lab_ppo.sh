@@ -32,7 +32,9 @@
 # strict checkpoint's weights and optimizer state, a fresh update count). Other settings:
 # CR_PPO_ENGINE_COUNT (8), CR_LAB_ENGINE_CPUS (0-7), CR_LAB_WORKER_CPUS (8-15), CR_LAB_CONTROL_CPUS (16-19), CR_LAB_TRAIN_GPUS
 # (0; nvidia-smi numbers, e.g. 0,1), CR_LAB_KEEP_CHECKPOINTS (3) and CR_LAB_CHECKPOINT_BUCKET (1000):
-# the newest few strict checkpoints are kept plus the first one in every bucket of that many updates.
+# the newest few strict checkpoints are kept plus the first one in every bucket of that many updates
+# (checked every minute; a run remembers both in launch-env). With --accumulate-batches, updates are minutes
+# apart, so a bucket of about 10 keeps a rollback point every hour or two.
 # NCCL_P2P_DISABLE, CR_PPO_INFERENCE_BATCH_WAIT_MS and other environment variables pass through to the trainer.
 # CR_LAB_INSTANCE (unset, or 1-3) runs a second, independent lab on the same machine: its own engine and
 # worker ports, emulator names and console ports, /dev/shm files, node directory, stop marker and schedule,
@@ -46,7 +48,7 @@ set -euo pipefail
 
 launch_vars=(CR_PPO_ENGINE_COUNT CR_LAB_ENGINE_CPUS CR_LAB_WORKER_CPUS CR_LAB_CONTROL_CPUS CR_LAB_TRAIN_GPUS
   CR_PPO_INFERENCE_BATCH_WAIT_MS CR_PPO_SEGMENT_SECONDS CR_PPO_LANE_MICROBATCH_SIZE NCCL_P2P_DISABLE
-  CR_PPO_CHECKPOINT CR_LAB_INSTANCE CR_PPO_TRAINER_CPUS)
+  CR_PPO_CHECKPOINT CR_LAB_INSTANCE CR_PPO_TRAINER_CPUS CR_LAB_KEEP_CHECKPOINTS CR_LAB_CHECKPOINT_BUCKET)
 explicit_vars=" "
 for variable in "${launch_vars[@]}" CR_PPO_EXTRA_ARGS; do
   [[ ! -v $variable ]] || explicit_vars+="$variable "
@@ -338,6 +340,8 @@ run() {
   # A warm start from this run's own checkpoint keeps its optimizer state (not saved as a run option).
   local trainer_extra=$extra
   [[ -z ${CR_LAB_WARM_START_OPTIMIZER:-} ]] || trainer_extra+=" --warm-start-optimizer"
+  # The trainer would otherwise delete every older checkpoint; prune_checkpoints decides what stays.
+  trainer_extra+=" --keep-strict-checkpoints"
   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$train_gpus CR_PPO_EXTRA_ARGS=$trainer_extra \
     bash "$script_dir/launch_ppo_multinode_training.sh" "$stage" "$node_dir/topology.json" "$updates" \
     "${CR_PPO_SEGMENT_SECONDS:-40}" "$resume" >>"$logs/trainer.log" 2>&1 &

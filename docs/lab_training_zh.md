@@ -110,6 +110,8 @@ bash native_runner/training/v4/lab_ppo.sh resume spar-week1         # 中断后�
 - **默认单卡**（GPU 0），CPU 按 `CR_LAB_ENGINE_CPUS` / `CR_LAB_WORKER_CPUS` / `CR_LAB_CONTROL_CPUS` 分配（默认值见脚本开头，按自己的核数调整）。有第二块卡时，可以在训练中途拿来评测。改用双卡：`CR_LAB_TRAIN_GPUS=0,1`；双卡之间通信出问题时再加 `NCCL_P2P_DISABLE=1`。
 - **训练参数**默认是第 6 节的对练配置，实际用的参数存在 `runs/名字/trainer-options.txt`，续训时会自动沿用。要换参数用 `options`（见下面「中途改参数」），不用换名字。
 - **检查点**：每打完一批对局存一个完整检查点（约 48 MB，大约每 8 次更新一个）。脚本只保留最新 3 个，再加每 1000 次更新的第一个，一周大约 1–2 GB。对手池快照每 200 次更新一个。
+  - 以前训练器每存一个新检查点就删掉所有旧的，上面这条保留规则（以及其他文档里的 `CR_LAB_KEEP_CHECKPOINTS=100`）实际没有生效，每个阶段只剩最新一个。现在 `lab_ppo.sh` 让训练器保留旧检查点，由脚本每分钟按规则清理，下一次启动或续训起生效。
+  - 攒批时每次更新都存一个，几分钟一次，按 1000 次分桶太稀；建议 `CR_LAB_CHECKPOINT_BUCKET=10`（约每 10 次更新留一个回退点，acc1 的速度下约 1 小时一个、每天约 1 GB）。这个值和 `CR_LAB_KEEP_CHECKPOINTS` 一样会记进 `launch-env`，以后续训自动沿用。
 - 剩余硬盘不足 5 GB 时，`supervisor.log` 里会出现警告。
 - **`status` 怎么看进步**：
   - 最后几行是学习者对三个固定对手的胜率：「first」是本次训练最早的约 300 局，「latest」是最近的约 300 局。latest 比 first 高，说明在进步。

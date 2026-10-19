@@ -484,11 +484,15 @@ def _restore_rank_rng_state(payload: Mapping[str, object], *, rank: int, world_s
     _set_rank_rng_state(state, device=device)
 
 
-def _publish_strict_checkpoint(output_dir: Path, checkpoint_path: Path) -> None:
+def _publish_strict_checkpoint(output_dir: Path, checkpoint_path: Path, *, keep_previous: bool = False) -> None:
+    """Point latest.pt at checkpoint_path and delete the older strict checkpoints, unless the launcher prunes."""
+
     latest = output_dir / "latest.pt"
     temporary = output_dir / f".latest.{uuid.uuid4().hex}.tmp"
     temporary.symlink_to(checkpoint_path.relative_to(output_dir))
     temporary.replace(latest)
+    if keep_previous:
+        return
     for previous in (output_dir / "checkpoints").glob("update-*.pt"):
         if previous != checkpoint_path:
             previous.unlink()
@@ -1086,6 +1090,11 @@ def main() -> int:
         ),
     )
     parser.add_argument("--snapshot-every", type=int, default=8)
+    parser.add_argument(
+        "--keep-strict-checkpoints",
+        action="store_true",
+        help="keep every strict checkpoint instead of only the newest; the launcher prunes them (lab_ppo.sh does)",
+    )
     parser.add_argument(
         "--freeze-recent-actions",
         action="store_true",
@@ -2326,7 +2335,9 @@ def main() -> int:
                             ),
                         },
                     )
-                    _publish_strict_checkpoint(args.output_dir, checkpoint_path)
+                    _publish_strict_checkpoint(
+                        args.output_dir, checkpoint_path, keep_previous=args.keep_strict_checkpoints
+                    )
             behavior_state_id = str(_broadcast_object(behavior_state_id if rank == 0 else None))
             actor_state_id = behavior_state_id
             dist.barrier()
