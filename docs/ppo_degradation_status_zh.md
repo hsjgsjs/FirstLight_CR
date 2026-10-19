@@ -95,8 +95,11 @@ PY
 
 ```bash
 git pull
-bash native_runner/training/v4/lab_ppo.sh stop spar16-snr-a
-bash native_runner/training/v4/lab_ppo.sh stop spar16-hog-sanity
+for name in spar16-snr-a spar16-hog-sanity; do
+  bash native_runner/training/v4/lab_ppo.sh unwatch $name
+  bash native_runner/training/v4/lab_ppo.sh stop $name
+done
+crontab -l | grep lab_ppo   # 应该没有输出；还有旧的 schedule 就用 CR_LAB_INSTANCE=N lab_ppo.sh unschedule 清掉
 for name in spar16-seg160 spar16-lr1e5; do
   mkdir -p runs/$name/logs
   cp runs/spar16-snr-a/trainer-options.txt runs/$name/
@@ -112,7 +115,7 @@ for name in spar16-seg160 spar16-lr1e5; do
 done
 ```
 
-如果 seg160 显存不够，改成 120。
+旧 run 的 watch 必须先去掉：新 run 和旧 run 共用实例，`resume` 会清掉实例的停止标记，新 run 一挂，旧 watch 就可能把旧 run 拉起来。如果 seg160 显存不够，改成 120。
 
 | 观察 | 含义 | 下一步 |
 |---|---|---|
