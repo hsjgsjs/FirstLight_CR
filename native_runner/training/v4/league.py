@@ -21,6 +21,8 @@ class LeagueEntryV4:
     wins_against: int = 0
     draws_against: int = 0
     losses_against: int = 0
+    # A configured fixed opponent rather than one of the run's own snapshots.
+    fixed: bool = False
 
     def __post_init__(self) -> None:
         if not self.checkpoint_id or not self.checkpoint_path or self.update_step < 0:
@@ -46,7 +48,7 @@ class LeagueEntryV4:
         return 0.05 + 0.7 * near_even + 0.3 * weakness
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "checkpoint_id": self.checkpoint_id,
             "checkpoint_path": self.checkpoint_path,
             "update_step": self.update_step,
@@ -54,6 +56,10 @@ class LeagueEntryV4:
             "draws_against": self.draws_against,
             "losses_against": self.losses_against,
         }
+        # Written only when set, so leagues saved before the flag existed read back unchanged.
+        if self.fixed:
+            value["fixed"] = True
+        return value
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "LeagueEntryV4":
@@ -64,6 +70,7 @@ class LeagueEntryV4:
             wins_against=int(value.get("wins_against", 0)),
             draws_against=int(value.get("draws_against", 0)),
             losses_against=int(value.get("losses_against", 0)),
+            fixed=bool(value.get("fixed", False)),
         )
 
 
@@ -83,7 +90,9 @@ class PolicyLeagueV4:
     def has_history(self) -> bool:
         return bool(self.entries)
 
-    def add_snapshot(self, checkpoint_id: str, checkpoint_path: str | Path, *, update_step: int) -> None:
+    def add_snapshot(
+        self, checkpoint_id: str, checkpoint_path: str | Path, *, update_step: int, fixed: bool = False
+    ) -> None:
         if checkpoint_id == self.anchor_checkpoint_id or any(
             item.checkpoint_id == checkpoint_id for item in self.entries
         ):
@@ -93,22 +102,26 @@ class PolicyLeagueV4:
                 checkpoint_id=checkpoint_id,
                 checkpoint_path=str(Path(checkpoint_path).resolve()),
                 update_step=int(update_step),
+                fixed=fixed,
             )
         )
 
     def sample_history(self, rng: random.Random) -> LeagueEntryV4:
         return self.sample_history_from(rng, self.entries)
 
-    def sample_history_candidates(self, rng: random.Random, *, limit: int) -> tuple[LeagueEntryV4, ...]:
-        """Select one batch's PFSP candidate pool without replacement."""
+    def sample_history_candidates(
+        self, rng: random.Random, *, limit: int, pool: Sequence[LeagueEntryV4] | None = None
+    ) -> tuple[LeagueEntryV4, ...]:
+        """Select one batch's PFSP candidate pool without replacement (from ``pool``, default every entry)."""
 
         if limit <= 0:
             raise ValueError("historical policy candidate limit must be positive")
-        if not self.entries:
+        entries = self.entries if pool is None else list(pool)
+        if not entries:
             return ()
-        if len(self.entries) <= limit:
-            return tuple(self.entries)
-        remaining = list(self.entries)
+        if len(entries) <= limit:
+            return tuple(entries)
+        remaining = list(entries)
         selected: list[LeagueEntryV4] = []
         for _ in range(limit):
             index = rng.choices(range(len(remaining)), weights=tuple(item.pfsp_weight for item in remaining), k=1)[0]

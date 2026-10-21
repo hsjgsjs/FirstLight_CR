@@ -36,7 +36,7 @@ from .decoding import ShadowCandidateLegality
 from .distributed_ppo import RunningAdvantageScaleV4, distributed_ppo_update_v4
 from .ppo_expert_bc import load_expert_sampler_v4, distributed_expert_bc_update_v4, expert_bc_contract_v4
 from .factory import build_production_model_v4
-from .league import PolicyLeagueV4
+from .league import LeagueEntryV4, PolicyLeagueV4
 from .matchmaking import (
     BATTLE_LEVELS,
     MATCH_LEARNER_FOCUS,
@@ -60,6 +60,8 @@ DEFAULT_GATE_TEMPERATURE_ANNEAL_UPDATES = 1
 DEFAULT_ACTION_TEMPERATURE = 1.0
 DEFAULT_CONTINUE_TEMPERATURE = 2.0
 HISTORY_CANDIDATES_PER_BATCH = 8
+# With fixed opponents, the run's own snapshots that may play in one batch (each costs a forward per step).
+HISTORY_SNAPSHOT_CANDIDATES_PER_BATCH = 2
 SPECIAL_TOWER_RUNTIME_IDS = frozenset((159_000_002, 159_000_004))
 WANDB_PROJECT = "cr-ai-ppo"
 
@@ -727,6 +729,7 @@ def _balanced_assignments(
     rich_capacities: Sequence[int],
     special_towers_require_rich: bool,
     uniform_history_sampling: bool = False,
+    history_snapshot_fraction: float = 0.0,
     fixed_opponent_il_max_average_elixir: float | None = None,
     deck_average_elixir_by_id: Mapping[str, float] | None = None,
     learner_deck: DeckIdentityV4 | None = None,
@@ -743,11 +746,27 @@ def _balanced_assignments(
             raise ValueError("fixed-opponent deck threshold requires deck averages")
     world_size = len(match_capacities)
     total = sum(match_capacities)
-    history_candidates = (
-        tuple(league.entries)
-        if uniform_history_sampling
-        else league.sample_history_candidates(rng, limit=HISTORY_CANDIDATES_PER_BATCH)
-    )
+    if not 0.0 <= history_snapshot_fraction < 1.0:
+        raise ValueError("history snapshot fraction must be in [0, 1)")
+    if history_snapshot_fraction and not uniform_history_sampling:
+        raise ValueError("history snapshot games need fixed opponents")
+    snapshot_candidates: tuple[LeagueEntryV4, ...] = ()
+    if history_snapshot_fraction:
+        # Fixed opponents keep their uniform cycle; the run's own snapshots get a separate PFSP pool.
+        history_candidates = tuple(item for item in league.entries if item.fixed)
+        if not history_candidates:
+            raise ValueError("history snapshot games need the league's fixed opponents marked")
+        snapshot_candidates = league.sample_history_candidates(
+            rng,
+            limit=HISTORY_SNAPSHOT_CANDIDATES_PER_BATCH,
+            pool=tuple(item for item in league.entries if not item.fixed),
+        )
+    else:
+        history_candidates = (
+            tuple(league.entries)
+            if uniform_history_sampling
+            else league.sample_history_candidates(rng, limit=HISTORY_CANDIDATES_PER_BATCH)
+        )
     uniform_history_cycle = []
     candidates: list[ClusterMatchAssignmentV4] = []
     matchups = tuple(
@@ -793,6 +812,8 @@ def _balanced_assignments(
                 use_anchor_il = opponent_average_elixir <= fixed_opponent_il_max_average_elixir + 1e-12
             if use_anchor_il:
                 matchup = replace(matchup, policy_matchup=POLICY_IL)
+            elif snapshot_candidates and rng.random() < history_snapshot_fraction:
+                opponent = league.sample_history_from(rng, snapshot_candidates)
             elif uniform_history_sampling:
                 if not uniform_history_cycle:
                     uniform_history_cycle = list(history_candidates)
@@ -1028,6 +1049,16 @@ def main() -> int:
         type=int,
         default=0,
         help="total percent of games assigned to --fixed-opponent-checkpoint",
+    )
+    parser.add_argument(
+        "--history-opponent-percent",
+        type=int,
+        default=0,
+        help=(
+            "with --fixed-opponent-checkpoint: percent of all games against the run's own past snapshots "
+            "(one every --snapshot-every updates, the starting checkpoint first), PFSP-weighted, at most "
+            f"{HISTORY_SNAPSHOT_CANDIDATES_PER_BATCH} per batch; the fixed opponents keep their own share"
+        ),
     )
     parser.add_argument(
         "--fixed-opponent-checkpoint",
@@ -1320,13 +1351,25 @@ def main() -> int:
     resolved_fixed_paths = tuple(path.resolve() for path in fixed_opponent_paths)
     if len(set(resolved_fixed_paths)) != len(resolved_fixed_paths):
         raise ValueError("fixed opponent checkpoint paths must be unique")
-    il_opponent_percent = 100 - self_play_percent - fixed_opponent_percent
+    history_opponent_percent = int(args.history_opponent_percent)
+    if not 0 <= history_opponent_percent <= 100:
+        raise ValueError("history opponent percent must be in [0, 100]")
+    if history_opponent_percent and not fixed_opponent_paths:
+        # Without fixed opponents the frozen share already plays the run's snapshots.
+        raise ValueError("--history-opponent-percent requires --fixed-opponent-checkpoint")
+    il_opponent_percent = 100 - self_play_percent - fixed_opponent_percent - history_opponent_percent
     if il_opponent_percent < 0:
-        raise ValueError("self-play and fixed opponent percentages exceed 100")
+        raise ValueError("self-play, fixed and history opponent percentages exceed 100")
+    # Both frozen shares draw from the league; each frozen game goes to a snapshot with this probability.
+    history_snapshot_fraction = (
+        history_opponent_percent / (fixed_opponent_percent + history_opponent_percent)
+        if history_opponent_percent
+        else 0.0
+    )
     matchmaker_config = MatchmakerConfigV4(
         current_current=self_play_percent,
         current_il=il_opponent_percent,
-        current_history=fixed_opponent_percent,
+        current_history=fixed_opponent_percent + history_opponent_percent,
         focus_tail_current_focus_percent=75,
     )
     positive = (
@@ -1675,6 +1718,8 @@ def main() -> int:
         resume_contract["freeze_recent_actions"] = True
     if args.overlap_collection:
         resume_contract["overlap_collection"] = True
+    if history_opponent_percent:
+        resume_contract["history_opponent_percent"] = history_opponent_percent
     advantage_scale = None
     if args.advantage_normalization == "running":
         resume_contract["advantage_normalization"] = ["running", args.advantage_normalization_decay]
@@ -1735,7 +1780,12 @@ def main() -> int:
                     fixed_update_step = int(current_payload["update_step"])
                 else:
                     fixed_checkpoint_id, fixed_update_step = _checkpoint_identity(fixed_path)
-                league.add_snapshot(fixed_checkpoint_id, fixed_path, update_step=fixed_update_step)
+                league.add_snapshot(fixed_checkpoint_id, fixed_path, update_step=fixed_update_step, fixed=True)
+            if history_opponent_percent and args.checkpoint.resolve() not in resolved_fixed_paths:
+                # The starting checkpoint is the first past self, so snapshot games start at once.
+                league.add_snapshot(
+                    source_checkpoint_id, args.checkpoint, update_step=int(current_payload["update_step"])
+                )
         else:
             assert isinstance(resume_extra, Mapping) and matchmaker is not None
             matchmaker_state = resume_extra.get("matchmaker_state")
@@ -1751,6 +1801,8 @@ def main() -> int:
             league = PolicyLeagueV4.from_dict(league_state)
             if league.anchor_checkpoint_id != anchor_state_id:
                 raise ValueError("resume checkpoint IL anchor changed")
+            if history_opponent_percent and not any(item.fixed for item in league.entries):
+                raise ValueError("resume league does not mark its fixed opponents")
             league_rng.setstate(resume_extra["league_rng_state"])
     history_cache: dict[str, UniversalCardPolicyV4] = {}
 
@@ -1855,6 +1907,7 @@ def main() -> int:
                 rich_capacities=rich_capacities,
                 special_towers_require_rich=False,
                 uniform_history_sampling=bool(resolved_fixed_paths),
+                history_snapshot_fraction=history_snapshot_fraction,
                 fixed_opponent_il_max_average_elixir=(fixed_opponent_il_max_average_elixir),
                 deck_average_elixir_by_id=deck_average_elixir_by_id,
                 learner_deck=learner_deck,
@@ -2303,7 +2356,7 @@ def main() -> int:
                         gamma_per_decision=args.gamma,
                         gae_lambda=args.gae_lambda,
                     )
-                    if not resolved_fixed_paths:
+                    if not resolved_fixed_paths or history_opponent_percent:
                         league.add_snapshot(league_checkpoint_id, league_checkpoint, update_step=update_step)
                 league.save(league_path)
                 strict_boundary = not segment_session_can_resume or update_step == args.updates
@@ -2449,8 +2502,15 @@ def main() -> int:
                 }
                 batch_segments.append(metric)
                 _json_log(metrics_path, metric)
+                fixed_ids = {item.checkpoint_id for item in league.entries if item.fixed}
                 for report in reports:
-                    _json_log(matches_path, {"update": update_step, **report})
+                    row = {"update": update_step, **report}
+                    if history_opponent_percent and report.get("opponent_checkpoint_id") is not None:
+                        # Lets the tools keep snapshot games out of the fixed-opponent win rate.
+                        row["opponent_kind"] = (
+                            "fixed" if report["opponent_checkpoint_id"] in fixed_ids else "snapshot"
+                        )
+                    _json_log(matches_path, row)
                 if wandb_run is None:
                     raise RuntimeError("rank 0 lost its W&B offline run")
                 logging_rng_state = _rank_rng_state(device)

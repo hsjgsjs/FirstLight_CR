@@ -12,7 +12,9 @@ for run in runs:
     for path in sorted(glob.glob(f"runs/{run}/train-*/matches.jsonl")):
         for line in open(path):
             g = json.loads(line)
-            if g.get("policy_matchup") != "current-history" or not g.get("opponent_checkpoint_id"):
+            # Games against the run's own snapshots (--history-opponent-percent) are not fixed-opponent games.
+            if (g.get("policy_matchup") != "current-history" or not g.get("opponent_checkpoint_id")
+                    or g.get("opponent_kind") == "snapshot"):
                 continue
             owner = g["current_owners"][0]
             key = (g["sequence"], g["deck0_id"], g["deck1_id"], g["opponent_checkpoint_id"], owner)
