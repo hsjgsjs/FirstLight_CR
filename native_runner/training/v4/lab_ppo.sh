@@ -642,16 +642,22 @@ if forced:
     print(f"  fixed opponents forced to open: {len(forced) / len(frozen):.0%} of their games, "
           f"median at {statistics.median(forced):.0f}s")
 # Win rate against each frozen opponent, earliest games versus latest; self-play is always about 50%.
-fixed = [r for r in rows if r["policy_matchup"] == "current-history" and r.get("opponent_checkpoint_id")]
+# With --history-opponent-percent, games against the run's own snapshots are tagged and shown as one line.
+frozen_rows = [r for r in rows if r["policy_matchup"] == "current-history" and r.get("opponent_checkpoint_id")]
+fixed = [r for r in frozen_rows if r.get("opponent_kind") != "snapshot"]
+past = [r["result"][r["current_owners"][0]] for r in frozen_rows if r.get("opponent_kind") == "snapshot"]
+# Draws (result 0) are neither wins nor losses; show them so they don't read as losses.
+rate = lambda part: (
+    f"{100 * sum(value > 0 for value in part) / len(part):.0f}% win "
+    f"{100 * sum(value == 0 for value in part) / len(part):.0f}% draw of {len(part)}"
+) if part else "-"
 for opponent in sorted({r["opponent_checkpoint_id"] for r in fixed}, key=lambda value: names.get(value, value)):
     games = [r["result"][r["current_owners"][0]] for r in fixed if r["opponent_checkpoint_id"] == opponent]
-    # Draws (result 0) are neither wins nor losses; show them so they don't read as losses.
-    rate = lambda part: (
-        f"{100 * sum(value > 0 for value in part) / len(part):.0f}% win "
-        f"{100 * sum(value == 0 for value in part) / len(part):.0f}% draw of {len(part)}"
-    ) if part else "-"
     window = min(300, len(games) // 2)
     print(f"  vs {names.get(opponent, opponent[:12]):32s} win rate: first {rate(games[:window])}  latest {rate(games[-window:] if window else games)}")
+if past:
+    window = min(300, len(past) // 2)
+    print(f"  vs {'own past snapshots':32s} win rate: first {rate(past[:window])}  latest {rate(past[-window:] if window else past)}")
 PY
       echo "checkpoints: $(find "$run_dir" -path '*/train-*/checkpoints/update-*.pt' 2>/dev/null | wc -l), newest $(newest_checkpoint "$run_dir")"
     fi
@@ -684,13 +690,16 @@ for stage in sorted(run.glob("train-*")):
             if changed:
                 print(f"   options {sign}", " | ".join(sorted(changed)))
     previous = options if options is not None else previous
-    print("   updates    vs fixed (n)  self  kl      clip   EV     entropy  adv scale  steps  plays  wasted  first"
-          "  grad cos  snr")
+    print("   updates    vs fixed (n)  self  vs past (n)  kl      clip   EV     entropy  adv scale  steps  plays  wasted"
+          "  first  grad cos  snr")
     for low in range(metrics[0]["update"], metrics[-1]["update"] + 1, block):
         high = low + block - 1
         part = [row for row in metrics if low <= row["update"] <= high]
         played = [row for row in games if low <= row["update"] <= high]
-        fixed = [row["result"][row["current_owners"][0]] for row in played if row.get("opponent_checkpoint_id")]
+        # Games against the run's own snapshots (--history-opponent-percent) are tagged and counted apart.
+        frozen = [row for row in played if row.get("opponent_checkpoint_id")]
+        fixed = [row["result"][row["current_owners"][0]] for row in frozen if row.get("opponent_kind") != "snapshot"]
+        past = [row["result"][row["current_owners"][0]] for row in frozen if row.get("opponent_kind") == "snapshot"]
         seats = [(row, owner) for row in played for owner in row["current_owners"]]
         median = lambda key: st.median(float(row[key]) for row in part if key in row) \
             if any(key in row for row in part) else math.nan
@@ -698,8 +707,8 @@ for stage in sorted(run.glob("train-*")):
                   if row.get("cumulative_elixir_overflow_wasted")]
         first = [row["first_nonwait_action_tick"][owner] / 20 for row, owner in seats
                  if row["first_nonwait_action_tick"][owner] is not None]
-        rate = f"{100 * sum(value > 0 for value in fixed) / len(fixed):3.0f}% ({len(fixed):3d})" if fixed else "    -     "
-        print(f"   {low:4d}-{high:<4d}  {rate}  {len(played) - len(fixed):4d}  {median('approx_kl'):.4f}  "
+        rate = lambda part: f"{100 * sum(value > 0 for value in part) / len(part):3.0f}% ({len(part):3d})" if part else "    -     "
+        print(f"   {low:4d}-{high:<4d}  {rate(fixed)}  {len(played) - len(frozen):4d}  {rate(past)}   {median('approx_kl'):.4f}  "
               f"{median('clip_fraction'):.3f}  {median('value_explained_variance'):5.2f}  {median('entropy'):.3f}    "
               f"{median('advantage_scale'):7.3f}  {median('minibatch_updates'):5.0f}  "
               f"{st.mean(row['active_actions'][owner] for row, owner in seats) if seats else math.nan:5.1f}  "

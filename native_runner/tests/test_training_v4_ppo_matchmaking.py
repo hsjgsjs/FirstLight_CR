@@ -30,6 +30,7 @@ from native_runner.training.v4.ppo_runtime import (
 )
 from native_runner.training.v4.train_ppo_self_play_cluster import (
     HISTORY_CANDIDATES_PER_BATCH,
+    HISTORY_SNAPSHOT_CANDIDATES_PER_BATCH,
     _balanced_assignments,
 )
 
@@ -312,6 +313,71 @@ def test_full_batch_uses_at_most_eight_history_checkpoints(tmp_path) -> None:
         <= HISTORY_CANDIDATES_PER_BATCH
         for shard in shards
     )
+
+
+def test_policy_league_fixed_flag_round_trips_and_old_entries_read_as_snapshots(tmp_path) -> None:
+    league = PolicyLeagueV4(anchor_checkpoint_id="anchor-id", anchor_checkpoint_path=tmp_path / "anchor.pt")
+    league.add_snapshot("fixed-id", tmp_path / "fixed.pt", update_step=5, fixed=True)
+    league.add_snapshot("snapshot-id", tmp_path / "snapshot.pt", update_step=10)
+    saved = league.to_dict()
+
+    assert saved["entries"][0]["fixed"] is True
+    # Leagues written before the flag existed carry no key and read back unchanged.
+    assert "fixed" not in saved["entries"][1]
+    assert [entry.fixed for entry in PolicyLeagueV4.from_dict(saved).entries] == [True, False]
+
+
+def _fixed_and_snapshot_league(tmp_path, *, snapshots: int) -> PolicyLeagueV4:
+    league = PolicyLeagueV4(anchor_checkpoint_id="anchor-id", anchor_checkpoint_path=tmp_path / "anchor.pt")
+    for index in range(3):
+        league.add_snapshot(f"fixed-{index}", tmp_path / f"fixed-{index}.pt", update_step=index, fixed=True)
+    for index in range(snapshots):
+        league.add_snapshot(f"snapshot-{index}", tmp_path / f"snapshot-{index}.pt", update_step=10 * (index + 1))
+    return league
+
+
+def test_history_snapshot_share_plays_own_snapshots_beside_fixed_opponents(tmp_path) -> None:
+    league = _fixed_and_snapshot_league(tmp_path, snapshots=6)
+    shards = _balanced_assignments(
+        DeckMatchmakerV4(
+            _manifest(), seed=79, config=MatchmakerConfigV4(current_current=20, current_il=0, current_history=80)
+        ),
+        league,
+        random.Random(83),
+        match_capacities=(200, 200),
+        rich_capacities=(0, 0),
+        special_towers_require_rich=False,
+        uniform_history_sampling=True,
+        history_snapshot_fraction=0.25,
+    )
+    frozen = [row.opponent for shard in shards for row in shard if row.opponent is not None]
+    fixed = [entry for entry in frozen if entry.fixed]
+    snapshots = [entry for entry in frozen if not entry.fixed]
+
+    assert len(frozen) == 320
+    assert 0.15 < len(snapshots) / len(frozen) < 0.35
+    assert {entry.checkpoint_id for entry in fixed} == {"fixed-0", "fixed-1", "fixed-2"}
+    assert max(Counter(entry.checkpoint_id for entry in fixed).values()) - min(
+        Counter(entry.checkpoint_id for entry in fixed).values()
+    ) <= 2
+    assert len({entry.checkpoint_id for entry in snapshots}) <= HISTORY_SNAPSHOT_CANDIDATES_PER_BATCH
+
+
+def test_history_snapshot_share_falls_back_to_fixed_without_snapshots(tmp_path) -> None:
+    shards = _balanced_assignments(
+        DeckMatchmakerV4(
+            _manifest(), seed=89, config=MatchmakerConfigV4(current_current=0, current_il=0, current_history=100)
+        ),
+        _fixed_and_snapshot_league(tmp_path, snapshots=0),
+        random.Random(97),
+        match_capacities=(100,),
+        rich_capacities=(0,),
+        special_towers_require_rich=False,
+        uniform_history_sampling=True,
+        history_snapshot_fraction=0.25,
+    )
+
+    assert all(row.opponent is not None and row.opponent.fixed for row in shards[0])
 
 
 def test_fixed_opponent_model_is_selected_from_its_assigned_deck_average(
