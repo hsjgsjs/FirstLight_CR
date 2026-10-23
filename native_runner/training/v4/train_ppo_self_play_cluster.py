@@ -49,9 +49,9 @@ from .matchmaking import (
     MatchmakerConfigV4,
 )
 from .model import UniversalCardPolicyV4
+from .new_parameters import NewParameterScheduleV4
 from .ppo import PPOConfigV4, StoredRolloutV4, concatenate_rollout_lanes_v4
 from .ppo_runtime import ppo_environment_config_v4, ppo_ruleset_id_v4, validate_reward_parameters_v4
-from .structural_training import scale_structural_steps, structural_weight_rms
 from .tensors import GATE_ACT, GATE_WAIT
 
 
@@ -1134,11 +1134,18 @@ def main() -> int:
     )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument(
-        "--structural-lr-scale",
+        "--new-parameter-lr-scale",
         type=float,
         default=1.0,
-        help="multiply the optimizer steps of the zero-start v4.2 structural input weights (tower planes, spell "
-        "lethality, spell reach, projectile timing) by this factor; other weights keep --learning-rate",
+        help="learning-rate multiple for parameters of zero-start layers added to the policy (v4.2 tower planes, "
+        "spell lethality, spell reach, projectile timing, and later ones); other weights keep --learning-rate",
+    )
+    parser.add_argument(
+        "--new-parameter-lr-decay-updates",
+        type=int,
+        default=100,
+        help="the multiple fades linearly to 1 over this many PPO updates of each parameter's own training age, "
+        "which checkpoints carry; 0 keeps it constant",
     )
     parser.add_argument("--gamma", type=float, default=0.9997)
     parser.add_argument("--gae-lambda", type=float, default=0.98)
@@ -1279,8 +1286,10 @@ def main() -> int:
     args = parser.parse_args()
     if not args.score_model_delay_offset and args.execution_delay_ticks is None:
         raise ValueError("the model's delay offset reaches the game unless --execution-delay-ticks replaces it")
-    if args.structural_lr_scale <= 0:
-        raise ValueError("--structural-lr-scale must be positive")
+    if args.new_parameter_lr_scale <= 0:
+        raise ValueError("--new-parameter-lr-scale must be positive")
+    if args.new_parameter_lr_decay_updates < 0:
+        raise ValueError("--new-parameter-lr-decay-updates cannot be negative")
     if args.gradient_noise_every < 0:
         raise ValueError("--gradient-noise-every must be 0 (off) or positive")
     if args.accumulate_batches < 0:
@@ -1528,7 +1537,6 @@ def main() -> int:
     current_model.set_ppo_location_head_fp32(True)
     current_model.set_ppo_score_delay_offset(args.score_model_delay_offset)
     optimizer = torch.optim.AdamW(current_model.parameters(), lr=args.learning_rate, eps=1e-5, weight_decay=0.0)
-    scale_structural_steps(optimizer, current_model, args.structural_lr_scale)
     if args.resume_checkpoint is None:
         current_payload = load_actor_critic_checkpoint(
             args.checkpoint,
@@ -1630,6 +1638,13 @@ def main() -> int:
         if args.late_opening_penalty > 0.0
         else None
     )
+    new_parameter_schedule = NewParameterScheduleV4(
+        current_model,
+        scale=args.new_parameter_lr_scale,
+        decay_updates=args.new_parameter_lr_decay_updates,
+        ages=current_payload.get("parameter_ages"),
+    )
+    new_parameter_schedule.attach(optimizer)
     resume_contract = {
         "schema": "v4-ppo-strict-resume.v1",
         "anchor_checkpoint_id": anchor_state_id,
@@ -1728,8 +1743,8 @@ def main() -> int:
     if args.freeze_recent_actions:
         resume_contract["freeze_recent_actions"] = True
     # Omitted at the default so existing strict resumes keep matching.
-    if args.structural_lr_scale != 1.0:
-        resume_contract["structural_lr_scale"] = args.structural_lr_scale
+    if new_parameter_schedule.contract() is not None:
+        resume_contract["new_parameter_lr"] = new_parameter_schedule.contract()
     if args.overlap_collection:
         resume_contract["overlap_collection"] = True
     if history_opponent_percent:
@@ -2330,6 +2345,7 @@ def main() -> int:
                 )
                 if rank == 0:
                     print({"event": "ppo_expert_bc_complete", "update": update_step, **bc_metrics}, flush=True)
+            new_parameter_schedule.advance()
             next_gate_temperature = _gate_temperature_for_update(
                 update_step + 1,
                 start=args.gate_temperature_start,
@@ -2369,6 +2385,7 @@ def main() -> int:
                         training_stage="ppo-league-snapshot",
                         gamma_per_decision=args.gamma,
                         gae_lambda=args.gae_lambda,
+                        parameter_ages=new_parameter_schedule.state(),
                     )
                     if not resolved_fixed_paths or history_opponent_percent:
                         league.add_snapshot(league_checkpoint_id, league_checkpoint, update_step=update_step)
@@ -2384,6 +2401,7 @@ def main() -> int:
                         training_stage="ppo-distributed",
                         gamma_per_decision=args.gamma,
                         gae_lambda=args.gae_lambda,
+                        parameter_ages=new_parameter_schedule.state(),
                         extra={
                             "strict_boundary": True,
                             "resume_contract": resume_contract,
@@ -2513,7 +2531,7 @@ def main() -> int:
                     **behavior_metrics,
                     **averaged,
                     **bc_metrics,
-                    **structural_weight_rms(current_model),
+                    **new_parameter_schedule.metrics(),
                 }
                 batch_segments.append(metric)
                 _json_log(metrics_path, metric)

@@ -595,10 +595,13 @@ for line in lines:
     m = json.loads(line)
     print(f"update {m['update']}: {m['end_to_end_seconds']:.1f}s  frames/s {m['end_to_end_owner_frames_per_second']:.0f}  "
           f"entropy {m.get('entropy', float('nan')):.3f}  rejected {m['native_rejected_actions']}")
-# v4.2 structural input weights start at zero; their size shows whether the new inputs are used yet.
-sizes = {key[len("structural_rms_"):]: value for key, value in m.items() if key.startswith("structural_rms_")}
+# Layers added to the policy start at zero; their size shows whether the new inputs are used yet,
+# next to each one's training age and current learning-rate multiple.
+sizes = {key[len("new_rms/"):]: value for key, value in m.items() if key.startswith("new_rms/")}
 if sizes:
-    print("  new input weight RMS: " + "  ".join(f"{name} {value:.5f}" for name, value in sorted(sizes.items())))
+    print("  new layers (weight RMS, age, lr x):")
+    for name, value in sorted(sizes.items()):
+        print(f"    {name:40s} {value:.5f}  {m.get('new_age/' + name, 0):5.0f}  {m.get('new_lr_scale/' + name, 1):5.1f}")
 PY
       "$python" - "$run_dir" 2>/dev/null <<'PY' || echo "no finished games yet"
 import json, statistics, sys

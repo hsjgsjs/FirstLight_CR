@@ -36,18 +36,35 @@ from .structural_features import candidate_tower_features, child_impact_timing
 from .structural_tables import TOWER_TROOP_TYPE_COUNT, TOWER_TYPE_COUNT, StructuralTablesV1
 
 
+ZERO_START_ATTRIBUTE = "_zero_start_path"
+
+
 def zero_start(module_type: type[nn.Module], *args: object, **kwargs: object) -> nn.Module:
     """A layer whose weights start at exactly zero, built without drawing from the random generator.
 
     New input paths use it so that, for a given seed, every pre-existing parameter initializes exactly as it
-    did before the path existed.
+    did before the path existed. The layer is tagged, so checkpoint upgrades and the trainer recognize its
+    parameters as added later (see ``zero_start_parameters``) without a hand-kept list.
     """
 
     module = nn.utils.skip_init(module_type, *args, **kwargs)
     with torch.no_grad():
         for parameter in module.parameters():
             parameter.zero_()
+    setattr(module, ZERO_START_ATTRIBUTE, True)
     return module
+
+
+def zero_start_parameters(model: nn.Module) -> tuple[tuple[str, nn.Parameter], ...]:
+    """Parameters of ``zero_start`` layers, each once, under its first state-dict name."""
+
+    tagged = {
+        id(parameter)
+        for module in model.modules()
+        if getattr(module, ZERO_START_ATTRIBUTE, False)
+        for parameter in module.parameters()
+    }
+    return tuple((name, parameter) for name, parameter in model.named_parameters() if id(parameter) in tagged)
 
 
 def mlp(*dimensions: int, layer_norm: bool = False) -> nn.Sequential:

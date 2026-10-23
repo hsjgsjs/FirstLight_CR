@@ -12,7 +12,7 @@ from native_runner.training.v4.checkpoint import (
     RECENT_ACTION_PARAMETER_PREFIXES,
     RECENT_ACTION_WIDENED,
     checkpoint_contract,
-    is_structural_parameter,
+    zero_start_parameter_names,
     legacy_checkpoint_contract,
     load_actor_critic_checkpoint,
     save_actor_critic_checkpoint,
@@ -110,7 +110,7 @@ def _legacy_payload(model, path, *, optimizer=None) -> dict:
     for name, value in payload["model_state_dict"].items():
         if ".card_encoder." in name and name.startswith(RECENT_ACTION_PARAMETER_PREFIXES):
             continue
-        if name.startswith(RECENT_ACTION_PARAMETER_PREFIXES) or is_structural_parameter(name):
+        if name.startswith(RECENT_ACTION_PARAMETER_PREFIXES) or name in zero_start_parameter_names(model):
             continue
         if name in RECENT_ACTION_WIDENED:
             axis = RECENT_ACTION_WIDENED[name]
@@ -132,7 +132,7 @@ def test_legacy_checkpoint_upgrade_is_output_identical_and_trainable(tmp_path) -
     source = _model().eval()
     with torch.no_grad():
         for name, parameter in source.named_parameters():
-            if not name.startswith(RECENT_ACTION_PARAMETER_PREFIXES) and not is_structural_parameter(name):
+            if not name.startswith(RECENT_ACTION_PARAMETER_PREFIXES) and name not in zero_start_parameter_names(source):
                 parameter.add_(0.01 * torch.randn_like(parameter))
         # A legacy checkpoint has no recent-action columns at all.
         source.input_projection[0].weight[:, -source.config.recent_action_dim :].zero_()
@@ -174,7 +174,7 @@ def test_legacy_optimizer_moments_follow_parameter_names(tmp_path) -> None:
     legacy_names = [
         name
         for name, _ in source.named_parameters()
-        if not name.startswith(RECENT_ACTION_PARAMETER_PREFIXES) and not is_structural_parameter(name)
+        if not name.startswith(RECENT_ACTION_PARAMETER_PREFIXES) and name not in zero_start_parameter_names(source)
     ]
     parameters = dict(source.named_parameters())
     optimizer = torch.optim.AdamW([parameters[name] for name in legacy_names], lr=1e-3)

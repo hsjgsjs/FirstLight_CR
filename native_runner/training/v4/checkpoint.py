@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 import uuid
 
 import torch
 
+from .components import zero_start_parameters
 from .config import (
     LEGACY_OBSERVATION_VERSION,
     LEGACY_POLICY_VERSION,
@@ -45,7 +46,24 @@ def checkpoint_contract(model: UniversalCardPolicyV4) -> dict[str, Any]:
     }
 
 
-# Model config fields and parameters introduced with recent own actions.
+@dataclass(frozen=True, slots=True)
+class PolicyVersionV4:
+    """One step in the policy's history: what a checkpoint saved at this version lacks of the next ones.
+
+    To add a version: build its new paths with ``components.zero_start`` (they are recognized automatically),
+    add its config fields to ``ModelConfigV4``, raise ``UNIVERSAL_POLICY_VERSION`` and append a row listing
+    those fields. Do not widen existing tensors; ``widened`` and ``parameter_prefixes`` exist only for v4.1,
+    which predates ``zero_start``.
+    """
+
+    policy_version: str
+    observation_version: str
+    config_fields: frozenset[str] = frozenset()
+    widened: Mapping[str, int] = field(default_factory=dict)
+    parameter_prefixes: tuple[str, ...] = ()
+
+
+# Model config fields and parameters introduced with recent own actions (policy v4.1).
 RECENT_ACTION_CONFIG_FIELDS = frozenset(
     {
         "max_recent_actions",
@@ -59,47 +77,72 @@ RECENT_ACTION_PARAMETER_PREFIXES = ("recent_action_encoder.", "recent_action_pol
 # Existing tensors that gained trailing input columns/channels for recent actions.
 RECENT_ACTION_WIDENED = {"input_projection.0.weight": 1, "spatial_encoder.input.weight": 1}
 
-# Model config fields and parameters introduced with the derived structural inputs (policy v4.2). They are
-# separate zero-start modules, so no existing tensor is widened. The card encoder is shared, so its new
-# projection appears under several state-dict names that all end the same way.
+# Model config fields introduced with the derived structural inputs (policy v4.2); their parameters are
+# zero-start layers.
 STRUCTURAL_CONFIG_FIELDS = frozenset(
     {"tower_spatial_channels", "candidate_tower_feature_dim", "card_spell_target_dim", "child_timing_feature_dim"}
 )
-STRUCTURAL_PARAMETER_NAMES = frozenset(
-    {"spatial_encoder.tower_input.weight", "candidate_encoder.tower_features.weight", "child_encoder.timing.weight"}
+
+POLICY_VERSION_HISTORY = (
+    PolicyVersionV4(LEGACY_POLICY_VERSION, LEGACY_OBSERVATION_VERSION),
+    PolicyVersionV4(
+        RECENT_ACTION_POLICY_VERSION,
+        UNIVERSAL_OBSERVATION_VERSION,
+        RECENT_ACTION_CONFIG_FIELDS,
+        widened=RECENT_ACTION_WIDENED,
+        parameter_prefixes=RECENT_ACTION_PARAMETER_PREFIXES,
+    ),
+    PolicyVersionV4(UNIVERSAL_POLICY_VERSION, UNIVERSAL_OBSERVATION_VERSION, STRUCTURAL_CONFIG_FIELDS),
 )
-STRUCTURAL_PARAMETER_SUFFIX = "card_encoder.spell_targets.weight"
-
-
-def is_structural_parameter(name: str) -> bool:
-    return name in STRUCTURAL_PARAMETER_NAMES or name.endswith(STRUCTURAL_PARAMETER_SUFFIX)
+if POLICY_VERSION_HISTORY[-1].policy_version != UNIVERSAL_POLICY_VERSION:
+    raise RuntimeError("the newest policy version history row must be the current policy version")
 
 
 def is_recent_action_parameter(name: str) -> bool:
     return name.startswith(RECENT_ACTION_PARAMETER_PREFIXES)
 
 
+def zero_start_parameter_names(model: UniversalCardPolicyV4) -> frozenset[str]:
+    """Every state-dict name of a zero-start parameter, including the shared card encoder's aliases."""
+
+    tagged = {id(parameter) for _name, parameter in zero_start_parameters(model)}
+    return frozenset(
+        name for name, parameter in model.named_parameters(remove_duplicate=False) if id(parameter) in tagged
+    )
+
+
+def contract_at_version(model: UniversalCardPolicyV4, index: int) -> dict[str, Any]:
+    """The contract a checkpoint saved at ``POLICY_VERSION_HISTORY[index]`` carries."""
+
+    if not 0 <= index < len(POLICY_VERSION_HISTORY):
+        raise ValueError("policy version index out of range")
+    contract = checkpoint_contract(model)
+    later = frozenset().union(*(row.config_fields for row in POLICY_VERSION_HISTORY[index + 1 :]))
+    contract["policy_version"] = POLICY_VERSION_HISTORY[index].policy_version
+    contract["observation_version"] = POLICY_VERSION_HISTORY[index].observation_version
+    contract["model_config"] = {key: value for key, value in contract["model_config"].items() if key not in later}
+    return contract
+
+
 def recent_action_checkpoint_contract(model: UniversalCardPolicyV4) -> dict[str, Any]:
     """The contract a checkpoint saved with recent own actions but before the structural inputs carries."""
 
-    contract = checkpoint_contract(model)
-    contract["policy_version"] = RECENT_ACTION_POLICY_VERSION
-    contract["model_config"] = {
-        key: value for key, value in contract["model_config"].items() if key not in STRUCTURAL_CONFIG_FIELDS
-    }
-    return contract
+    return contract_at_version(model, 1)
 
 
 def legacy_checkpoint_contract(model: UniversalCardPolicyV4) -> dict[str, Any]:
     """The contract a checkpoint saved before recent own actions carries."""
 
-    contract = recent_action_checkpoint_contract(model)
-    contract["policy_version"] = LEGACY_POLICY_VERSION
-    contract["observation_version"] = LEGACY_OBSERVATION_VERSION
-    contract["model_config"] = {
-        key: value for key, value in contract["model_config"].items() if key not in RECENT_ACTION_CONFIG_FIELDS
-    }
-    return contract
+    return contract_at_version(model, 0)
+
+
+def _added_after(index: int) -> tuple[dict[str, int], tuple[str, ...]]:
+    widened: dict[str, int] = {}
+    prefixes: list[str] = []
+    for row in POLICY_VERSION_HISTORY[index + 1 :]:
+        widened.update(row.widened)
+        prefixes.extend(row.parameter_prefixes)
+    return widened, tuple(prefixes)
 
 
 def _parameter_aliases(model: UniversalCardPolicyV4) -> dict[str, list[str]]:
@@ -112,19 +155,20 @@ def _parameter_aliases(model: UniversalCardPolicyV4) -> dict[str, list[str]]:
 
 
 def upgrade_legacy_model_state(
-    model: UniversalCardPolicyV4, legacy_state: Mapping[str, torch.Tensor], *, recent_actions_present: bool = False
+    model: UniversalCardPolicyV4, legacy_state: Mapping[str, torch.Tensor], *, version_index: int
 ) -> dict[str, torch.Tensor]:
-    """Embed an older state dict so the upgraded model computes the same outputs.
+    """Embed a state dict saved at ``POLICY_VERSION_HISTORY[version_index]`` so the model computes the same outputs.
 
-    A checkpoint from before recent own actions (``recent_actions_present=False``) lacks both the recent-action
-    and the structural modules; one from policy v4.1 lacks only the structural modules. New modules keep their
-    initialization; every path from them into existing activations starts at zero (the widened input columns,
-    the spatial input channels, the policy skip and the structural projections), so outputs are unchanged and
+    Parameters added since then keep their initialization: zero-start layers add exact zeros, and v4.1's
+    widened input columns, spatial channels and policy skip start at zero, so outputs are unchanged and
     gradients still reach the new weights.
     """
 
+    widened_axes, prefixes = _added_after(version_index)
+    zero_start_names = zero_start_parameter_names(model)
+
     def is_new(name: str) -> bool:
-        return is_structural_parameter(name) or (not recent_actions_present and is_recent_action_parameter(name))
+        return name in zero_start_names or name.startswith(prefixes)
 
     current = model.state_dict()
     aliases = _parameter_aliases(model)
@@ -135,7 +179,7 @@ def upgrade_legacy_model_state(
             if tuple(old.shape) == tuple(fresh.shape):
                 upgraded[name] = old
                 continue
-            axis = RECENT_ACTION_WIDENED.get(name)
+            axis = widened_axes.get(name)
             if axis is None or old.ndim != fresh.ndim or old.shape[axis] >= fresh.shape[axis]:
                 raise ValueError(f"legacy checkpoint tensor {name} has an incompatible shape")
             widened = torch.zeros_like(fresh, device=old.device, dtype=old.dtype)
@@ -160,8 +204,12 @@ def upgrade_legacy_optimizer_state(
     optimizer: torch.optim.Optimizer,
     legacy_state: Mapping[str, torch.Tensor],
     legacy_optimizer_state: Mapping[str, Any],
+    *,
+    version_index: int,
 ) -> dict[str, Any]:
     """Map Adam moments by parameter name; new parameters start without state."""
+
+    widened_axes, _prefixes = _added_after(version_index)
 
     names = {id(parameter): name for name, parameter in model.named_parameters()}
     fresh = optimizer.state_dict()
@@ -186,7 +234,7 @@ def upgrade_legacy_optimizer_state(
             moved = {}
             for key, value in old.items():
                 if isinstance(value, torch.Tensor) and value.ndim > 0 and tuple(value.shape) != tuple(parameter.shape):
-                    axis = RECENT_ACTION_WIDENED.get(names[id(parameter)])
+                    axis = widened_axes.get(names[id(parameter)])
                     if axis is None:
                         raise ValueError(f"legacy optimizer state for {names[id(parameter)]} has the wrong shape")
                     widened = torch.zeros(parameter.shape, dtype=value.dtype, device=value.device)
@@ -210,8 +258,13 @@ def save_actor_critic_checkpoint(
     gamma_per_decision: float,
     gae_lambda: float | None = None,
     extra: Mapping[str, Any] | None = None,
+    parameter_ages: Mapping[str, int] | None = None,
 ) -> str:
-    """Save the complete actor, critic, optimizer, and behavior temperatures."""
+    """Save the complete actor, critic, optimizer, and behavior temperatures.
+
+    ``parameter_ages`` (PPO updates each zero-start parameter has trained, see ``new_parameters.py``) is stored
+    when given; a checkpoint without it counts those parameters as untrained.
+    """
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -236,6 +289,8 @@ def save_actor_critic_checkpoint(
         "cuda_rng_state_all": (torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
         "extra": dict(extra or {}),
     }
+    if parameter_ages is not None:
+        payload["parameter_ages"] = {str(name): int(age) for name, age in parameter_ages.items()}
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
         torch.save(payload, temporary)
@@ -260,29 +315,23 @@ def load_actor_critic_checkpoint(
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     if not isinstance(payload, dict) or payload.get("schema") != CHECKPOINT_SCHEMA_V4:
         raise ValueError("unsupported V4 actor-critic checkpoint")
-    older = next(
+    version_index = next(
         (
-            (contract, recent_actions_present)
-            for contract, recent_actions_present in (
-                (legacy_checkpoint_contract(model), False),
-                (recent_action_checkpoint_contract(model), True),
-            )
-            if payload.get("contract") == contract
+            index
+            for index in range(len(POLICY_VERSION_HISTORY) - 2, -1, -1)
+            if payload.get("contract") == contract_at_version(model, index)
         ),
         None,
     )
-    if older is not None:
-        older_contract, recent_actions_present = older
+    if version_index is not None:
         legacy_state = payload["model_state_dict"]
-        payload["model_state_dict"] = upgrade_legacy_model_state(
-            model, legacy_state, recent_actions_present=recent_actions_present
-        )
+        payload["model_state_dict"] = upgrade_legacy_model_state(model, legacy_state, version_index=version_index)
         if optimizer is not None and payload.get("optimizer_state_dict") is not None:
             payload["optimizer_state_dict"] = upgrade_legacy_optimizer_state(
-                model, optimizer, legacy_state, payload["optimizer_state_dict"]
+                model, optimizer, legacy_state, payload["optimizer_state_dict"], version_index=version_index
             )
+        payload["upgraded_from_contract"] = payload["contract"]
         payload["contract"] = checkpoint_contract(model)
-        payload["upgraded_from_contract"] = older_contract
     elif payload.get("contract") != checkpoint_contract(model):
         raise ValueError("checkpoint model/catalog contract does not match")
     model.load_state_dict(payload["model_state_dict"], strict=True)

@@ -1,6 +1,6 @@
 # 架构增强计划：把公开信息直接算给模型
 
-记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节（含第一次训练检查和 `--structural-lr-scale`）；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
+记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节（含第一次训练检查、新层学习率和以后加新输入的做法）；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
 
 ## 1. 出发点
 
@@ -298,8 +298,15 @@ bash native_runner/training/v4/lab_ppo.sh watch spar16-v42
 | 飞行时间 `timing` | 0.00005 | 0.00011 | |
 
 - **原因**：Adam 每步对每个元素最多移动约一个学习率，每次更新只走 4 步。12 次更新理论上最多能到约 50 个学习率，实际只到约 10%，说明梯度方向大多互相抵消，和整体 `snr` 0.04–0.08 一致。照这个速度，新层要几百次更新才能和老层同量级，新输入现在基本没参与决策。
-- **处理**：新增 `--structural-lr-scale K`，只把这四个新层每一步的移动乘以 K（不加权重衰减时等同于给它们 K 倍学习率），其他参数不变。人类数据那一步也一样放大，人类录像里打塔补刀、法术打空中的信号比 PPO 密。实现用优化器钩子，不加第二个参数组，旧检查点的优化器状态照常加载。默认 1，即不变；设成别的值时写进续跑合同，所以要用热启动开新阶段。
-- 每次更新的指标里多了 `structural_rms_tower_planes`、`structural_rms_candidate_lethality`、`structural_rms_spell_reach`、`structural_rms_projectile_timing`；`lab_ppo.sh status NAME` 多一行 `new input weight RMS`。
+- **处理**：新增 `--new-parameter-lr-scale K` 和 `--new-parameter-lr-decay-updates N`（默认 100）。新层的学习率先放大到 K 倍，再随这一层自己训练过的更新次数，在 N 次内线性降回 1 倍；N=0 表示一直保持 K 倍。其他参数不变。
+  - 人类数据那一步也一样放大。人类录像里补刀、法术打空中这类信号比 PPO 密。
+  - 实现用优化器钩子，不加第二个参数组，旧检查点的优化器状态照常加载。
+  - 默认 K=1，即不变。设成别的值时会写进续跑合同，所以要用热启动开新阶段。
+- **哪些是新层：自动识别**，不再手写名单。凡是用 `components.zero_start` 建的层都算新层，它的参数自动：
+  - 在升级老检查点时补零；
+  - 记录训练年龄（训练过多少次更新）。年龄存在检查点的 `parameter_ages` 里，随续跑、热启动一路带着。没有记录的检查点（v42 之前的、模仿学习训练出来的）按 0 算。
+  - 按年龄放大学习率。以后第二批再加新层，新层从 0 岁开始放大，已经训练过的 v4.2 层不受影响。
+- **监控**：每次更新的指标里，每个新层都有 `new_rms/…`（权重均方根）、`new_age/…`（年龄）、`new_lr_scale/…`（当前倍数）。`lab_ppo.sh status NAME` 末尾列成一张小表。
 
 建议 K = 30：新层每步上限约 1e-3，几十次更新内可以长到老层的十分之一以上，而老层不受影响。判断方法：
 
@@ -327,10 +334,32 @@ PY
 )"
 echo "起点 $CK  温度 $T  剩余退火 $N"
 bash native_runner/training/v4/lab_ppo.sh options spar16-v42 \
-  --gate-temperature-start "$T" --gate-temperature-anneal-updates "$N" --structural-lr-scale 30
+  --gate-temperature-start "$T" --gate-temperature-anneal-updates "$N" \\
+  --new-parameter-lr-scale 30 --new-parameter-lr-decay-updates 100
 bash native_runner/training/v4/lab_ppo.sh resume spar16-v42 400
 bash native_runner/training/v4/lab_ppo.sh watch spar16-v42
 ```
 
 - `resume` 会提示"trainer options changed"并从最新检查点热启动新阶段（带优化器状态，更新计数从 1 开始）。
-- 确认新阶段 `config.json` 里 `arguments.structural_lr_scale` 是 30。几次更新后 `status` 的 `new input weight RMS` 应该明显比现在涨得快。
+- 确认新阶段 `config.json` 里 `arguments.new_parameter_lr_scale` 是 30。
+- 几次更新后，`status` 的新层表里：
+  - 均方根应该明显比现在涨得快；
+  - 年龄从 1 往上数；
+  - 倍数从约 30 往下降，每次更新约降 0.3。
+
+### 以后加新输入的做法（第二批起）
+
+1. **新路径单独建一个层**，用 `zero_start(...)` 建，加到已有的激活上。
+   - 不要加宽已有的张量。加宽只在 v4.1 用过，v4.1 那时还没有 `zero_start`。
+   - 新输入尽量在模型内部从已有张量算出来，这样不用改缓存、tensorizer 和实战链路。
+2. **改配置和版本号**：
+   - 新的宽度字段加进 `ModelConfigV4`，并加进 `frozen_widths`；
+   - `UNIVERSAL_POLICY_VERSION` 升一版；
+   - 在 `checkpoint.py` 的 `POLICY_VERSION_HISTORY` 末尾加一行，列出这一版新加的配置字段。
+3. **其他都是自动的**：老检查点升级后输出逐位不变，Adam 状态按名字搬运，新层自动按年龄放大学习率、出现在监控里。
+4. **测试**照 `test_training_v4_structural_inputs.py` 的升级测试写：
+   - 上一版检查点升级后输出逐位相同；
+   - 新层能收到梯度。
+5. **定期清理**：
+   - 还要用的老检查点（General 460、速猪专家等）存成新格式后，可以删掉 `POLICY_VERSION_HISTORY` 里最老的行和对应的升级代码。
+   - 几批都稳定后，用最终架构从当前最强的模型蒸馏、重训一个干净的模型。
