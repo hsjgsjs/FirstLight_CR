@@ -1,6 +1,6 @@
 # 架构增强计划：把公开信息直接算给模型
 
-记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节（含第一次训练检查、新层学习率和以后加新输入的做法）；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
+记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节（含两次训练检查、新层学习率、离线预训练新层和以后加新输入的做法）；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
 
 ## 1. 出发点
 
@@ -346,6 +346,78 @@ bash native_runner/training/v4/lab_ppo.sh watch spar16-v42
   - 均方根应该明显比现在涨得快；
   - 年龄从 1 往上数；
   - 倍数从约 30 往下降，每次更新约降 0.3。
+
+### 第二次检查（10-23，K=30 跑到第 21 次更新）：新层在长，但多半是噪声
+
+- **训练稳定**：KL 约 0.0005，clip 0.014–0.019，`steps` 一直是 4，EV 0.87，熵约 0.20，被拒出牌 0。
+- **新层长到 0.0017–0.0047**（倍数已降到 23.9）。但增长大致按"更新次数开根号"走：第 1 次 0.0008，若全是噪声，第 21 次约 0.0008×√21 ≈ 0.0037，和实测差不多；若是稳定方向，会大得多。所以多半还是随机游走。
+- **对固定对手胜率从 57% 降到 54–55%**（每段约 900 局，误差约 ±1.6 个点），在误差边缘。
+- **为什么放大倍数救不了**：每一步的移动是学习率 ×（信号 + 噪声），乘 K 只是两者一起放大，信噪比不变。PPO 在这里的 `snr` 约 0.05（bchist 140 次更新没进步就是这个原因），新层学到的同样大半是噪声。第 3、4 节记过：每次更新 KL 正常，并不能阻止随机游走跨更新累积（snr-a 就是这样掉到 8% 的）。现在只有 4 个小层在游走、倍数会降回 1，所以是轻度版，但方向不对。
+
+### 改为离线预训练新层：`pretrain_new_parameters.py`
+
+人类录像每一步都有标签（出不出牌、出哪张、放哪里），信号比胜负密得多。所以先离线用人类录像只训练新层，其余全部冻结，再接 PPO：
+
+- **只动新层**：所有 `zero_start` 层可训练，其他参数 `requires_grad=False`，老层逐位不变。损失与 PPO 里的人类数据那一步相同（五个动作头，不训练价值头）。
+- **按验证集选**：每隔 `--eval-every` 步在 `validation.json`（按整场划分、训练从不读取）的固定一批窗口上算损失，最后保留验证损失最低那一步的新层；第 0 步（不训练）也参与比较，所以结果预测人类不会比起点差。
+- **输出可直接热启动 PPO**：除新层外，与源检查点完全相同，包括 PPO 优化器状态、出牌温度、更新计数、参数年龄。`--reset-new-parameters` 先把新层清零，年龄记为 0。
+- **也是清零对照的工具**：`--steps 0 --reset-new-parameters` 只写一份新层清零的副本，用来在评测里检验新层有没有用。
+- 日志：每次评估打印一行（训练损失、验证总损失和各头损失、新层均方根），同时写到输出文件旁的 `.jsonl`。
+
+**服务器上的步骤**
+
+```bash
+# 1. 停掉 K=30 的运行（检查点都保留，之后可对比）
+bash native_runner/training/v4/lab_ppo.sh unwatch spar16-v42
+bash native_runner/training/v4/lab_ppo.sh stop spar16-v42
+git pull
+
+# 2. 起点：K=30 之前的最后一个检查点；从它所在阶段的 config.json 读人类录像清单、算出牌温度的接续
+SRC=runs/spar16-v42/train-20261023-151001/checkpoints/update-00000014.pt
+read MANIFEST T N <<<"$(python - "$SRC" <<'PY'
+import json, sys, torch
+from pathlib import Path
+ck = Path(sys.argv[1])
+a = json.loads((ck.parents[1] / "config.json").read_text())["arguments"]
+p = torch.load(ck, map_location="cpu", weights_only=False)
+print(a["expert_bc_manifest"], p["ppo_gate_temperature"], max(1, a["gate_temperature_anneal_updates"] - int(p["update_step"])))
+PY
+)"
+echo "清单 $MANIFEST  温度 $T  剩余退火 $N"; ls "$(dirname "$MANIFEST")"
+
+# 3. 先跑 200 步试速度、看验证损失有没有在降
+python -m native_runner.training.v4.pretrain_new_parameters "$SRC" --manifest "$MANIFEST" \
+  --reset-new-parameters --steps 200 --eval-every 50 --output runs/keep/v42-pretrain-try.pt --device cuda:0
+
+# 4. 正式跑（默认 3000 步，每 250 步评估一次）
+python -m native_runner.training.v4.pretrain_new_parameters "$SRC" --manifest "$MANIFEST" \
+  --reset-new-parameters --output runs/keep/v42-pretrained.pt --device cuda:0 2>&1 | tee runs/keep/v42-pretrained.log
+
+# 5. 新运行 spar16-v42p：从预训练结果热启动，新层不再放大学习率（K=1）
+mkdir -p runs/spar16-v42p/logs
+cp runs/spar16-v42/trainer-options.txt runs/spar16-v42p/
+grep -v '^CR_PPO_CHECKPOINT=' runs/spar16-v42/launch-env > runs/spar16-v42p/launch-env
+bash native_runner/training/v4/lab_ppo.sh options spar16-v42p \
+  --gate-temperature-start "$T" --gate-temperature-anneal-updates "$N" \
+  --unset --new-parameter-lr-scale --unset --new-parameter-lr-decay-updates
+CR_PPO_CHECKPOINT=runs/keep/v42-pretrained.pt CR_LAB_WARM_START_OPTIMIZER=1 \
+  bash native_runner/training/v4/lab_ppo.sh resume spar16-v42p 400
+bash native_runner/training/v4/lab_ppo.sh watch spar16-v42p
+```
+
+- 第 2 步的 `ls` 应该能看到 `train.json` 和 `validation.json`。如果运行用的是另存的清单（例如加了火球注释的），旁边可能没有 `validation.json`，就加 `--validation-manifest <原清单目录>/validation.json`；完全没有验证集时工具会提示，并保留最后一步。
+- 第 3 步每次评估一行，`seconds` 一列可以估算 3000 步要多久。两个运行用同一个实例，所以 PPO 必须先停，GPU 才空得出来。
+- 启动后确认 `runs/spar16-v42p/train-*/config.json` 里 `source_checkpoint` 是 `v42-pretrained.pt`，`arguments.new_parameter_lr_scale` 是 1.0。
+
+**怎么判断**
+
+| 预训练结果 | 含义 | 下一步 |
+|---|---|---|
+| 验证损失明显下降（比第 0 步低 1% 以上），主要降在 `candidate`、`target` | 新输入能帮着预测人类出牌和落点 | 按第 5 步接 PPO |
+| 训练损失降、验证损失先降后升 | 过拟合，工具已保留验证最低的那一步 | 照常接 PPO；可以降低 `--learning-rate` 重跑对比 |
+| 验证损失几乎不降（0.2% 以内），新层很小 | 人类录像里这些输入没多少用 | 不用新层也行；回到 bchist final 继续，或重新考虑输入设计 |
+
+接上 PPO 后，和 K=30 的同期（第 1–21 次更新）对比 `trend`：对固定对手胜率不低于 57%，浪费圣水和首牌时间不变坏，就说明这条路对了。可选：PPO 之前先用循环赛比较预训练结果和它的清零副本（`--steps 0 --reset-new-parameters` 生成）。
 
 ### 以后加新输入的做法（第二批起）
 
