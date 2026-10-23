@@ -82,7 +82,8 @@ def main(argv=None):
                  delay_a_ticks=tuple(options["delay_ticks"]), delay_b_ticks=tuple(options["delay_ticks"]),
                  min_play_gap_ticks=tuple(options["min_play_gap_ticks"]),
                  gate_temperature_a=options["gate_temperature"], gate_temperature_b=options["gate_temperature"],
-                 schedule=schedule, resident_lanes=options["lanes"])
+                 schedule=schedule, resident_lanes=options["lanes"],
+                 trace_dir=destination / "traces" if options.get("trace") else None)
         elapsed = time.perf_counter() - started
         loaded = json.loads((destination / "identity.json").read_text(encoding="utf-8"))
         if [entry["sha256"] for entry in loaded["checkpoints"]] != [study["models"][name] for name in pair]:

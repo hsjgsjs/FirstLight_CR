@@ -1,6 +1,6 @@
 # 架构增强计划：把公开信息直接算给模型
 
-记录日期：2026-10-23。本文是实现前的规划，列出的改动都还没有实现。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
+记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
 
 ## 1. 出发点
 
@@ -203,3 +203,84 @@
 A、B、C 一起作为第一批；D 视数据核实结果决定放在第一批还是推迟。
 
 之后的顺序：第二批成对时间特征 → 第三批三个辅助预测头（逐个上）→ 第四批对方精英前摇。训练侧的对局线错开等新架构稳定后再做。
+
+## 11. 实现状态（2026-10-23）
+
+第一批 A–D 和第 5 节的统计都已实现；策略版本升为 `v4.2`，观测版本不变（`v4.1`），人类缓存、tensorizer、远程传输和实战链路都没改。
+
+### 数据来源：游戏数据表，不是手写常数
+
+- 法术对塔伤害、法术能否打空中 / 地面、塔的满血，都由 `structural_tables.py` 从 `card_logic` 编译数据算出，也就是引擎执行的同一份数据。平衡改动时随数据重新编译一起更新，模型读的是"这一发打多少、塔还剩多少"，不是从经验里记住的数。
+- 卡牌伤害和塔血按同一条等级曲线增长（各品质对齐到 11 级为锦标赛标准），所以"一发占塔满血的比例"在卡牌和塔同级时与等级无关，直接和塔的剩余血量比例比，模型不需要知道等级。
+- 11 级下每发打塔的伤害（对塔折算后）：
+
+| 法术 | 打塔 | 打空中 | 备注 |
+|---|---|---|---|
+| 火球 | 172 | 是 | 与卡牌特征表一致（688 × 25%） |
+| 万箭齐发 | 74 | 是 | 3 波 |
+| 火箭 | 342 | 是 | |
+| 雷电法术 | 264 | 是 | 每个目标只打一次 |
+| 电击法术 | 48 | 是 | |
+| 伤害药水 | 170 | 是 | 每秒伤害 × 8 秒 |
+| 地震法术 | 148 | 否 | 每秒伤害 × 3 秒 |
+| 滚木 | 35 | 否 | 卡牌特征表里原来是空的 |
+| 野蛮人滚桶 | 233 | 否 | 卡牌特征表里原来是空的；数据里没有对塔减伤，需实战核对 |
+| 皇家速递 | 0 | — | 效果区域 `IgnoreBuildings`，打不到塔 |
+| 虚空、哥布林魔咒、藤蔓、骷髅召唤 | 未知 | 未知 | 由脚本决定目标，标为"未知"，不当 0 |
+
+- 塔满血按数据里的基础血量 × 11 级倍率（2.56）：国王塔 6144、公主塔 3584、匕首公爵夫人 3251、加农炮手 3072。这是推算值，统计脚本最后一行"塔满血 / 11 级表值"会核对：11 级对局应为 1.00，16 级应为 1.60。
+
+### 模型里加了什么
+
+| 项 | 实现 | 输入 |
+|---|---|---|
+| A 塔层 | `SpatialScatterEncoder.tower_input`（3 通道卷积） | 我方塔血比例、敌方塔血比例、敌方塔血 / 5000，画在塔的占地格上；被推掉的塔不画 |
+| B 斩杀 | `CandidateEncoder.tower_features` | 每张候选牌：最划算一座敌塔的"伤害 / 剩余血量"（截断到 2）、能否打掉一座塔、能打掉的是左塔 / 右塔 / 国王塔、伤害是否已知；技能和非法术为 0 |
+| C 打空中 / 地面 | `GlobalCardEncoder.spell_targets` | 每张卡：打空中、打地面、是否已知（所有用到卡牌编码的地方共享） |
+| D 剩余飞行时间 | `LocalChildSetEncoder.timing` | 飞行中、落点已知且已在移动的投射物：到落点的秒数（上限 5 秒）、是否可算 |
+
+- 四个新模块都从零开始，而且建的时候不抽随机数：同一种子下旧参数和改动前完全一样，旧检查点加载后输出逐位不变。
+- `checkpoint.py` 认三种合同：v4（无近期指令）、v4.1（有近期指令）、v4.2。前两种加载时自动升级，Adam 状态按参数名搬运，新参数没有状态。
+- 测试 `test_training_v4_structural_inputs.py`：伤害表与卡牌特征表交叉核对、斩杀和塔层的计算、新通路置零时输出逐位不变、v4.1 检查点升级后输出不变且新参数有梯度、优化器状态对应、仓库里的 General 460 和速猪专家 2 能升级加载。
+
+### 统计（第 5 节）
+
+`behavior_stats.py` 读对局记录，按模型统计：可斩杀时的结局（常规时间、加时分开）、法术打塔、滚木 / 滚桶只滚到空中单位的比例、对方飞桶后 6 秒内塔掉的血和是否用法术应对、塔满血核对。对局记录由循环赛加 `--trace` 写出（每局约 1–2 MB，不影响结果和续跑）。
+
+### 服务器上的步骤
+
+```bash
+git pull
+
+# 1. 训练用卡组池（重点卡组换成 v2，见第 8 节）
+python -m native_runner.training.v4.build_ppo_deck_pool --from-pool runs/deck-pool.json \
+  --focus-decks native_runner/training/v4/focus_decks_20_v2.json --output runs/deck-pool-v2.json
+
+# 2. 起点的基线统计：只放 General 460 和起点两个模型，单独一份配置，组号 0–24（100 局）
+cat > round_robin.stats.json <<'JSON'
+{
+  "models": {
+    "General 460": "checkpoints/General/checkpoint-step-00000460.pt",
+    "bchist u80": "runs/keep/bchist-u80.pt"
+  },
+  "anchor": "General 460",
+  "sample": true,
+  "gate_temperature": 0.2
+}
+JSON
+bash round_robin.sh --config round_robin.stats.json --engines 2 --blocks 0-24 --trace
+python -m native_runner.training.v4.behavior_stats evaluations/rr-<上一步打印的目录>
+
+# 3. 新训练：从选定的起点热启动，设置沿用 bchist，只换卡组池
+START=runs/keep/bchist-u80.pt   # 按 u80 / u140 循环赛的结果选
+mkdir -p runs/spar16-v42/logs
+cp runs/spar16-bchist/trainer-options.txt runs/spar16-v42/
+grep -v -e '^CR_PPO_CHECKPOINT=' -e '^CR_PPO_DECK_POOL=' runs/spar16-bchist/launch-env > runs/spar16-v42/launch-env
+CR_PPO_CHECKPOINT=$START CR_PPO_DECK_POOL=runs/deck-pool-v2.json CR_LAB_WARM_START_OPTIMIZER=1 \
+  bash native_runner/training/v4/lab_ppo.sh resume spar16-v42 400
+bash native_runner/training/v4/lab_ppo.sh watch spar16-v42
+```
+
+- 启动后确认阶段目录 `config.json` 的 `source_checkpoint` 和 `deck_pool` 是这两个文件。
+- 训练 60–100 次更新后，把新检查点和 General 460 放进同样的配置、同样的组号再跑一遍统计，和基线对比；判断表见第 6 节。
+- 循环赛的研究身份包含代码哈希：拉取本次代码前后跑的循环赛不能合并。u80 / u140 的循环赛如果还没跑，建议在新代码上跑（旧检查点升级后输出不变）。

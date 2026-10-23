@@ -326,7 +326,8 @@ PY
 - [x] 实现攒批（`--accumulate-batches`）和双卡训练；acc4 / acc4-2g 约 90 次更新不退化。
 - [x] 历史快照与固定对手共存（`--history-opponent-percent`）；bchist 跑完 140 次更新。
 - [ ] 循环赛（General 460、bchist u80、bchist u140、acc4-2g final，采样、温度 0.2）选出下一阶段起点。
-- [ ] 按[架构增强计划](architecture_enhancement_plan_zh.md)先加针对性统计并测基线，再做 v4.2 输入迁移（塔层、斩杀特征、法术打空中 / 打地面、投射物剩余飞行时间）。
+- [x] v4.2 输入迁移（塔层、斩杀特征、法术打空中 / 打地面、投射物剩余飞行时间）和针对性统计脚本已实现（10-23），见[架构增强计划](architecture_enhancement_plan_zh.md)第 11 节。
+- [ ] 服务器上测起点的统计基线，再开 `spar16-v42` 训练。
 - [x] 卡组抽样：新名单 `focus_decks_20_v2.json` 换进自闭桶、超骑卡组各一副（第 10、20 名），三枪不加；`build_ppo_deck_pool --from-pool` 生成训练用新池（10-23 用户决定，不做同源对照）。
 - [ ] 服务器上生成 `runs/deck-pool-v2.json`，新训练启动时用它。
 

@@ -7,12 +7,15 @@ from dataclasses import dataclass, fields
 from ..card_features import CARD_MECHANIC_FEATURE_NAMES, CARD_STATIC_FEATURE_NAMES
 
 
-UNIVERSAL_POLICY_VERSION = "universal-card-policy.v4.1"
+UNIVERSAL_POLICY_VERSION = "universal-card-policy.v4.2"
 UNIVERSAL_OBSERVATION_VERSION = "universal-semantic-observation.v4.1"
 # Checkpoints saved before recent own actions were added. They load through the
 # zero-contribution upgrade in ``checkpoint.py`` and behave exactly as before.
 LEGACY_POLICY_VERSION = "universal-card-policy.v4"
 LEGACY_OBSERVATION_VERSION = "universal-semantic-observation.v4"
+# Checkpoints saved with recent own actions but before the derived structural inputs (tower planes, spell
+# tower damage, spell reach, projectile time to impact). The observation is unchanged; only the policy grew.
+RECENT_ACTION_POLICY_VERSION = "universal-card-policy.v4.1"
 UNIVERSAL_ACTION_VERSION = "universal-candidate-action.v4"
 UNIVERSAL_CARD_CATALOG_VERSION = "universal-card-catalog.v3"
 
@@ -219,6 +222,19 @@ RECENT_ACTION_FEATURE_NAMES = (
     "is_ability",
 )
 
+# Derived inside the model from existing tensors (structural_features.py); no observation field changes.
+TOWER_PLANE_NAMES = ("own_tower_hitpoints_ratio", "enemy_tower_hitpoints_ratio", "enemy_tower_hitpoints_over_5000")
+CANDIDATE_TOWER_FEATURE_NAMES = (
+    "best_tower_damage_over_remaining_over_2",
+    "kills_a_tower",
+    "kills_left_princess",
+    "kills_right_princess",
+    "kills_king",
+    "tower_damage_known",
+)
+CARD_SPELL_TARGET_FEATURE_NAMES = ("hits_air", "hits_ground", "reach_known")
+CHILD_TIMING_FEATURE_NAMES = ("time_to_impact_over_5s", "time_to_impact_known")
+
 SPATIAL_PAIR_FEATURE_NAMES = (
     "dx_over_board_width",
     "dy_over_board_height",
@@ -322,6 +338,11 @@ class ModelConfigV4:
     recent_action_feature_dim: int = len(RECENT_ACTION_FEATURE_NAMES)
     recent_action_dim: int = 64
     recent_action_spatial_channels: int = 2
+    # Derived structural inputs; every path from them into existing activations starts at zero.
+    tower_spatial_channels: int = len(TOWER_PLANE_NAMES)
+    candidate_tower_feature_dim: int = len(CANDIDATE_TOWER_FEATURE_NAMES)
+    card_spell_target_dim: int = len(CARD_SPELL_TARGET_FEATURE_NAMES)
+    child_timing_feature_dim: int = len(CHILD_TIMING_FEATURE_NAMES)
 
     # The only persistent neural recurrent core.
     lstm_input_dim: int = 512
@@ -364,6 +385,10 @@ class ModelConfigV4:
             "ability_feature_dim": len(ABILITY_FEATURE_NAMES),
             "shadow_feature_dim": len(SHADOW_FEATURE_NAMES),
             "spatial_pair_dim": len(SPATIAL_PAIR_FEATURE_NAMES),
+            "tower_spatial_channels": len(TOWER_PLANE_NAMES),
+            "candidate_tower_feature_dim": len(CANDIDATE_TOWER_FEATURE_NAMES),
+            "card_spell_target_dim": len(CARD_SPELL_TARGET_FEATURE_NAMES),
+            "child_timing_feature_dim": len(CHILD_TIMING_FEATURE_NAMES),
         }
         drifted = sorted(name for name, width in frozen_widths.items() if getattr(self, name) != width)
         if drifted:
