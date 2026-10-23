@@ -385,13 +385,18 @@ PY
 )"
 echo "清单 $MANIFEST  温度 $T  剩余退火 $N"; ls "$(dirname "$MANIFEST")"
 
-# 3. 先跑 200 步试速度、看验证损失有没有在降
-python -m native_runner.training.v4.pretrain_new_parameters "$SRC" --manifest "$MANIFEST" \
-  --reset-new-parameters --steps 200 --eval-every 50 --output runs/keep/v42-pretrain-try.pt --device cuda:0
+# 3. 先跑 200 步试速度、看验证损失有没有在降（两张卡，每张每步 4 场，合计 8 场）
+free -g   # 每个进程最多占 --cache-gb 的分片内存，两个进程就是两份
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node 2 \
+  -m native_runner.training.v4.pretrain_new_parameters "$SRC" --manifest "$MANIFEST" \
+  --reset-new-parameters --records 4 --cache-gb 32 --steps 200 --eval-every 50 \
+  --output runs/keep/v42-pretrain-try.pt
 
 # 4. 正式跑（默认 3000 步，每 250 步评估一次）
-python -m native_runner.training.v4.pretrain_new_parameters "$SRC" --manifest "$MANIFEST" \
-  --reset-new-parameters --output runs/keep/v42-pretrained.pt --device cuda:0 2>&1 | tee runs/keep/v42-pretrained.log
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node 2 \
+  -m native_runner.training.v4.pretrain_new_parameters "$SRC" --manifest "$MANIFEST" \
+  --reset-new-parameters --records 4 --cache-gb 32 \
+  --output runs/keep/v42-pretrained.pt 2>&1 | tee runs/keep/v42-pretrained.log
 
 # 5. 新运行 spar16-v42p：从预训练结果热启动，新层不再放大学习率（K=1）
 mkdir -p runs/spar16-v42p/logs
@@ -406,7 +411,8 @@ bash native_runner/training/v4/lab_ppo.sh watch spar16-v42p
 ```
 
 - 第 2 步的 `ls` 应该能看到 `train.json` 和 `validation.json`。如果运行用的是另存的清单（例如加了火球注释的），旁边可能没有 `validation.json`，就加 `--validation-manifest <原清单目录>/validation.json`；完全没有验证集时工具会提示，并保留最后一步。
-- 启动时先打印训练集、验证集各有多少视角、分布在多少个缓存分片、解压后多大，以及内存里最多留几个分片（`--cache-gb`，默认 16）。每读一场录像都要读入、校验、解压它所在的整个分片，分片留在内存里就只读一次；用 `free -g` 看空闲内存，够的话把 `--cache-gb` 调到能放下全部分片。
+- 启动时先打印训练集、验证集各有多少视角、分布在多少个缓存分片、解压后多大，以及内存里最多留几个分片（`--cache-gb`，按每个进程算，默认 16）。每读一场录像都要读入、校验、解压它所在的整个分片，分片留在内存里就只读一次。接着用 `--load-workers`（默认 8）个线程并行把分片预先读进内存，每读完一成打印一行；内存够的话把 `--cache-gb` 调到能放下全部分片，训练中就不再读盘。
+- 多卡：每张卡每步取 `--records` 场，梯度取平均，和 PPO 里人类数据那一步的多卡做法相同。两张卡配 `--records 4` 与单卡 `--records 8` 每步的数据量相同，耗时约减半。单卡就去掉 `torchrun` 那部分，改成 `python -m ... --device cuda:0`。验证集的抽法和进程数有关，单卡和双卡的验证损失不能直接比。
 - 之后每 10 步一行进度（每步秒数、训练损失、剩余时间），每次评估前提示一次；第 0 步的评估要回放全部验证录像，第一行结果会等一会儿。第 3 步的秒数可以估算 3000 步要多久。两个运行用同一个实例，所以 PPO 必须先停，GPU 才空得出来。
 - 启动后确认 `runs/spar16-v42p/train-*/config.json` 里 `source_checkpoint` 是 `v42-pretrained.pt`，`arguments.new_parameter_lr_scale` 是 1.0。
 

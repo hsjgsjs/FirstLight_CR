@@ -200,3 +200,70 @@ def test_shards_are_read_once_when_they_fit_in_memory(tmp_path, monkeypatch) -> 
     for update in range(1, 9):
         ppo.sample(update, 0, 1)
         assert len(ppo._shards) == 1
+
+
+def _rank_main(rank: int, port: int, argv: list[str]) -> None:
+    import os
+
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE="2", LOCAL_RANK=str(rank)
+    )
+    factory.build_production_model_v4 = lambda device=None: _model().to(device)
+    torch.set_num_threads(1)
+    main(argv)
+
+
+def test_two_processes_train_together_and_only_the_first_saves(tmp_path, manifests) -> None:
+    import multiprocessing
+    import socket
+
+    source = tmp_path / "update-00000014.pt"
+    source_model, _optimizer = _source_checkpoint(source)
+    output = tmp_path / "pretrained.pt"
+    argv = [
+        str(source),
+        "--output",
+        str(output),
+        "--manifest",
+        str(manifests / "train.json"),
+        "--steps",
+        "2",
+        "--eval-every",
+        "1",
+        "--learning-rate",
+        "1e-2",
+        "--records",
+        "1",
+        "--window-steps",
+        "4",
+        "--chunk-steps",
+        "4",
+        "--validation-batches",
+        "1",
+        "--load-workers",
+        "2",
+        "--device",
+        "cpu",
+    ]
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    context = multiprocessing.get_context("spawn")
+    processes = [context.Process(target=_rank_main, args=(rank, port, argv)) for rank in range(2)]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=600)
+    assert [process.exitcode for process in processes] == [0, 0]
+
+    model = _model()
+    payload = load_actor_critic_checkpoint(output, model)
+    summary = payload["extra"]["new_parameter_pretraining"]
+    assert summary["world_size"] == 2 and summary["chosen_step"] > 0
+    new_names = {name for name, _parameter in zero_start_parameters(model)}
+    expected = dict(source_model.named_parameters())
+    for name, parameter in model.named_parameters():
+        if name not in new_names:
+            torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
+    log = [json.loads(line) for line in output.with_suffix(".jsonl").read_text().splitlines()]
+    assert [row["step"] for row in log if row["event"] == "eval"] == [0, 1, 2]  # one log, written by rank 0

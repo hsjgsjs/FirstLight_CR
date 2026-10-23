@@ -9,24 +9,32 @@ update step and parameter ages are carried over, so it is a drop-in PPO warm sta
 with the lowest loss on held-out human games (step 0 included), so the result never predicts humans worse than
 the source. ``--steps 0 --reset-new-parameters`` writes the source with its new layers zeroed: the ablation copy
 for checking in an evaluation whether the new layers help.
+
+Several GPUs: ``torchrun --nproc-per-node 2 -m native_runner.training.v4.pretrain_new_parameters ...``. Each GPU
+takes ``--records`` games per step and the gradients are averaged, as in the PPO trainer's imitation step.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
+from . import ppo_expert_bc
 from .checkpoint import load_actor_critic_checkpoint, save_actor_critic_checkpoint
 from .components import zero_start_parameters
 from .imitation import ILLossWeightsV4, imitation_loss, slice_il_sequence
 from .learning import evaluate_recurrent_sequence
-from .ppo_expert_bc import COUNT_NAMES, HEADS, distributed_expert_bc_update_v4, load_expert_sampler_v4
+from .ppo_expert_bc import COUNT_NAMES, HEADS, _sum, _world, distributed_expert_bc_update_v4, load_expert_sampler_v4
 
 # Same as the PPO imitation step.
 DELAY_NEIGHBOR_WEIGHT = 0.2
@@ -62,15 +70,17 @@ def imitation_losses(model: nn.Module, sampler, *, batches: int, chunk_steps: in
     """Per-head imitation loss on a fixed set of human windows: the same windows on every call.
 
     Each window replays its game from the real start for the recurrent state, exactly as the training step does.
+    With several GPUs each takes its share of the windows and the sums are combined.
     """
 
     device = next(model.parameters()).device
-    sums = torch.zeros(len(HEADS), dtype=torch.float64)
-    counts = torch.zeros(len(HEADS), dtype=torch.float64)
+    rank, world_size = _world()
+    sums = torch.zeros(len(HEADS), dtype=torch.float64, device=device)
+    counts = torch.zeros(len(HEADS), dtype=torch.float64, device=device)
     was_training = model.training
     model.eval()
     for batch in range(1, batches + 1):
-        for item in sampler.sample(batch, 0, 1):
+        for item in sampler.sample(batch, rank, world_size):
             sequence, state = item.sequence, None
             for start in range(0, sequence.time_steps, chunk_steps):
                 chunk = slice_il_sequence(sequence, start, min(start + chunk_steps, sequence.time_steps)).to(device)
@@ -96,10 +106,11 @@ def imitation_losses(model: nn.Module, sampler, *, batches: int, chunk_steps: in
                             gate_act_weight=sampler.gate_act_weight,
                             delay_neighbor_weight=DELAY_NEIGHBOR_WEIGHT,
                         )
-                        head_counts = torch.stack([getattr(loss, name) for name in COUNT_NAMES]).double().cpu()
-                        sums += torch.stack([getattr(loss, name) for name in HEADS]).double().cpu() * head_counts
+                        head_counts = torch.stack([getattr(loss, name) for name in COUNT_NAMES]).double()
+                        sums += torch.stack([getattr(loss, name) for name in HEADS]).double() * head_counts
                         counts += head_counts
     model.train(was_training)
+    sums, counts = _sum(sums).cpu(), _sum(counts).cpu()
     means = sums / counts.clamp_min(1)
     result = {name: float(value) for name, value in zip(HEADS, means.tolist(), strict=True)}
     result["total"] = float(means.sum())
@@ -142,7 +153,8 @@ def pretrain_new_parameters(
         row: dict[str, object] = {"event": "eval", "step": step, "seconds": round(time.perf_counter() - started, 1)}
         row.update({f"train_{name}": value for name, value in train.items()})
         if validation is not None:
-            progress(f"step {step}: evaluating on {validation_batches * validation.records_per_rank} held-out games")
+            games = validation_batches * validation.records_per_rank * _world()[1]
+            progress(f"step {step}: evaluating on {games} held-out games")
             losses = imitation_losses(model, validation, batches=validation_batches, chunk_steps=chunk_steps)
             row.update({f"validation_{name}": value for name, value in losses.items()})
             if best is None or losses["total"] < best[0]:
@@ -192,10 +204,20 @@ def pretrain_new_parameters(
     return {"chosen_step": chosen_step, "rows": rows}
 
 
-def _share_shard_cache(sampler, validation, *, cache_gb: float) -> None:
+def _share_shard_cache(
+    sampler,
+    validation,
+    *,
+    cache_gb: float,
+    workers: int = 1,
+    validation_batches: int = 0,
+    say: Callable[[str], None] = lambda text: print(text, flush=True),
+) -> None:
     """Keep as many unpacked shards in memory as ``cache_gb`` holds, shared by training and validation.
 
     Each record otherwise reads, verifies and unpacks its whole shard again, which is most of the time per step.
+    The cache is filled up front by ``workers`` threads (hashing and unpacking release the interpreter lock):
+    this GPU's validation shards first, then the training shards most likely to be drawn.
     """
 
     sizes: dict[str, int] = {}
@@ -206,15 +228,36 @@ def _share_shard_cache(sampler, validation, *, cache_gb: float) -> None:
         for path in paths - sizes.keys():
             sizes[path] = int(json.loads(Path(path).read_text(encoding="utf-8"))["container_bytes"])
         unpacked = sum(sizes[path] for path in paths) / 1e9
-        print(f"{name}: {len(source.rows)} sides in {len(paths)} shards, {unpacked:.1f} GB unpacked", flush=True)
+        say(f"{name}: {len(source.rows)} sides in {len(paths)} shards, {unpacked:.1f} GB unpacked")
     largest = max(sizes.values())
     count = min(len(sizes), max(1, int(cache_gb * 1e9 // largest)))
-    print(f"keeping up to {count} of {len(sizes)} shards in memory (--cache-gb {cache_gb:g})", flush=True)
+    say(f"keeping up to {count} of {len(sizes)} shards in memory (--cache-gb {cache_gb:g})")
     cache = sampler._shards
     for source in (sampler, validation):
         if source is not None:
             source.cached_shards = count
             source._shards = cache
+
+    rank, world_size = _world()
+    wanted = []
+    if validation is not None:
+        for batch in range(1, validation_batches + 1):
+            wanted += [row["summary_path"] for row in validation.rows_for_update(batch, rank, world_size)]
+    weights: Counter[str] = Counter()
+    for row in sampler.rows:
+        weights[row["summary_path"]] += row["weight"]
+    wanted += [path for path, _weight in weights.most_common()]
+    order = [path for path in dict.fromkeys(wanted) if path not in cache][: count - len(cache)]
+    if not order:
+        return
+    started = time.perf_counter()
+    report_every = max(1, len(order) // 10)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(ppo_expert_bc.load_il_cache_shard, path, verify=True): path for path in order}
+        for done, future in enumerate(as_completed(futures), 1):
+            cache[futures[future]] = future.result()
+            if done % report_every == 0 or done == len(order):
+                say(f"loaded {done}/{len(order)} shards in {time.perf_counter() - started:.0f}s")
 
 
 def _describe(row: Mapping[str, object]) -> str:
@@ -240,7 +283,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--output", type=Path, required=True, help="checkpoint to write; a .jsonl log goes beside it")
     parser.add_argument("--steps", type=int, default=3000, help="imitation steps (0: no training)")
-    parser.add_argument("--records", type=int, default=8, help="human games per step")
+    parser.add_argument("--records", type=int, default=8, help="human games per step on each GPU")
     parser.add_argument("--window-steps", type=int, default=128, help="supervised decisions per game window")
     parser.add_argument("--chunk-steps", type=int, default=48)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -249,8 +292,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--validation-batches", type=int, default=8, help="validation size, in batches of --records")
     parser.add_argument("--reset-new-parameters", action="store_true", help="zero the new layers before training")
     parser.add_argument(
-        "--cache-gb", type=float, default=16, help="memory for unpacked cache shards, so each is read only once"
+        "--cache-gb", type=float, default=16, help="memory per GPU process for unpacked shards, each then read once"
     )
+    parser.add_argument("--load-workers", type=int, default=8, help="threads reading and unpacking shards")
     parser.add_argument("--progress-every", type=int, default=10, help="print a progress line every N steps")
     parser.add_argument("--seed", type=int, default=1, help="which training windows are drawn")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -265,9 +309,35 @@ def main(argv: list[str] | None = None) -> None:
 
     from .factory import build_production_model_v4
 
+    distributed = "LOCAL_RANK" in os.environ
+    if distributed:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        if args.device == "cpu" or not torch.cuda.is_available():
+            device = torch.device("cpu")
+            dist.init_process_group(backend="gloo")
+        else:
+            device = torch.device("cuda", local_rank)
+            torch.cuda.set_device(device)
+            dist.init_process_group(backend="nccl", device_id=device)
+    else:
+        device = torch.device(args.device)
+    try:
+        _run(args, validation_path, device, build_production_model_v4)
+    finally:
+        if distributed:
+            dist.destroy_process_group()
+
+
+def _run(args: argparse.Namespace, validation_path: Path, device: torch.device, build_model) -> None:
+    rank, world_size = _world()
+    lead = rank == 0
+
+    def say(text: str) -> None:
+        if lead:
+            print(text, flush=True)
+
     torch.manual_seed(args.seed)
-    device = torch.device(args.device)
-    model = build_production_model_v4(device=device)
+    model = build_model(device=device)
     # As in the PPO trainer, whose imitation step this reuses.
     model.set_ppo_location_head_fp32(True)
     # Carries the source's PPO optimizer state through unchanged, for --warm-start-optimizer.
@@ -291,19 +361,31 @@ def main(argv: list[str] | None = None) -> None:
             split="validation",
         )
     else:
-        print(f"no validation manifest at {validation_path}; keeping the last step", flush=True)
-    _share_shard_cache(sampler, validation, cache_gb=args.cache_gb)
+        say(f"no validation manifest at {validation_path}; keeping the last step")
+    if world_size > 1:
+        say(f"{world_size} processes: {args.records} games per step on each, {args.records * world_size} in all")
+    _share_shard_cache(
+        sampler,
+        validation,
+        cache_gb=args.cache_gb,
+        workers=args.load_workers,
+        validation_batches=args.validation_batches,
+        say=say,
+    )
 
     log_path = args.output.with_suffix(".jsonl")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    log_path.unlink(missing_ok=True)
+    if lead:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        log_path.unlink(missing_ok=True)
 
     def log(row: Mapping[str, object]) -> None:
+        if not lead:
+            return
         print(_describe(row), flush=True)
         with log_path.open("a", encoding="utf-8") as destination:
             destination.write(json.dumps(row, sort_keys=True) + "\n")
 
-    print(f"training {', '.join(name for name, _ in zero_start_parameters(model))}; everything else frozen", flush=True)
+    say(f"training {', '.join(name for name, _ in zero_start_parameters(model))}; everything else frozen")
     result = pretrain_new_parameters(
         model,
         sampler,
@@ -315,9 +397,11 @@ def main(argv: list[str] | None = None) -> None:
         validation_batches=args.validation_batches,
         eval_every=args.eval_every,
         log=log,
-        progress=lambda text: print(text, flush=True),
+        progress=say,
         progress_every=args.progress_every,
     )
+    if not lead:
+        return
     rows = result["rows"]
     chosen = next(row for row in rows if row["step"] == result["chosen_step"])
     summary = {
@@ -329,6 +413,7 @@ def main(argv: list[str] | None = None) -> None:
         "steps": args.steps,
         "chosen_step": result["chosen_step"],
         "records": args.records,
+        "world_size": world_size,
         "window_steps": args.window_steps,
         "learning_rate": args.learning_rate,
         "seed": args.seed,
