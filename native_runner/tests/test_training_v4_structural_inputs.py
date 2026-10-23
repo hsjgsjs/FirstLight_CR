@@ -23,10 +23,11 @@ from native_runner.training.v4.checkpoint import (
 from native_runner.training.v4.config import CHILD_FEATURE_NAMES, ModelConfigV4
 from native_runner.training.v4.mechanics import EffectSemanticCatalogV1, MechanicProfileCatalogV1
 from native_runner.training.v4.model import UniversalCardPolicyV4
-from native_runner.training.v4.structural_features import (
-    candidate_tower_features,
-    child_impact_timing,
-    tower_planes,
+from native_runner.training.v4.structural_features import candidate_tower_features, child_impact_timing, tower_planes
+from native_runner.training.v4.structural_training import (
+    scale_structural_steps,
+    structural_parameters,
+    structural_weight_rms,
 )
 from native_runner.training.v4.structural_tables import (
     StructuralTablesV1,
@@ -351,3 +352,62 @@ def test_repository_checkpoints_load_with_zero_structural_paths(relative: str) -
     assert not any(bool(parameter.any()) for parameter in _structural_parameters(model).values())
     fireball = model.catalog.vocab_id(FIREBALL)
     assert model.candidate_encoder.card_crown_tower_damage[fireball] == pytest.approx(172.2, abs=1.0)
+
+
+# --- Structural learning-rate scale -------------------------------------------------------------------------
+
+
+def _fixed_gradient_steps(model: UniversalCardPolicyV4, optimizer: torch.optim.Optimizer, steps: int) -> None:
+    generator = torch.Generator().manual_seed(11)
+    directions = [torch.randn(p.shape, generator=generator) for p in model.parameters()]
+    for step in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        loss = sum(((p * d) * (1.0 + step)).sum() + p.square().sum() for p, d in zip(model.parameters(), directions))
+        loss.backward()
+        optimizer.step()
+
+
+def test_structural_step_scale_equals_a_larger_learning_rate_for_those_weights_only() -> None:
+    torch.manual_seed(5)
+    scaled = _model()
+    reference = _model()
+    reference.load_state_dict(scaled.state_dict())
+    learning_rate = 1e-3
+    scaled_optimizer = torch.optim.AdamW(scaled.parameters(), lr=learning_rate, eps=1e-5, weight_decay=0.0)
+    handles = scale_structural_steps(scaled_optimizer, scaled, 30.0)
+    assert len(handles) == 2
+    structural_ids = {id(p) for _name, p in structural_parameters(reference)}
+    reference_optimizer = torch.optim.AdamW(
+        [
+            {"params": [p for p in reference.parameters() if id(p) not in structural_ids]},
+            {"params": [p for p in reference.parameters() if id(p) in structural_ids], "lr": 30 * learning_rate},
+        ],
+        lr=learning_rate,
+        eps=1e-5,
+        weight_decay=0.0,
+    )
+    _fixed_gradient_steps(scaled, scaled_optimizer, 3)
+    _fixed_gradient_steps(reference, reference_optimizer, 3)
+    expected = dict(reference.named_parameters())
+    for name, parameter in scaled.named_parameters():
+        if is_structural_parameter(name):
+            assert parameter.abs().max() > 30 * learning_rate  # moved beyond what the base rate allows
+            torch.testing.assert_close(parameter, expected[name], rtol=1e-5, atol=1e-7)
+        else:
+            torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
+    # Optimizer state keeps its single-group layout, so older checkpoints still load.
+    assert len(scaled_optimizer.state_dict()["param_groups"]) == 1
+
+
+def test_structural_step_scale_of_one_adds_no_hooks_and_weight_sizes_are_labelled() -> None:
+    model = _model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    assert scale_structural_steps(optimizer, model, 1.0) == ()
+    with pytest.raises(ValueError):
+        scale_structural_steps(optimizer, model, 0.0)
+    assert structural_weight_rms(model) == {
+        "structural_rms_tower_planes": 0.0,
+        "structural_rms_candidate_lethality": 0.0,
+        "structural_rms_projectile_timing": 0.0,
+        "structural_rms_spell_reach": 0.0,
+    }

@@ -595,6 +595,10 @@ for line in lines:
     m = json.loads(line)
     print(f"update {m['update']}: {m['end_to_end_seconds']:.1f}s  frames/s {m['end_to_end_owner_frames_per_second']:.0f}  "
           f"entropy {m.get('entropy', float('nan')):.3f}  rejected {m['native_rejected_actions']}")
+# v4.2 structural input weights start at zero; their size shows whether the new inputs are used yet.
+sizes = {key[len("structural_rms_"):]: value for key, value in m.items() if key.startswith("structural_rms_")}
+if sizes:
+    print("  new input weight RMS: " + "  ".join(f"{name} {value:.5f}" for name, value in sorted(sizes.items())))
 PY
       "$python" - "$run_dir" 2>/dev/null <<'PY' || echo "no finished games yet"
 import json, statistics, sys

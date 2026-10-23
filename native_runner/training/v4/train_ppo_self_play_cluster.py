@@ -51,6 +51,7 @@ from .matchmaking import (
 from .model import UniversalCardPolicyV4
 from .ppo import PPOConfigV4, StoredRolloutV4, concatenate_rollout_lanes_v4
 from .ppo_runtime import ppo_environment_config_v4, ppo_ruleset_id_v4, validate_reward_parameters_v4
+from .structural_training import scale_structural_steps, structural_weight_rms
 from .tensors import GATE_ACT, GATE_WAIT
 
 
@@ -1132,6 +1133,13 @@ def main() -> int:
         help="control runs: keep the recent own action paths at zero so the policy trains as before they existed",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--structural-lr-scale",
+        type=float,
+        default=1.0,
+        help="multiply the optimizer steps of the zero-start v4.2 structural input weights (tower planes, spell "
+        "lethality, spell reach, projectile timing) by this factor; other weights keep --learning-rate",
+    )
     parser.add_argument("--gamma", type=float, default=0.9997)
     parser.add_argument("--gae-lambda", type=float, default=0.98)
     parser.add_argument("--shaping-beta", type=float, default=0.05)
@@ -1271,6 +1279,8 @@ def main() -> int:
     args = parser.parse_args()
     if not args.score_model_delay_offset and args.execution_delay_ticks is None:
         raise ValueError("the model's delay offset reaches the game unless --execution-delay-ticks replaces it")
+    if args.structural_lr_scale <= 0:
+        raise ValueError("--structural-lr-scale must be positive")
     if args.gradient_noise_every < 0:
         raise ValueError("--gradient-noise-every must be 0 (off) or positive")
     if args.accumulate_batches < 0:
@@ -1518,6 +1528,7 @@ def main() -> int:
     current_model.set_ppo_location_head_fp32(True)
     current_model.set_ppo_score_delay_offset(args.score_model_delay_offset)
     optimizer = torch.optim.AdamW(current_model.parameters(), lr=args.learning_rate, eps=1e-5, weight_decay=0.0)
+    scale_structural_steps(optimizer, current_model, args.structural_lr_scale)
     if args.resume_checkpoint is None:
         current_payload = load_actor_critic_checkpoint(
             args.checkpoint,
@@ -1716,6 +1727,9 @@ def main() -> int:
         resume_contract["expert_bc"] = expert_bc_contract
     if args.freeze_recent_actions:
         resume_contract["freeze_recent_actions"] = True
+    # Omitted at the default so existing strict resumes keep matching.
+    if args.structural_lr_scale != 1.0:
+        resume_contract["structural_lr_scale"] = args.structural_lr_scale
     if args.overlap_collection:
         resume_contract["overlap_collection"] = True
     if history_opponent_percent:
@@ -2499,6 +2513,7 @@ def main() -> int:
                     **behavior_metrics,
                     **averaged,
                     **bc_metrics,
+                    **structural_weight_rms(current_model),
                 }
                 batch_segments.append(metric)
                 _json_log(metrics_path, metric)

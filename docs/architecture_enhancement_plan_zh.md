@@ -1,6 +1,6 @@
 # 架构增强计划：把公开信息直接算给模型
 
-记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
+记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节（含第一次训练检查和 `--structural-lr-scale`）；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
 
 ## 1. 出发点
 
@@ -284,3 +284,53 @@ bash native_runner/training/v4/lab_ppo.sh watch spar16-v42
 - 启动后确认阶段目录 `config.json` 的 `source_checkpoint` 和 `deck_pool` 是这两个文件。
 - 训练 60–100 次更新后，把新检查点和 General 460 放进同样的配置、同样的组号再跑一遍统计，和基线对比；判断表见第 6 节。
 - 循环赛的研究身份包含代码哈希：拉取本次代码前后跑的循环赛不能合并。u80 / u140 的循环赛如果还没跑，建议在新代码上跑（旧检查点升级后输出不变）。
+
+### 第一次检查（10-23，`spar16-v42` 第 12 次更新）：新层几乎没动
+
+- **胜率**：对固定对手第 1–4 次更新 57%，第 1–12 次合计约 59%（约 1700 局，误差约 ±1.2%）。bchist 当时从 acc4-2g 起步是 54–55%。新层全为 0 时输出和起点逐位相同，所以第 1–4 次的 57% 就是起点 bchist final 本身的水平；之后多出的 2–3 个点在误差内。重点卡组只换了 20 副里的 2 副，影响最多 1 个点左右。
+- **新层大小**（权重均方根）：
+
+| 层 | 第 1 次 | 第 12 次 | 旁边的老层 |
+|---|---|---|---|
+| 塔层 `tower_input` | 0.00007 | 0.00022 | 空间输入卷积 0.029 |
+| 斩杀 `tower_features` | 0.00002 | 0.00005 | 候选牌运行时特征 0.42 |
+| 打空中 / 地面 `spell_targets` | 0.00006 | 0.00013 | |
+| 飞行时间 `timing` | 0.00005 | 0.00011 | |
+
+- **原因**：Adam 每步对每个元素最多移动约一个学习率，每次更新只走 4 步。12 次更新理论上最多能到约 50 个学习率，实际只到约 10%，说明梯度方向大多互相抵消，和整体 `snr` 0.04–0.08 一致。照这个速度，新层要几百次更新才能和老层同量级，新输入现在基本没参与决策。
+- **处理**：新增 `--structural-lr-scale K`，只把这四个新层每一步的移动乘以 K（不加权重衰减时等同于给它们 K 倍学习率），其他参数不变。人类数据那一步也一样放大，人类录像里打塔补刀、法术打空中的信号比 PPO 密。实现用优化器钩子，不加第二个参数组，旧检查点的优化器状态照常加载。默认 1，即不变；设成别的值时写进续跑合同，所以要用热启动开新阶段。
+- 每次更新的指标里多了 `structural_rms_tower_planes`、`structural_rms_candidate_lethality`、`structural_rms_spell_reach`、`structural_rms_projectile_timing`；`lab_ppo.sh status NAME` 多一行 `new input weight RMS`。
+
+建议 K = 30：新层每步上限约 1e-3，几十次更新内可以长到老层的十分之一以上，而老层不受影响。判断方法：
+
+| 观察（20–30 次更新） | 含义 |
+|---|---|
+| 新层均方根到 0.003 以上，KL、clip、胜率正常 | 新输入开始起作用，跑到 60–100 次更新做循环赛和统计 |
+| 新层长了，但 KL 常超过 0.01、`steps` 常小于 4 | 步子太大，K 降到 10 |
+| 新层还是在 0.001 以下 | 梯度基本是噪声，PPO 学不动，改为先用人类录像单独预训练这四个新层 |
+| 胜率掉到 52% 以下 | 停，回到这次热启动的检查点 |
+
+服务器上的步骤（拉取本次代码后；出牌温度照第 4 步的办法接上）：
+
+```bash
+bash native_runner/training/v4/lab_ppo.sh unwatch spar16-v42
+bash native_runner/training/v4/lab_ppo.sh stop spar16-v42 30   # 等下一个检查点存好再停，最多 30 分钟
+git pull
+CK=$(ls -t runs/spar16-v42/train-*/checkpoints/update-*.pt | head -1)
+read T N <<<"$(python - "$CK" runs/spar16-v42/trainer-options.txt <<'PY'
+import shlex, sys, torch
+payload = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+options = shlex.split(open(sys.argv[2]).read())
+anneal = int(options[options.index("--gate-temperature-anneal-updates") + 1])
+print(payload["ppo_gate_temperature"], max(1, anneal - int(payload["update_step"])))
+PY
+)"
+echo "起点 $CK  温度 $T  剩余退火 $N"
+bash native_runner/training/v4/lab_ppo.sh options spar16-v42 \
+  --gate-temperature-start "$T" --gate-temperature-anneal-updates "$N" --structural-lr-scale 30
+bash native_runner/training/v4/lab_ppo.sh resume spar16-v42 400
+bash native_runner/training/v4/lab_ppo.sh watch spar16-v42
+```
+
+- `resume` 会提示"trainer options changed"并从最新检查点热启动新阶段（带优化器状态，更新计数从 1 开始）。
+- 确认新阶段 `config.json` 里 `arguments.structural_lr_scale` 是 30。几次更新后 `status` 的 `new input weight RMS` 应该明显比现在涨得快。

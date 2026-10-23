@@ -342,3 +342,4 @@ PPO 每次的移动里只有约 1/5 是稳定方向（`snr` 约 0.05），人类
 | `--overlap-collection` | 攒批时，GPU 更新期间引擎继续打下一批，减少引擎空等；数据晚一次更新（见 `lab_training_zh.md`） |
 | `--no-score-model-delay-offset` | 不把延迟头计入 PPO 比率（备用） |
 | `--history-opponent-percent P` | 一部分对局对手换成本运行自己过去的快照，固定对手份额不变；`trend` 的 `vs past` 列和 `status` 的「own past snapshots」一行显示对它们的胜率 |
+| `--structural-lr-scale K` | 只把 v4.2 的四个新输入层每步的移动乘以 K（等于给它们 K 倍学习率），其他参数不变；`status` 的 `new input weight RMS` 一行显示它们的大小，见[架构增强计划](architecture_enhancement_plan_zh.md)第 11 节 |
