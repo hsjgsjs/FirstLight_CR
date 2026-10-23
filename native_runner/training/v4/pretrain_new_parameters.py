@@ -21,20 +21,29 @@ import json
 import os
 import time
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch import nn
+from torch import Tensor, nn
 
 from . import ppo_expert_bc
 from .checkpoint import load_actor_critic_checkpoint, save_actor_critic_checkpoint
 from .components import zero_start_parameters
-from .imitation import ILLossWeightsV4, imitation_loss, slice_il_sequence
+from .imitation import IL_TIME_FIELDS, ILLossWeightsV4, ILSequenceV4, imitation_loss, slice_il_sequence
 from .learning import evaluate_recurrent_sequence
-from .ppo_expert_bc import COUNT_NAMES, HEADS, _sum, _world, distributed_expert_bc_update_v4, load_expert_sampler_v4
+from .ppo_expert_bc import (
+    COUNT_NAMES,
+    HEADS,
+    _reduce_actor_gradients,
+    _sum,
+    _world,
+    head_counts,
+    load_expert_sampler_v4,
+)
+from .tensors import concatenate_padded_tensor_records
 
 # Same as the PPO imitation step.
 DELAY_NEIGHBOR_WEIGHT = 0.2
@@ -65,6 +74,141 @@ def new_parameter_rms(model: nn.Module) -> dict[str, float]:
     }
 
 
+def batch_sequences(sequences: Sequence[ILSequenceV4]) -> ILSequenceV4:
+    """Put several games side by side as lanes of one recurrent batch.
+
+    Each lane is padded to the longest game by repeating its last frame with every mask cleared, and rows are
+    padded to common counts with the canonical masked values, as in PPO rollout batches. Lanes never interact,
+    so each lane computes what it would alone, while the GPU runs all of them in each step.
+    """
+
+    if not sequences:
+        raise ValueError("batching needs at least one sequence")
+    time_steps = max(sequence.time_steps for sequence in sequences)
+
+    def frames(name: str) -> tuple:
+        return tuple(
+            concatenate_padded_tensor_records(
+                tuple(getattr(sequence, name)[min(step, sequence.time_steps - 1)] for sequence in sequences)
+            )
+            for step in range(time_steps)
+        )
+
+    def times(name: str) -> Tensor | None:
+        values = [getattr(sequence, name) for sequence in sequences]
+        if all(value is None for value in values):
+            return None
+        padded = []
+        for sequence, value in zip(sequences, values, strict=True):
+            value = sequence.valid_mask if value is None else value
+            missing = time_steps - sequence.time_steps
+            if missing:
+                value = torch.cat((value, value.new_zeros((missing, sequence.batch_size))))
+            padded.append(value)
+        return torch.cat(padded, dim=1)
+
+    result = ILSequenceV4(
+        observations=frames("observations"),
+        actions=frames("actions"),
+        **{name: times(name) for name in IL_TIME_FIELDS},
+        sequence_id="+".join(sequence.sequence_id for sequence in sequences),
+        natural_time=all(sequence.natural_time for sequence in sequences),
+    )
+    result.validate()
+    return result
+
+
+def _replay(model: nn.Module, sequence: ILSequenceV4, chunk_steps: int, on_chunk) -> None:
+    """Replay a batch from its real start in chunks; ``on_chunk`` scores the chunks that hold labels."""
+
+    device = next(model.parameters()).device
+    state = None
+    for start in range(0, sequence.time_steps, chunk_steps):
+        chunk = slice_il_sequence(sequence, start, min(start + chunk_steps, sequence.time_steps)).to(device)
+        supervised = bool(chunk.valid_mask.any())
+        with (
+            torch.set_grad_enabled(supervised and torch.is_grad_enabled()),
+            torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"),
+        ):
+            evaluation = evaluate_recurrent_sequence(
+                model,
+                chunk.observations,
+                chunk.actions,
+                chunk.episode_start,
+                initial_state=state,
+                gate_temperature=1.0,
+                action_temperature=1.0,
+                continue_temperature=1.0,
+                validate=False,
+                preencode_observations=True,
+            )
+            state = evaluation.final_state.detach()
+            if supervised:
+                on_chunk(chunk, evaluation)
+        del chunk, evaluation
+
+
+def _head_losses(chunk: ILSequenceV4, evaluation, gate_act_weight: float) -> tuple[Tensor, Tensor]:
+    loss = imitation_loss(
+        chunk,
+        evaluation,
+        weights=ILLossWeightsV4(value=0.0),
+        gate_act_weight=gate_act_weight,
+        delay_neighbor_weight=DELAY_NEIGHBOR_WEIGHT,
+    )
+    means = torch.stack([getattr(loss, name) for name in HEADS]).float()
+    counts = torch.stack([getattr(loss, name) for name in COUNT_NAMES]).float()
+    return means, counts
+
+
+def imitation_step(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    items,
+    *,
+    chunk_steps: int,
+    max_grad_norm: float,
+    gate_act_weight: float,
+) -> dict[str, float]:
+    """One optimizer step on the sampled games, run side by side.
+
+    The same objective as the PPO trainer's imitation step at coefficient 1: each head normalized by its global
+    label count, gradients averaged over processes and clipped by global norm. That step replays one game at a
+    time; here all of them share each forward pass.
+    """
+
+    device = next(model.parameters()).device
+    world_size = _world()[1]
+    sequence = batch_sequences([item.sequence for item in items])
+    totals = _sum(head_counts(sequence).to(device))
+    if bool(torch.any(totals[[0, 1, 3, 4]] <= 0)):
+        raise RuntimeError("expert batch lacks an action-head training population")
+    model.eval()
+    optimizer.zero_grad(set_to_none=True)
+    numerators = torch.zeros(len(HEADS), device=device, dtype=torch.float64)
+
+    def train_chunk(chunk: ILSequenceV4, evaluation) -> None:
+        nonlocal numerators
+        means, counts = _head_losses(chunk, evaluation, gate_act_weight)
+        objective = (means * counts / totals.clamp_min(1).float()).sum() * world_size
+        if not bool(torch.isfinite(objective)):
+            raise FloatingPointError("nonfinite imitation loss")
+        objective.backward()
+        numerators += means.detach().double() * counts.double()
+
+    _replay(model, sequence, chunk_steps, train_chunk)
+    _reduce_actor_gradients(tuple(model.parameters()))
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm, error_if_nonfinite=True)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    losses = (_sum(numerators) / totals.clamp_min(1)).tolist()
+    return {
+        "bc_loss": float(sum(losses)),
+        **{f"bc_{name}_loss": float(value) for name, value in zip(HEADS, losses, strict=True)},
+        "bc_gradient_norm": float(grad_norm),
+    }
+
+
 @torch.no_grad()
 def imitation_losses(model: nn.Module, sampler, *, batches: int, chunk_steps: int) -> dict[str, float]:
     """Per-head imitation loss on a fixed set of human windows: the same windows on every call.
@@ -79,36 +223,16 @@ def imitation_losses(model: nn.Module, sampler, *, batches: int, chunk_steps: in
     counts = torch.zeros(len(HEADS), dtype=torch.float64, device=device)
     was_training = model.training
     model.eval()
+
+    def score_chunk(chunk: ILSequenceV4, evaluation) -> None:
+        nonlocal sums, counts
+        means, head_counts_ = _head_losses(chunk, evaluation, sampler.gate_act_weight)
+        sums += means.double() * head_counts_.double()
+        counts += head_counts_.double()
+
     for batch in range(1, batches + 1):
-        for item in sampler.sample(batch, rank, world_size):
-            sequence, state = item.sequence, None
-            for start in range(0, sequence.time_steps, chunk_steps):
-                chunk = slice_il_sequence(sequence, start, min(start + chunk_steps, sequence.time_steps)).to(device)
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                    evaluation = evaluate_recurrent_sequence(
-                        model,
-                        chunk.observations,
-                        chunk.actions,
-                        chunk.episode_start,
-                        initial_state=state,
-                        gate_temperature=1.0,
-                        action_temperature=1.0,
-                        continue_temperature=1.0,
-                        validate=False,
-                        preencode_observations=True,
-                    )
-                    state = evaluation.final_state
-                    if bool(chunk.valid_mask.any()):
-                        loss = imitation_loss(
-                            chunk,
-                            evaluation,
-                            weights=ILLossWeightsV4(value=0.0),
-                            gate_act_weight=sampler.gate_act_weight,
-                            delay_neighbor_weight=DELAY_NEIGHBOR_WEIGHT,
-                        )
-                        head_counts = torch.stack([getattr(loss, name) for name in COUNT_NAMES]).double()
-                        sums += torch.stack([getattr(loss, name) for name in HEADS]).double() * head_counts
-                        counts += head_counts
+        sequence = batch_sequences([item.sequence for item in sampler.sample(batch, rank, world_size)])
+        _replay(model, sequence, chunk_steps, score_chunk)
     model.train(was_training)
     sums, counts = _sum(sums).cpu(), _sum(counts).cpu()
     means = sums / counts.clamp_min(1)
@@ -169,14 +293,13 @@ def pretrain_new_parameters(
         window_steps = 0
         recent_loss, recent_steps, recent_started = 0.0, 0, time.perf_counter()
         for step in range(1, steps + 1):
-            metrics = distributed_expert_bc_update_v4(
+            metrics = imitation_step(
                 model,
                 optimizer,
-                sampler,
-                update_step=step,
-                sequence_chunk_steps=chunk_steps,
-                coefficient=1.0,
+                sampler.sample(step, *_world()),
+                chunk_steps=chunk_steps,
                 max_grad_norm=max_grad_norm,
+                gate_act_weight=sampler.gate_act_weight,
             )
             for name in ("loss", *(f"{head}_loss" for head in HEADS), "gradient_norm"):
                 window[name] = window.get(name, 0.0) + metrics[f"bc_{name}"]
