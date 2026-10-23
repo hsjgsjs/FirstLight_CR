@@ -10,7 +10,12 @@ from typing import Any, Iterator, Mapping
 import orjson
 import pyarrow.parquet as pq
 
-from .deck_pool import build_deck_pool_manifest_from_counts, deck_counts_from_payloads, mark_focus_decks
+from .deck_pool import (
+    DeckPoolManifestV4,
+    build_deck_pool_manifest_from_counts,
+    deck_counts_from_payloads,
+    mark_focus_decks,
+)
 
 
 DEFAULT_DATASET_ROOT = Path(__file__).resolve().parents[3] / "datasets"
@@ -57,17 +62,40 @@ def main() -> int:
     parser.add_argument("--minimum-uses", type=int, default=5)
     parser.add_argument("--focus-decks", type=Path)
     parser.add_argument("--expected-pool-size", type=int)
+    parser.add_argument(
+        "--from-pool",
+        type=Path,
+        help="re-mark the focus decks of an existing pool instead of scanning replays (needs --focus-decks)",
+    )
     args = parser.parse_args()
 
-    parts = tuple(sorted(args.dataset_root.glob("*/replays/*.parquet")))
-    if not parts:
-        raise FileNotFoundError(f"no replay Parquet parts found below {args.dataset_root}")
-    counts, scan_metadata = deck_counts_from_payloads(_payload_rows(parts))
-    manifest = build_deck_pool_manifest_from_counts(
-        counts,
-        minimum_uses=args.minimum_uses,
-        metadata={**scan_metadata, "dataset_root": str(args.dataset_root.resolve()), "parquet_part_count": len(parts)},
-    )
+    if args.from_pool is not None:
+        if args.focus_decks is None:
+            parser.error("--from-pool needs --focus-decks")
+        if args.from_pool.resolve() == args.output.resolve():
+            parser.error("--from-pool must not overwrite its own input")
+        # Same decks and usage counts; only the focus ranks change.
+        manifest = DeckPoolManifestV4.load(args.from_pool)
+        scan_metadata = {"source_pool": str(args.from_pool.resolve())}
+        manifest = DeckPoolManifestV4(
+            decks=manifest.decks,
+            minimum_uses=manifest.minimum_uses,
+            metadata={**dict(manifest.metadata), **scan_metadata},
+        )
+    else:
+        parts = tuple(sorted(args.dataset_root.glob("*/replays/*.parquet")))
+        if not parts:
+            raise FileNotFoundError(f"no replay Parquet parts found below {args.dataset_root}")
+        counts, scan_metadata = deck_counts_from_payloads(_payload_rows(parts))
+        manifest = build_deck_pool_manifest_from_counts(
+            counts,
+            minimum_uses=args.minimum_uses,
+            metadata={
+                **scan_metadata,
+                "dataset_root": str(args.dataset_root.resolve()),
+                "parquet_part_count": len(parts),
+            },
+        )
     if args.focus_decks is not None:
         manifest = mark_focus_decks(manifest, _focus_identities(args.focus_decks))
     if args.expected_pool_size is not None and len(manifest.decks) != args.expected_pool_size:
