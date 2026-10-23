@@ -26,6 +26,7 @@ venv/
 !.env.example
 /duel.local.json
 /round_robin.local.json
+/round_robin.stats.json
 
 # Generated native binaries
 /native_runner/probe/out/

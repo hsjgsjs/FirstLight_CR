@@ -44,11 +44,14 @@
 # it use the worker CPUs, where busy workers preempt its serial inference thread.
 # A start saves these launch settings to runs/NAME/launch-env and a resume restores them, unless the same
 # variable is given on the resume command line.
+# CR_PPO_DECK_POOL is one of them, so a run can train on its own deck pool while .env keeps the one
+# round_robin.sh evaluates on.
 set -euo pipefail
 
 launch_vars=(CR_PPO_ENGINE_COUNT CR_LAB_ENGINE_CPUS CR_LAB_WORKER_CPUS CR_LAB_CONTROL_CPUS CR_LAB_TRAIN_GPUS
   CR_PPO_INFERENCE_BATCH_WAIT_MS CR_PPO_SEGMENT_SECONDS CR_PPO_LANE_MICROBATCH_SIZE NCCL_P2P_DISABLE
-  CR_PPO_CHECKPOINT CR_LAB_INSTANCE CR_PPO_TRAINER_CPUS CR_LAB_KEEP_CHECKPOINTS CR_LAB_CHECKPOINT_BUCKET)
+  CR_PPO_CHECKPOINT CR_LAB_INSTANCE CR_PPO_TRAINER_CPUS CR_LAB_KEEP_CHECKPOINTS CR_LAB_CHECKPOINT_BUCKET
+  CR_PPO_DECK_POOL)
 explicit_vars=" "
 for variable in "${launch_vars[@]}" CR_PPO_EXTRA_ARGS; do
   [[ ! -v $variable ]] || explicit_vars+="$variable "

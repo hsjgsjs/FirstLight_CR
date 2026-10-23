@@ -347,7 +347,8 @@ def _run(args):
         port, console = choose_ports(count)
     output = Path(tempfile.mkdtemp(prefix="rr-", dir=parent))
     write_json(output / "study.json", identity)
-    write_json(output / "settings.json", options)
+    # Tracing records extra files only; it is a local setting, not part of the study identity.
+    write_json(output / "settings.json", {**options, "trace": bool(getattr(args, "trace", False))})
     write_json(output / "requested-blocks.json", args.blocks)
     if historical_engine is not None:
         write_json(output / "expected-engine.json", historical_engine)
@@ -478,6 +479,12 @@ def main(argv=None):
     parser.add_argument("--min-play-gap-ticks")
     parser.add_argument("--battle-level", type=int)
     parser.add_argument("--device")
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="also write a per-step combat trace of every game (pair-*/traces/) for behavior_stats; "
+        "about 1-2 MB per game, results and resume identity unchanged",
+    )
     args = parser.parse_args(argv)
     try:
         if args.command == "report":

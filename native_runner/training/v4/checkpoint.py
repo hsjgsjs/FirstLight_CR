@@ -12,6 +12,7 @@ import torch
 from .config import (
     LEGACY_OBSERVATION_VERSION,
     LEGACY_POLICY_VERSION,
+    RECENT_ACTION_POLICY_VERSION,
     UNIVERSAL_ACTION_VERSION,
     UNIVERSAL_OBSERVATION_VERSION,
     UNIVERSAL_POLICY_VERSION,
@@ -58,11 +59,41 @@ RECENT_ACTION_PARAMETER_PREFIXES = ("recent_action_encoder.", "recent_action_pol
 # Existing tensors that gained trailing input columns/channels for recent actions.
 RECENT_ACTION_WIDENED = {"input_projection.0.weight": 1, "spatial_encoder.input.weight": 1}
 
+# Model config fields and parameters introduced with the derived structural inputs (policy v4.2). They are
+# separate zero-start modules, so no existing tensor is widened. The card encoder is shared, so its new
+# projection appears under several state-dict names that all end the same way.
+STRUCTURAL_CONFIG_FIELDS = frozenset(
+    {"tower_spatial_channels", "candidate_tower_feature_dim", "card_spell_target_dim", "child_timing_feature_dim"}
+)
+STRUCTURAL_PARAMETER_NAMES = frozenset(
+    {"spatial_encoder.tower_input.weight", "candidate_encoder.tower_features.weight", "child_encoder.timing.weight"}
+)
+STRUCTURAL_PARAMETER_SUFFIX = "card_encoder.spell_targets.weight"
+
+
+def is_structural_parameter(name: str) -> bool:
+    return name in STRUCTURAL_PARAMETER_NAMES or name.endswith(STRUCTURAL_PARAMETER_SUFFIX)
+
+
+def is_recent_action_parameter(name: str) -> bool:
+    return name.startswith(RECENT_ACTION_PARAMETER_PREFIXES)
+
+
+def recent_action_checkpoint_contract(model: UniversalCardPolicyV4) -> dict[str, Any]:
+    """The contract a checkpoint saved with recent own actions but before the structural inputs carries."""
+
+    contract = checkpoint_contract(model)
+    contract["policy_version"] = RECENT_ACTION_POLICY_VERSION
+    contract["model_config"] = {
+        key: value for key, value in contract["model_config"].items() if key not in STRUCTURAL_CONFIG_FIELDS
+    }
+    return contract
+
 
 def legacy_checkpoint_contract(model: UniversalCardPolicyV4) -> dict[str, Any]:
     """The contract a checkpoint saved before recent own actions carries."""
 
-    contract = checkpoint_contract(model)
+    contract = recent_action_checkpoint_contract(model)
     contract["policy_version"] = LEGACY_POLICY_VERSION
     contract["observation_version"] = LEGACY_OBSERVATION_VERSION
     contract["model_config"] = {
@@ -81,15 +112,19 @@ def _parameter_aliases(model: UniversalCardPolicyV4) -> dict[str, list[str]]:
 
 
 def upgrade_legacy_model_state(
-    model: UniversalCardPolicyV4, legacy_state: Mapping[str, torch.Tensor]
+    model: UniversalCardPolicyV4, legacy_state: Mapping[str, torch.Tensor], *, recent_actions_present: bool = False
 ) -> dict[str, torch.Tensor]:
-    """Embed a pre-recent-action state dict so the upgraded model computes the same outputs.
+    """Embed an older state dict so the upgraded model computes the same outputs.
 
-    New modules keep their initialization; every path from them into existing
-    activations starts at zero (the widened input columns, the spatial input
-    channels and the policy skip), so outputs are unchanged and gradients still
-    reach the new weights.
+    A checkpoint from before recent own actions (``recent_actions_present=False``) lacks both the recent-action
+    and the structural modules; one from policy v4.1 lacks only the structural modules. New modules keep their
+    initialization; every path from them into existing activations starts at zero (the widened input columns,
+    the spatial input channels, the policy skip and the structural projections), so outputs are unchanged and
+    gradients still reach the new weights.
     """
+
+    def is_new(name: str) -> bool:
+        return is_structural_parameter(name) or (not recent_actions_present and is_recent_action_parameter(name))
 
     current = model.state_dict()
     aliases = _parameter_aliases(model)
@@ -110,7 +145,7 @@ def upgrade_legacy_model_state(
         shared = next((alias for alias in aliases.get(name, ()) if alias in legacy_state), None)
         if shared is not None:
             upgraded[name] = legacy_state[shared]
-        elif name.startswith(RECENT_ACTION_PARAMETER_PREFIXES):
+        elif is_new(name):
             upgraded[name] = fresh
         else:
             raise ValueError(f"legacy checkpoint is missing tensor {name}")
@@ -225,16 +260,29 @@ def load_actor_critic_checkpoint(
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     if not isinstance(payload, dict) or payload.get("schema") != CHECKPOINT_SCHEMA_V4:
         raise ValueError("unsupported V4 actor-critic checkpoint")
-    legacy = payload.get("contract") == legacy_checkpoint_contract(model)
-    if legacy:
+    older = next(
+        (
+            (contract, recent_actions_present)
+            for contract, recent_actions_present in (
+                (legacy_checkpoint_contract(model), False),
+                (recent_action_checkpoint_contract(model), True),
+            )
+            if payload.get("contract") == contract
+        ),
+        None,
+    )
+    if older is not None:
+        older_contract, recent_actions_present = older
         legacy_state = payload["model_state_dict"]
-        payload["model_state_dict"] = upgrade_legacy_model_state(model, legacy_state)
+        payload["model_state_dict"] = upgrade_legacy_model_state(
+            model, legacy_state, recent_actions_present=recent_actions_present
+        )
         if optimizer is not None and payload.get("optimizer_state_dict") is not None:
             payload["optimizer_state_dict"] = upgrade_legacy_optimizer_state(
                 model, optimizer, legacy_state, payload["optimizer_state_dict"]
             )
         payload["contract"] = checkpoint_contract(model)
-        payload["upgraded_from_contract"] = legacy_checkpoint_contract(model)
+        payload["upgraded_from_contract"] = older_contract
     elif payload.get("contract") != checkpoint_contract(model):
         raise ValueError("checkpoint model/catalog contract does not match")
     model.load_state_dict(payload["model_state_dict"], strict=True)

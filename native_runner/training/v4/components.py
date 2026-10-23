@@ -32,6 +32,22 @@ from .tensors import (
     RelationEdgesV4,
     TowerSetV4,
 )
+from .structural_features import candidate_tower_features, child_impact_timing
+from .structural_tables import TOWER_TROOP_TYPE_COUNT, TOWER_TYPE_COUNT, StructuralTablesV1
+
+
+def zero_start(module_type: type[nn.Module], *args: object, **kwargs: object) -> nn.Module:
+    """A layer whose weights start at exactly zero, built without drawing from the random generator.
+
+    New input paths use it so that, for a given seed, every pre-existing parameter initializes exactly as it
+    did before the path existed.
+    """
+
+    module = nn.utils.skip_init(module_type, *args, **kwargs)
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.zero_()
+    return module
 
 
 def mlp(*dimensions: int, layer_norm: bool = False) -> nn.Sequential:
@@ -269,7 +285,12 @@ class GlobalCardEncoder(nn.Module):
     """Global semantics with a gated card-ID residual."""
 
     def __init__(
-        self, config: ModelConfigV4, catalog: CardCatalogV1, mechanic_catalog: MechanicProfileCatalogV1
+        self,
+        config: ModelConfigV4,
+        catalog: CardCatalogV1,
+        mechanic_catalog: MechanicProfileCatalogV1,
+        *,
+        spell_targets: Tensor | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -289,6 +310,14 @@ class GlobalCardEncoder(nn.Module):
             torch.tensor(mechanic_catalog.card_form_profile_ids, dtype=torch.long),
             persistent=False,
         )
+        targets = (
+            torch.zeros(catalog.vocab_size, config.card_spell_target_dim)
+            if spell_targets is None
+            else spell_targets.to(torch.float32)
+        )
+        if tuple(targets.shape) != (catalog.vocab_size, config.card_spell_target_dim):
+            raise ValueError("spell reach rows do not match the card catalog")
+        self.register_buffer("catalog_spell_targets", targets, persistent=False)
         self.id_embedding = nn.Embedding(catalog.vocab_size, config.card_semantic_dim)
         self.static_encoder = mlp(config.card_static_dim, config.card_semantic_dim, config.card_semantic_dim)
         self.mechanic_encoder = mlp(config.card_mechanic_dim, config.card_semantic_dim, config.card_semantic_dim)
@@ -296,6 +325,8 @@ class GlobalCardEncoder(nn.Module):
         self.mechanic_profile = nn.Linear(config.mechanic_profile_dim, config.card_semantic_dim)
         self.id_gate = mlp(2 * config.card_semantic_dim, config.card_semantic_dim, 1)
         self.output_norm = nn.LayerNorm(config.card_semantic_dim)
+        # V4.2: whether a spell reaches air and ground. Starts at zero so upgraded checkpoints are unchanged.
+        self.spell_targets = zero_start(nn.Linear, config.card_spell_target_dim, config.card_semantic_dim, bias=False)
         final_gate = self.id_gate[-1]
         if not isinstance(final_gate, nn.Linear):
             raise TypeError("ID residual gate must end in a linear layer")
@@ -314,6 +345,7 @@ class GlobalCardEncoder(nn.Module):
             + self.mechanic_profile(
                 nn.functional.embedding(self.card_form_profile_ids[card_vocab_id, runtime_form], profile_memory)
             )
+            + self.spell_targets(self.catalog_spell_targets[card_vocab_id])
         )
         gate = torch.sigmoid(self.id_gate(torch.cat((static_memory, mechanic_memory), dim=-1)))
         result = self.output_norm(generic + gate * self.id_embedding(card_vocab_id))
@@ -343,6 +375,8 @@ class LocalChildSetEncoder(nn.Module):
             persistent=False,
         )
         self.dynamic = mlp(config.child_feature_dim, width, width)
+        # V4.2: seconds until an in-flight projectile lands, derived from existing child features; zero start.
+        self.timing = zero_start(nn.Linear, config.child_timing_feature_dim, width, bias=False)
         self.input_norm = nn.LayerNorm(width)
         nn.init.zeros_(self.id_gate.weight)
         nn.init.constant_(self.id_gate.bias, -2.0)
@@ -368,6 +402,7 @@ class LocalChildSetEncoder(nn.Module):
             + mechanic_memory
             + self.active_effects(active_effect_memory)
             + self.dynamic(groups.child_features)
+            + self.timing(child_impact_timing(groups, self.config))
         )
         gate = torch.sigmoid(self.id_gate(torch.cat((source_memory, mechanic_memory), dim=-1)))
         child_memory = self.input_norm(generic + gate * self.archetype_embedding(groups.child_archetype_id))
@@ -721,6 +756,11 @@ class SpatialScatterEncoder(nn.Module):
         # contribution, so an upgraded checkpoint computes exactly what it did.
         with torch.no_grad():
             self.input.weight[:, -config.recent_action_spatial_channels :].zero_()
+        # V4.2: tower footprints with hitpoints. A separate zero-start convolution keeps upgraded checkpoints
+        # bit-identical (adding exact zeros), unlike widening the existing input convolution.
+        self.tower_input = zero_start(
+            nn.Conv2d, config.tower_spatial_channels, config.spatial_hidden_channels, 3, padding=1, bias=False
+        )
         self.blocks = nn.Sequential(
             *(ResidualSpatialBlock(config.spatial_hidden_channels) for _ in range(config.spatial_res_blocks))
         )
@@ -833,16 +873,16 @@ class SpatialScatterEncoder(nn.Module):
         child_radius: Tensor,
         child_mask: Tensor,
         recent_action_planes: Tensor,
+        tower_planes: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         learned = self.scatter(child_memory, child_position, child_extent, child_radius, child_mask)
         coordinates = self.coordinate_planes(explicit_planes).unsqueeze(0).expand(explicit_planes.shape[0], -1, -1, -1)
-        spatial = self.blocks(
-            self.input(
-                torch.cat(
-                    (explicit_planes, learned, coordinates, recent_action_planes.to(explicit_planes.dtype)), dim=1
-                )
-            )
+        projected = self.input(
+            torch.cat((explicit_planes, learned, coordinates, recent_action_planes.to(explicit_planes.dtype)), dim=1)
         )
+        if tower_planes is not None:
+            projected = projected + self.tower_input(tower_planes.to(explicit_planes.dtype))
+        spatial = self.blocks(projected)
         average = spatial.mean(dim=(2, 3))
         maximum = spatial.amax(dim=(2, 3))
         return spatial, self.summary(torch.cat((average, maximum), dim=-1))
@@ -1080,10 +1120,24 @@ class CandidateEncoder(nn.Module):
         *,
         ability_features: Tensor,
         mechanic_catalog: MechanicProfileCatalogV1,
+        tables: StructuralTablesV1 | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.card_encoder = card_encoder
+        vocab_size = card_encoder.catalog.vocab_size
+        damage = torch.zeros(vocab_size) if tables is None else tables.card_crown_tower_damage
+        known = torch.zeros(vocab_size, dtype=torch.bool) if tables is None else tables.card_damage_known
+        hitpoints = (
+            torch.zeros(TOWER_TYPE_COUNT, TOWER_TROOP_TYPE_COUNT) if tables is None else tables.tower_hitpoints_level_11
+        )
+        if damage.shape != (vocab_size,) or known.shape != (vocab_size,):
+            raise ValueError("tower damage rows do not match the card catalog")
+        if hitpoints.shape != (TOWER_TYPE_COUNT, TOWER_TROOP_TYPE_COUNT):
+            raise ValueError("tower hitpoint table has the wrong shape")
+        self.register_buffer("card_crown_tower_damage", damage.to(torch.float32), persistent=False)
+        self.register_buffer("card_damage_known", known.to(torch.bool), persistent=False)
+        self.register_buffer("tower_hitpoints_level_11", hitpoints.to(torch.float32), persistent=False)
         if tuple(ability_features.shape) != (config.ability_vocab_size, config.ability_feature_dim):
             raise ValueError("ability feature catalog has the wrong shape")
         self.register_buffer("ability_features", ability_features.to(torch.float32), persistent=False)
@@ -1097,6 +1151,8 @@ class CandidateEncoder(nn.Module):
             "ability_profile_ids", torch.tensor(ability_profile_ids, dtype=torch.long), persistent=False
         )
         self.runtime = nn.Linear(config.candidate_runtime_feature_dim, 128)
+        # V4.2: what one cast takes off the enemy towers, and whether it kills one; zero start.
+        self.tower_features = zero_start(nn.Linear, config.candidate_tower_feature_dim, 128, bias=False)
         input_width = (
             config.token_dim + 2 * config.card_semantic_dim + 32 + 128 + config.group_dim + config.child_dim + 128
         )
@@ -1112,8 +1168,20 @@ class CandidateEncoder(nn.Module):
         group_memory: Tensor,
         child_memory: Tensor,
         profile_memory: Tensor,
+        towers: TowerSetV4 | None = None,
     ) -> tuple[Tensor, Tensor]:
         own = gather_memory(own_card_memory, candidates.own_card_row)
+        runtime = self.runtime(candidates.runtime_features)
+        if towers is not None:
+            runtime = runtime + self.tower_features(
+                candidate_tower_features(
+                    candidates,
+                    towers,
+                    card_crown_tower_damage=self.card_crown_tower_damage,
+                    card_damage_known=self.card_damage_known,
+                    tower_hitpoints_level_11=self.tower_hitpoints_level_11,
+                ).to(candidates.runtime_features.dtype)
+            )
         group = gather_memory(group_memory, candidates.source_group_index)
         child = gather_memory(child_memory, candidates.source_child_index)
         visible = self.card_encoder(
@@ -1135,7 +1203,7 @@ class CandidateEncoder(nn.Module):
                         visible,
                         effective,
                         self.variant(candidates.variant),
-                        self.runtime(candidates.runtime_features),
+                        runtime,
                         group,
                         child,
                         ability,

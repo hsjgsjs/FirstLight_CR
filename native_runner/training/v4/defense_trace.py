@@ -115,18 +115,30 @@ def compact_view(observation: Any) -> dict[str, Any]:
             "kind": tower.tower_kind,
             "pos": _round_pair(tower.position),
             "hp": tower.hitpoints,
+            "max_hp": getattr(tower, "max_hitpoints", None),
             "active": tower.active,
         }
+        if getattr(tower, "tower_troop_id", None) is not None:
+            item["troop"] = tower.tower_troop_id
         if target is not None:
             item["target"] = target
         towers.append(item)
-    return {
+    view = {
         "tick": observation.tick,
         "owner": observation.owner,
+        "phase": getattr(observation, "phase", None),
         "events": events,
         "entities": entities,
         "towers": towers,
     }
+    # The acting owner's own hand and elixir, for behavior statistics (labels only, never model inputs).
+    player = next((item for item in getattr(observation, "players", ()) if item.owner == observation.owner), None)
+    if player is not None:
+        view["hand"] = list(getattr(player, "hand", ()))
+        elixir = getattr(player, "elixir_exact", None)
+        if elixir is not None:
+            view["elixir"] = round(float(elixir), 2)
+    return view
 
 
 class TraceWriter:

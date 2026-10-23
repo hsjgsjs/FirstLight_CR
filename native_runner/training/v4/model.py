@@ -33,6 +33,8 @@ from .components import (
 from .mechanics import EffectSemanticCatalogV1, MechanicProfileCatalogV1
 from .config import ModelConfigV4, UNIVERSAL_ACTION_VERSION, UNIVERSAL_OBSERVATION_VERSION, UNIVERSAL_POLICY_VERSION
 from .decoding import ShadowCandidateLegality
+from .structural_features import tower_planes
+from .structural_tables import StructuralTablesV1
 from .tensors import (
     ActionEvaluationComponentsV4,
     ActionSequenceV4,
@@ -94,6 +96,7 @@ class UniversalCardPolicyV4(nn.Module):
         effect_catalog: EffectSemanticCatalogV1,
         mechanic_profile_catalog: MechanicProfileCatalogV1,
         config: ModelConfigV4 | None = None,
+        structural_tables: StructuralTablesV1 | None = None,
     ) -> None:
         super().__init__()
         self.config = config or ModelConfigV4()
@@ -131,10 +134,14 @@ class UniversalCardPolicyV4(nn.Module):
         if entity_archetype_catalog.vocab_size > config.child_archetype_count:
             raise ValueError("EntityArchetypeCatalog exceeds ModelConfigV4 capacity")
 
+        # Spell damage on crown towers, spell reach and tower hitpoints, from the compiled game data.
+        tables = structural_tables or StructuralTablesV1.for_card_ids(catalog.raw_card_ids)
         self.effect_encoder = EffectSemanticEncoder(config, effect_catalog)
         self.mechanic_profile_encoder = MechanicProfileEncoder(config, mechanic_profile_catalog)
         self.active_effect_encoder = ActiveEffectEncoder(config)
-        self.card_encoder = GlobalCardEncoder(config, catalog, mechanic_profile_catalog)
+        self.card_encoder = GlobalCardEncoder(
+            config, catalog, mechanic_profile_catalog, spell_targets=tables.card_spell_targets
+        )
         self.child_encoder = LocalChildSetEncoder(config, self.card_encoder, mechanic_profile_catalog)
         self.group_encoder = BattleGroupEncoder(config, self.card_encoder)
         self.tower_encoder = TowerEncoder(config, mechanic_profile_catalog)
@@ -150,6 +157,7 @@ class UniversalCardPolicyV4(nn.Module):
             self.card_encoder,
             ability_features=ability_catalog.feature_tensor(config),
             mechanic_catalog=mechanic_profile_catalog,
+            tables=tables,
         )
 
         core_input_width = (
@@ -418,6 +426,7 @@ class UniversalCardPolicyV4(nn.Module):
             batch.groups.child_radius,
             batch.groups.child_mask,
             self.recent_action_encoder.planes(batch.recent_actions, dtype=batch.explicit_spatial_planes.dtype),
+            tower_planes(batch.towers, self.config),
         )
         scalar_summary = self.scalar_encoder(batch.match_scalars)
         event_summary = self.event_encoder(
@@ -431,6 +440,7 @@ class UniversalCardPolicyV4(nn.Module):
             group_memory=group_memory,
             child_memory=child_memory,
             profile_memory=profile_memory,
+            towers=batch.towers,
         )
         return EncodedObservationV4(
             scene_state=scene_state,

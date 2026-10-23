@@ -90,6 +90,8 @@ python -m native_runner.training.v4.build_ppo_deck_pool --dataset-root datasets 
 
 结果是 7,089 套牌组，其中 20 套是重点卡组。
 
+只换重点卡组时不用重新扫描录像：`--from-pool 原池.json --focus-decks 新名单.json --output 新池.json` 保留原池的卡组和使用次数，只改重点标记。新池给某个运行用时，在启动命令行写 `CR_PPO_DECK_POOL=新池.json`，`lab_ppo.sh` 会记进该运行的 `launch-env`，`.env` 和循环赛不受影响（见[架构增强计划](architecture_enhancement_plan_zh.md)第 8 节）。
+
 ## 3. 启动训练
 
 ### 一键启动（推荐）
