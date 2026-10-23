@@ -1,6 +1,6 @@
 # 架构增强计划：把公开信息直接算给模型
 
-记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节（含两次训练检查、新层学习率、离线预训练新层和以后加新输入的做法）；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
+记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节（含两次训练检查、新层学习率、离线预训练新层、进展记录与交接和以后加新输入的做法）；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
 
 ## 1. 出发点
 
@@ -426,6 +426,50 @@ bash native_runner/training/v4/lab_ppo.sh watch spar16-v42p
 | 验证损失几乎不降（0.2% 以内），新层很小 | 人类录像里这些输入没多少用 | 不用新层也行；回到 bchist final 继续，或重新考虑输入设计 |
 
 接上 PPO 后，和 K=30 的同期（第 1–21 次更新）对比 `trend`：对固定对手胜率不低于 57%，浪费圣水和首牌时间不变坏，就说明这条路对了。可选：PPO 之前先用循环赛比较预训练结果和它的清零副本（`--steps 0 --reset-new-parameters` 生成）。
+
+### 进展记录与交接（10-23 晚）
+
+**已完成（都已合并到 main）**
+
+| PR | 内容 |
+|---|---|
+| #90 | 新层自动识别（`zero_start`）、按年龄衰减的新层学习率倍数、版本历史表 |
+| #91 | `pretrain_new_parameters.py`：冻结其余参数、只用人类录像训练新层，按验证集保留最好的一步 |
+| #92 | 录像分片缓存与多线程预读（`--cache-gb`、`--load-workers`）、进度输出、`torchrun` 多卡 |
+| #93 | 一步里的录像并排成一批回放（之前逐场、批大小 1，GPU 空等）；梯度与 PPO 里的人类数据那一步一致，有测试对照 |
+
+**`spar16-v42` 的状态**
+
+- K=30 阶段：从 `train-20261023-151001/checkpoints/update-00000014.pt` 热启动，跑了 4 个阶段（17:40、19:20、20:00、21:50 开始），共 21 次更新，最后一个阶段 `train-20261023-215001`，最新检查点 `update-00000021.pt`。已停止，检查点保留作对比。
+- **4 小时里自己重启了 3 次，原因还没查**。每次丢 10–15 分钟和一轮未完成的更新。下次跑 PPO 前先看：
+
+  ```bash
+  grep -E "FAILED|exited with status|training to update|saved guest" runs/spar16-v42/logs/supervisor.log | tail -n 12
+  grep -nE "Traceback|Error|exitcode|Killed|out of memory" runs/spar16-v42/logs/trainer.log | tail -n 20
+  crontab -l | grep lab_ppo
+  ```
+
+- 回退点：`runs/spar16-v42/train-20261023-151001/checkpoints/update-00000014.pt`（K=30 之前，新层几乎为 0）。
+
+**正在跑：新层离线预训练（10-23 夜）**
+
+- 命令要点：两张卡（`torchrun --nproc-per-node 2`），`--reset-new-parameters --records 8 --cache-gb 32 --steps 2000 --eval-every 100`，起点 update-14，输出 `runs/keep/v42-pretrained.pt`，日志 `runs/keep/v42-pretrained.log` 和 `runs/keep/v42-pretrained.jsonl`。
+- 速度：拼批之前两卡各 4 场约 30 秒一步；拼批之后的速度看日志里的 `s/step`。
+- 醒来后看结果：
+
+  ```bash
+  tail -3 runs/keep/v42-pretrained.log
+  grep -E "^step +[0-9]+ .*validation" runs/keep/v42-pretrained.log
+  ```
+
+  最后一行 `saved ... kept step N, validation loss A -> B` 表示跑完。按上面"怎么判断"表决定。
+
+**下一步**
+
+1. 预训练有效：按"服务器上的步骤"第 5 步开 `spar16-v42p`（K=1，从 `v42-pretrained.pt` 热启动）。新终端里 `MANIFEST`、`T`、`N` 要重新用第 2 步那段 python 算。
+2. `spar16-v42p` 跑到约 20 次更新，对比 K=30 同期的 `trend`（K=30：对固定对手 57% → 54–55%，浪费圣水中间一段到过 6.2）。
+3. 可选：循环赛比较预训练结果和它的清零副本，确认新层在实战里有用。
+4. 60–100 次更新后做正式评估（同样卡组池与 bchist final 循环赛、`behavior_stats --trace`），之后才考虑第二批输入。
 
 ### 以后加新输入的做法（第二批起）
 
