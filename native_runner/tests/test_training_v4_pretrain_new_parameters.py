@@ -15,7 +15,13 @@ from native_runner.training.v4.build_expert_manifest import build_manifests
 from native_runner.training.v4.checkpoint import load_actor_critic_checkpoint, save_actor_critic_checkpoint
 from native_runner.training.v4.components import zero_start_parameters
 from native_runner.training.v4.ppo_expert_bc import load_expert_sampler_v4
-from native_runner.training.v4.pretrain_new_parameters import _share_shard_cache, main, pretrain_new_parameters
+from native_runner.training.v4.pretrain_new_parameters import (
+    _share_shard_cache,
+    batch_sequences,
+    imitation_step,
+    main,
+    pretrain_new_parameters,
+)
 
 
 def _rich(batch):
@@ -267,3 +273,32 @@ def test_two_processes_train_together_and_only_the_first_saves(tmp_path, manifes
             torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
     log = [json.loads(line) for line in output.with_suffix(".jsonl").read_text().splitlines()]
     assert [row["step"] for row in log if row["event"] == "eval"] == [0, 1, 2]  # one log, written by rank 0
+
+
+def test_games_side_by_side_train_exactly_like_the_ppo_imitation_step(manifests) -> None:
+    train = load_expert_sampler_v4(manifests / "train.json", seed=3, records_per_rank=3, window_steps=4)
+    items = train.sample(5, 0, 1)
+    assert len({item.sequence.time_steps for item in items}) > 1  # lanes of different lengths get padded
+    batch = batch_sequences([item.sequence for item in items])
+    assert batch.batch_size == 3 and batch.time_steps == max(item.sequence.time_steps for item in items)
+    torch.manual_seed(7)
+    reference = _model()
+    with torch.no_grad():
+        for _name, parameter in zero_start_parameters(reference):
+            parameter.normal_(std=0.05)
+    batched = _model()
+    batched.load_state_dict(reference.state_dict())
+    # Plain SGD moves each parameter in proportion to its gradient, so this compares the gradients themselves.
+    reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.1)
+    batched_optimizer = torch.optim.SGD(batched.parameters(), lr=0.1)
+    expected = ppo_expert_bc.distributed_expert_bc_update_v4(
+        reference, reference_optimizer, train, update_step=5, sequence_chunk_steps=4, coefficient=1.0, max_grad_norm=1.0
+    )
+    actual = imitation_step(
+        batched, batched_optimizer, items, chunk_steps=4, max_grad_norm=1.0, gate_act_weight=train.gate_act_weight
+    )
+    for name in ("bc_loss", "bc_gradient_norm", *(f"bc_{head}_loss" for head in ppo_expert_bc.HEADS)):
+        assert actual[name] == pytest.approx(expected[name], rel=1e-5, abs=1e-7), name
+    expected_parameters = dict(reference.named_parameters())
+    for name, parameter in batched.named_parameters():
+        torch.testing.assert_close(parameter, expected_parameters[name], rtol=1e-5, atol=1e-6)
