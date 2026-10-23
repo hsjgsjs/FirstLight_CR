@@ -1,0 +1,179 @@
+"""Offline imitation of the new (zero-start) layers only: everything else frozen, PPO state carried through."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+
+import pytest
+import torch
+
+from native_runner.tests.test_training_v4_general_expert_bc import _dataset
+from native_runner.tests.test_training_v4_structural_inputs import CHILD, _alive_towers, _model
+from native_runner.training.v4 import factory
+from native_runner.training.v4.build_expert_manifest import build_manifests
+from native_runner.training.v4.checkpoint import load_actor_critic_checkpoint, save_actor_critic_checkpoint
+from native_runner.training.v4.components import zero_start_parameters
+from native_runner.training.v4.ppo_expert_bc import load_expert_sampler_v4
+from native_runner.training.v4.pretrain_new_parameters import main, pretrain_new_parameters
+
+
+def _rich(batch):
+    """Standing towers and a projectile in flight, so the new tower and timing paths get gradients."""
+
+    features = batch.groups.child_features.clone()
+    features[:, 0, CHILD["projectile_in_flight"]] = 1.0
+    features[:, 0, CHILD["projectile_target_position_known"]] = 1.0
+    features[:, 0, CHILD["projectile_target_y_over_board_height"]] = 0.6
+    features[:, 0, CHILD["velocity_y_over_10"]] = 0.02
+    return replace(
+        batch,
+        towers=_alive_towers(batch, [1.0, 0.8, 1.0, 1.0, 0.25, 0.6]),
+        groups=replace(batch.groups, child_features=features),
+    )
+
+
+@pytest.fixture
+def manifests(tmp_path, monkeypatch):
+    from native_runner.tests import test_training_v4_general_expert_bc as general
+
+    plain = general._batch
+    monkeypatch.setattr(general, "_batch", lambda batch_size=2: _rich(plain(batch_size)))
+    root, selection = _dataset(tmp_path)
+    output = tmp_path / "manifests"
+    build_manifests(selection, [root], output, validation_percent=25)
+    return output
+
+
+def _samplers(manifests):
+    train = load_expert_sampler_v4(manifests / "train.json", seed=3, records_per_rank=1, window_steps=4)
+    validation = load_expert_sampler_v4(
+        manifests / "validation.json", seed=5, records_per_rank=1, window_steps=4, split="validation"
+    )
+    return train, validation
+
+
+def test_validation_games_load_only_when_asked_for(manifests) -> None:
+    train, validation = _samplers(manifests)
+    assert {row["replay_tag"] for row in train.rows}.isdisjoint(row["replay_tag"] for row in validation.rows)
+    with pytest.raises(ValueError, match="must not be used for training"):
+        load_expert_sampler_v4(manifests / "validation.json", seed=1)
+    with pytest.raises(ValueError, match="expected a validation"):
+        load_expert_sampler_v4(manifests / "train.json", seed=1, split="validation")
+    with pytest.raises(ValueError, match="train or validation"):
+        load_expert_sampler_v4(manifests / "train.json", seed=1, split="test")
+
+
+def test_only_new_layers_learn_and_the_best_validation_step_is_kept(manifests) -> None:
+    torch.manual_seed(2)
+    model = _model()
+    new_names = {name for name, _parameter in zero_start_parameters(model)}
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    train, validation = _samplers(manifests)
+    result = pretrain_new_parameters(
+        model,
+        train,
+        steps=4,
+        learning_rate=1e-2,
+        chunk_steps=4,
+        validation=validation,
+        validation_batches=1,
+        eval_every=1,
+    )
+    rows = result["rows"]
+    assert [row["step"] for row in rows] == [0, 1, 2, 3, 4]
+    losses = [row["validation_total"] for row in rows]
+    assert result["chosen_step"] == losses.index(min(losses)) > 0
+    assert min(losses) < losses[0]
+    assert all("train_loss" in row for row in rows[1:])
+    for name, parameter in model.named_parameters():
+        if name in new_names:
+            continue
+        torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
+    moved = {name for name, parameter in zero_start_parameters(model) if bool(parameter.any())}
+    assert {"spatial_encoder.tower_input.weight", "child_encoder.timing.weight"} <= moved
+    # The kept layers are the chosen step's, and every parameter is trainable again for later use.
+    rms = {
+        key.removeprefix("rms/"): value for key, value in rows[result["chosen_step"]].items() if key.startswith("rms/")
+    }
+    assert rms["spatial_encoder.tower_input"] == pytest.approx(
+        float(dict(zero_start_parameters(model))["spatial_encoder.tower_input.weight"].square().mean().sqrt())
+    )
+    assert all(parameter.requires_grad for parameter in model.parameters())
+
+
+def _source_checkpoint(path):
+    torch.manual_seed(4)
+    model = _model()
+    model.set_ppo_gate_temperature(0.32)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5, eps=1e-5, weight_decay=0.0)
+    sum(parameter.sum() for parameter in model.parameters()).backward()
+    optimizer.step()
+    ages = {name: 21 for name, _parameter in zero_start_parameters(model)}
+    save_actor_critic_checkpoint(
+        path,
+        model,
+        optimizer=optimizer,
+        update_step=14,
+        training_stage="ppo",
+        gamma_per_decision=0.99,
+        parameter_ages=ages,
+        extra={"resume_contract": {"kept": True}},
+    )
+    return model, optimizer
+
+
+def test_command_writes_a_warm_start_that_differs_only_in_the_new_layers(tmp_path, manifests, monkeypatch) -> None:
+    monkeypatch.setattr(factory, "build_production_model_v4", lambda device=None: _model().to(device))
+    source = tmp_path / "update-00000014.pt"
+    source_model, source_optimizer = _source_checkpoint(source)
+    output = tmp_path / "pretrained.pt"
+    common = [
+        "--manifest",
+        str(manifests / "train.json"),
+        "--records",
+        "1",
+        "--window-steps",
+        "4",
+        "--chunk-steps",
+        "4",
+        "--validation-batches",
+        "1",
+        "--device",
+        "cpu",
+    ]
+    main(
+        [str(source), "--output", str(output), "--steps", "3", "--eval-every", "1", "--learning-rate", "1e-2", *common]
+    )
+
+    model = _model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5, eps=1e-5, weight_decay=0.0)
+    payload = load_actor_critic_checkpoint(output, model, optimizer=optimizer)
+    assert payload["update_step"] == 14 and payload["training_stage"] == "ppo"
+    assert model.ppo_gate_temperature == pytest.approx(0.32)
+    assert payload["parameter_ages"] == {name: 21 for name, _parameter in zero_start_parameters(model)}
+    summary = payload["extra"]["new_parameter_pretraining"]
+    assert payload["extra"]["resume_contract"] == {"kept": True}
+    assert summary["chosen_step"] > 0 and summary["validation_loss_chosen"] < summary["validation_loss_start"]
+    assert summary["validation_manifest"].endswith("validation.json")
+    new_names = {name for name, _parameter in zero_start_parameters(model)}
+    expected = dict(source_model.named_parameters())
+    for name, parameter in model.named_parameters():
+        if name not in new_names:
+            torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
+    # The PPO optimizer state is the source's, untouched by the imitation steps.
+    saved_state = optimizer.state_dict()["state"]
+    for index, state in source_optimizer.state_dict()["state"].items():
+        torch.testing.assert_close(saved_state[index]["exp_avg"], state["exp_avg"], rtol=0, atol=0)
+    log = [json.loads(line) for line in output.with_suffix(".jsonl").read_text().splitlines()]
+    assert [row["step"] for row in log if row["event"] == "eval"] == [0, 1, 2, 3]
+    assert log[-1]["event"] == "saved"
+
+    with pytest.raises(SystemExit):
+        main([str(source), "--output", str(output), "--steps", "0", *common])  # refuses to overwrite
+
+    ablation = tmp_path / "zeroed.pt"
+    main([str(output), "--output", str(ablation), "--steps", "0", "--reset-new-parameters", *common])
+    payload = load_actor_critic_checkpoint(ablation, model)
+    assert not any(bool(parameter.any()) for _name, parameter in zero_start_parameters(model))
+    assert set(payload["parameter_ages"].values()) == {0}

@@ -343,3 +343,4 @@ PPO 每次的移动里只有约 1/5 是稳定方向（`snr` 约 0.05），人类
 | `--no-score-model-delay-offset` | 不把延迟头计入 PPO 比率（备用） |
 | `--history-opponent-percent P` | 一部分对局对手换成本运行自己过去的快照，固定对手份额不变；`trend` 的 `vs past` 列和 `status` 的「own past snapshots」一行显示对它们的胜率 |
 | `--new-parameter-lr-scale K`、`--new-parameter-lr-decay-updates N` | `zero_start` 新层的学习率放大到 K 倍，再按各层自己的训练年龄在 N 次更新内降回 1 倍，其他参数不变；`status` 末尾的新层表显示大小、年龄和倍数，见[架构增强计划](architecture_enhancement_plan_zh.md)第 11 节 |
+| `pretrain_new_parameters.py` | 冻结其余参数，只用人类录像训练 `zero_start` 新层，按验证集保留最好的一步，输出可直接热启动 PPO；`--steps 0 --reset-new-parameters` 生成新层清零的对照副本，见[架构增强计划](architecture_enhancement_plan_zh.md)第 11 节 |

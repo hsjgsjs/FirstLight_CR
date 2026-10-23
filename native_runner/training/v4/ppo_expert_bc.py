@@ -286,15 +286,20 @@ class HogExpertSamplerV4:
     gate_act_weight = 8.0
     quality = staticmethod(cached_sequence_quality)
 
-    def __init__(self, manifest_path, *, seed, records_per_rank=2, window_steps=128):
+    def __init__(self, manifest_path, *, seed, records_per_rank=2, window_steps=128, split="train"):
+        """``split="validation"`` reads held-out games for measurement only; training always uses "train"."""
         self.path = Path(manifest_path).resolve()
         raw = self.path.read_bytes()
         payload = json.loads(raw)
         schema = "v4-general-expert-selection.v1" if self.general else "v4-hog-expert-selection.v1"
         if payload.get("schema") != schema or payload.get("discard_tail_ticks") != 200:
             raise ValueError("unsupported or unsafe expert manifest")
-        if self.general and payload.get("split") != "train":
-            raise ValueError("validation expert manifest must not be used for training")
+        if split not in ("train", "validation"):
+            raise ValueError("expert split must be train or validation")
+        if self.general and payload.get("split") != split:
+            if split == "train":
+                raise ValueError("validation expert manifest must not be used for training")
+            raise ValueError(f"expected a {split} expert manifest, got {payload.get('split')!r}")
         if payload.get("cache_labels_verified") is not True:
             raise ValueError("BC requires a manifest audited against actual cached labels")
         self.rows = payload["rows"]
@@ -327,7 +332,7 @@ class HogExpertSamplerV4:
             raise ValueError("invalid expert quality selection")
         if self.general:
             if any(
-                r.get("source_split") != "train" or r.get("cached_micro_actions", 0) <= 0
+                r.get("source_split") != split or r.get("cached_micro_actions", 0) <= 0
                 or r.get("cached_gate_frames", 0) <= 0 or not r.get("cached_action_frame_indices")
                 or not r.get("cached_episode_start") or not r.get("cached_natural_time")
                 for r in self.rows
