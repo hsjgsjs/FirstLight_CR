@@ -11,23 +11,21 @@ import torch
 from native_runner.competitive_data import load_competitive_data
 from native_runner.tests.test_training_v4_model import _ability_catalog, _batch, _catalog
 from native_runner.training.v4 import components
+from native_runner.training.v4.components import zero_start_parameters
 from native_runner.training.v4 import model as model_module
 from native_runner.training.v4.catalog import EntityArchetypeCatalogV1
 from native_runner.training.v4.checkpoint import (
     checkpoint_contract,
-    is_structural_parameter,
     load_actor_critic_checkpoint,
     recent_action_checkpoint_contract,
     save_actor_critic_checkpoint,
+    zero_start_parameter_names,
 )
 from native_runner.training.v4.config import CHILD_FEATURE_NAMES, ModelConfigV4
 from native_runner.training.v4.mechanics import EffectSemanticCatalogV1, MechanicProfileCatalogV1
 from native_runner.training.v4.model import UniversalCardPolicyV4
-from native_runner.training.v4.structural_features import (
-    candidate_tower_features,
-    child_impact_timing,
-    tower_planes,
-)
+from native_runner.training.v4.structural_features import candidate_tower_features, child_impact_timing, tower_planes
+from native_runner.training.v4.new_parameters import NewParameterScheduleV4
 from native_runner.training.v4.structural_tables import (
     StructuralTablesV1,
     compiled_spell_facts,
@@ -235,7 +233,7 @@ def _rich_batch():
 
 
 def _structural_parameters(model: UniversalCardPolicyV4) -> dict[str, torch.Tensor]:
-    return {name: parameter for name, parameter in model.named_parameters() if is_structural_parameter(name)}
+    return dict(zero_start_parameters(model))
 
 
 def test_structural_paths_start_at_zero_and_change_nothing(monkeypatch) -> None:
@@ -269,7 +267,9 @@ def _recent_action_payload(model: UniversalCardPolicyV4, path: Path, *, optimize
     save_actor_critic_checkpoint(path, model, optimizer=optimizer, training_stage="test", gamma_per_decision=0.99)
     payload = torch.load(path, weights_only=False)
     payload["model_state_dict"] = {
-        name: value for name, value in payload["model_state_dict"].items() if not is_structural_parameter(name)
+        name: value
+        for name, value in payload["model_state_dict"].items()
+        if name not in zero_start_parameter_names(model)
     }
     payload["contract"] = recent_action_checkpoint_contract(model)
     torch.save(payload, path)
@@ -281,7 +281,7 @@ def test_v41_checkpoint_upgrade_is_output_identical_and_trainable(tmp_path) -> N
     source = _model().eval()
     with torch.no_grad():
         for name, parameter in source.named_parameters():
-            if not is_structural_parameter(name):
+            if name not in zero_start_parameter_names(source):
                 parameter.add_(0.01 * torch.randn_like(parameter))
     path = tmp_path / "v41.pt"
     _recent_action_payload(source, path)
@@ -311,7 +311,7 @@ def test_v41_checkpoint_upgrade_is_output_identical_and_trainable(tmp_path) -> N
 def test_v41_optimizer_moments_follow_names_and_new_parameters_start_empty(tmp_path) -> None:
     torch.manual_seed(8)
     source = _model()
-    old_names = [name for name, _ in source.named_parameters() if not is_structural_parameter(name)]
+    old_names = [name for name, _ in source.named_parameters() if name not in zero_start_parameter_names(source)]
     parameters = dict(source.named_parameters())
     optimizer = torch.optim.AdamW([parameters[name] for name in old_names], lr=1e-3)
     source(_rich_batch(), source.initial_state(2)).value.sum().backward()
@@ -328,7 +328,7 @@ def test_v41_optimizer_moments_follow_names_and_new_parameters_start_empty(tmp_p
     restored = {names[id(parameter)]: state for parameter, state in target_optimizer.state.items()}
     original = optimizer.state_dict()["state"]
     assert set(restored) == {old_names[index] for index in original}
-    assert not any(is_structural_parameter(name) for name in restored)
+    assert not set(restored) & zero_start_parameter_names(target)
     for index, state in original.items():
         torch.testing.assert_close(restored[old_names[index]]["exp_avg"], state["exp_avg"])
     target(_rich_batch(), target.initial_state(2)).value.sum().backward()
@@ -351,3 +351,109 @@ def test_repository_checkpoints_load_with_zero_structural_paths(relative: str) -
     assert not any(bool(parameter.any()) for parameter in _structural_parameters(model).values())
     fireball = model.catalog.vocab_id(FIREBALL)
     assert model.candidate_encoder.card_crown_tower_damage[fireball] == pytest.approx(172.2, abs=1.0)
+
+
+# --- New-parameter learning-rate schedule ------------------------------------------------------------------
+
+
+def _fixed_gradient_steps(model: UniversalCardPolicyV4, optimizer: torch.optim.Optimizer, steps: int) -> None:
+    generator = torch.Generator().manual_seed(11)
+    directions = [torch.randn(p.shape, generator=generator) for p in model.parameters()]
+    for step in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        loss = sum(((p * d) * (1.0 + step)).sum() + p.square().sum() for p, d in zip(model.parameters(), directions))
+        loss.backward()
+        optimizer.step()
+
+
+def test_new_parameters_are_found_from_zero_start_layers() -> None:
+    model = _model()
+    assert [name for name, _ in zero_start_parameters(model)] == [
+        "card_encoder.spell_targets.weight",
+        "child_encoder.timing.weight",
+        "spatial_encoder.tower_input.weight",
+        "candidate_encoder.tower_features.weight",
+    ]
+    # The shared card encoder's projection is one tensor under every encoder that holds it.
+    names = zero_start_parameter_names(model)
+    assert "candidate_encoder.card_encoder.spell_targets.weight" in names
+    assert {name for name in names if not name.endswith("card_encoder.spell_targets.weight")} == {
+        "child_encoder.timing.weight",
+        "spatial_encoder.tower_input.weight",
+        "candidate_encoder.tower_features.weight",
+    }
+
+
+def test_scale_equals_a_larger_learning_rate_for_new_parameters_only() -> None:
+    torch.manual_seed(5)
+    scaled = _model()
+    reference = _model()
+    reference.load_state_dict(scaled.state_dict())
+    learning_rate = 1e-3
+    scaled_optimizer = torch.optim.AdamW(scaled.parameters(), lr=learning_rate, eps=1e-5, weight_decay=0.0)
+    schedule = NewParameterScheduleV4(scaled, scale=30.0, decay_updates=0)
+    assert len(schedule.attach(scaled_optimizer)) == 2
+    new_ids = {id(p) for _name, p in zero_start_parameters(reference)}
+    reference_optimizer = torch.optim.AdamW(
+        [
+            {"params": [p for p in reference.parameters() if id(p) not in new_ids]},
+            {"params": [p for p in reference.parameters() if id(p) in new_ids], "lr": 30 * learning_rate},
+        ],
+        lr=learning_rate,
+        eps=1e-5,
+        weight_decay=0.0,
+    )
+    _fixed_gradient_steps(scaled, scaled_optimizer, 3)
+    _fixed_gradient_steps(reference, reference_optimizer, 3)
+    expected = dict(reference.named_parameters())
+    new_names = zero_start_parameter_names(scaled)
+    for name, parameter in scaled.named_parameters():
+        if name in new_names:
+            assert parameter.abs().max() > 30 * learning_rate  # moved beyond what the base rate allows
+            torch.testing.assert_close(parameter, expected[name], rtol=1e-5, atol=1e-7)
+        else:
+            torch.testing.assert_close(parameter, expected[name], rtol=0, atol=0)
+    # Optimizer state keeps its single-group layout, so older checkpoints still load.
+    assert len(scaled_optimizer.state_dict()["param_groups"]) == 1
+
+
+def test_scale_fades_with_each_parameter_age_and_ages_travel_with_checkpoints(tmp_path) -> None:
+    model = _model()
+    schedule = NewParameterScheduleV4(
+        model, scale=31.0, decay_updates=10, ages={"spatial_encoder.tower_input.weight": 5}
+    )
+    assert schedule.scale_for("child_encoder.timing.weight") == 31.0
+    assert schedule.scale_for("spatial_encoder.tower_input.weight") == pytest.approx(16.0)
+    for _ in range(5):
+        schedule.advance()
+    assert schedule.scale_for("child_encoder.timing.weight") == pytest.approx(16.0)
+    assert schedule.scale_for("spatial_encoder.tower_input.weight") == 1.0
+    metrics = schedule.metrics()
+    assert metrics["new_rms/spatial_encoder.tower_input"] == 0.0
+    assert metrics["new_age/spatial_encoder.tower_input"] == 10.0
+    assert metrics["new_lr_scale/child_encoder.timing"] == pytest.approx(16.0)
+    assert schedule.contract() == {"scale": 31.0, "decay_updates": 10}
+
+    path = tmp_path / "aged.pt"
+    save_actor_critic_checkpoint(
+        path, model, training_stage="test", gamma_per_decision=0.99, parameter_ages=schedule.state()
+    )
+    restored = NewParameterScheduleV4(
+        _model(), scale=31.0, decay_updates=10, ages=load_actor_critic_checkpoint(path, _model())["parameter_ages"]
+    )
+    assert restored.state() == schedule.state()
+    # Without recorded ages (older checkpoints, imitation training) every new parameter counts as untrained.
+    save_actor_critic_checkpoint(path, model, training_stage="test", gamma_per_decision=0.99)
+    payload = load_actor_critic_checkpoint(path, _model())
+    assert set(NewParameterScheduleV4(_model(), ages=payload.get("parameter_ages")).state().values()) == {0}
+
+
+def test_default_schedule_adds_no_hooks_and_rejects_bad_settings() -> None:
+    model = _model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    schedule = NewParameterScheduleV4(model)
+    assert schedule.attach(optimizer) == () and schedule.contract() is None
+    with pytest.raises(ValueError):
+        NewParameterScheduleV4(model, scale=0.0)
+    with pytest.raises(ValueError):
+        NewParameterScheduleV4(model, scale=2.0, decay_updates=-1)
