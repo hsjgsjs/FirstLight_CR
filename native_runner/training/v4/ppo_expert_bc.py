@@ -8,6 +8,7 @@ windows use ordinary state-carrying TBPTT. No expert returns train the critic.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -380,8 +381,10 @@ class HogExpertSamplerV4:
                 raise ValueError("proactive opening annotation population mismatch")
         self.sha256 = hashlib.sha256(raw).hexdigest()
         self.seed, self.records_per_rank, self.window_steps = int(seed), int(records_per_rank), int(window_steps)
-        self._shard_path = None
-        self._shard = None
+        # Shards kept in memory, oldest first. PPO keeps one; offline pretraining (many records per step)
+        # raises ``cached_shards`` so each shard is read, verified and decompressed only once.
+        self.cached_shards = 1
+        self._shards = OrderedDict()
 
     def contract(self):
         return dict(
@@ -398,6 +401,16 @@ class HogExpertSamplerV4:
             gate_act_weight=8.0,
             delay_neighbor_weight=0.2,
         )
+
+    def _load_shard(self, path):
+        shard = self._shards.pop(path, None)
+        if shard is None:
+            # Free the oldest before loading, so memory never holds more than ``cached_shards``.
+            while self._shards and len(self._shards) >= self.cached_shards:
+                self._shards.popitem(last=False)
+            shard = load_il_cache_shard(path, verify=True)
+        self._shards[path] = shard
+        return shard
 
     def rows_for_update(self, update, rank, world_size):
         if update < 1 or not 0 <= rank < world_size:
@@ -422,11 +435,7 @@ class HogExpertSamplerV4:
     def sample(self, update, rank, world_size):
         items = []
         for i, row in enumerate(self.rows_for_update(update, rank, world_size)):
-            if self._shard_path != row["summary_path"]:
-                self._shard = None
-                self._shard = load_il_cache_shard(row["summary_path"], verify=True)
-                self._shard_path = row["summary_path"]
-            shard = self._shard
+            shard = self._load_shard(row["summary_path"])
             if shard.summary["compressed_sha256"] != row["cache_compressed_sha256"]:
                 raise ValueError("expert cache bytes changed after dataset audit")
             index = int(row["sequence_index"])

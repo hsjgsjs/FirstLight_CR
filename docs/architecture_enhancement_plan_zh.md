@@ -406,7 +406,8 @@ bash native_runner/training/v4/lab_ppo.sh watch spar16-v42p
 ```
 
 - 第 2 步的 `ls` 应该能看到 `train.json` 和 `validation.json`。如果运行用的是另存的清单（例如加了火球注释的），旁边可能没有 `validation.json`，就加 `--validation-manifest <原清单目录>/validation.json`；完全没有验证集时工具会提示，并保留最后一步。
-- 第 3 步每次评估一行，`seconds` 一列可以估算 3000 步要多久。两个运行用同一个实例，所以 PPO 必须先停，GPU 才空得出来。
+- 启动时先打印训练集、验证集各有多少视角、分布在多少个缓存分片、解压后多大，以及内存里最多留几个分片（`--cache-gb`，默认 16）。每读一场录像都要读入、校验、解压它所在的整个分片，分片留在内存里就只读一次；用 `free -g` 看空闲内存，够的话把 `--cache-gb` 调到能放下全部分片。
+- 之后每 10 步一行进度（每步秒数、训练损失、剩余时间），每次评估前提示一次；第 0 步的评估要回放全部验证录像，第一行结果会等一会儿。第 3 步的秒数可以估算 3000 步要多久。两个运行用同一个实例，所以 PPO 必须先停，GPU 才空得出来。
 - 启动后确认 `runs/spar16-v42p/train-*/config.json` 里 `source_checkpoint` 是 `v42-pretrained.pt`，`arguments.new_parameter_lr_scale` 是 1.0。
 
 **怎么判断**

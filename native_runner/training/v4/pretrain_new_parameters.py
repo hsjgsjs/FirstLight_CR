@@ -119,13 +119,15 @@ def pretrain_new_parameters(
     validation_batches: int = 8,
     eval_every: int = 250,
     log: Callable[[Mapping[str, object]], None] = lambda row: None,
+    progress: Callable[[str], None] = lambda text: None,
+    progress_every: int = 10,
 ) -> dict[str, object]:
     """Imitation steps on the new parameters only; keeps the ones with the lowest validation loss.
 
     Without a validation sampler the last step is kept. Returns the evaluation rows and the chosen step.
     """
 
-    if steps < 0 or eval_every <= 0 or validation_batches <= 0 or chunk_steps <= 0:
+    if steps < 0 or min(eval_every, validation_batches, chunk_steps, progress_every) <= 0:
         raise ValueError("steps must be nonnegative, and evaluation and chunk sizes positive")
     if not learning_rate > 0:
         raise ValueError("learning rate must be positive")
@@ -140,6 +142,7 @@ def pretrain_new_parameters(
         row: dict[str, object] = {"event": "eval", "step": step, "seconds": round(time.perf_counter() - started, 1)}
         row.update({f"train_{name}": value for name, value in train.items()})
         if validation is not None:
+            progress(f"step {step}: evaluating on {validation_batches * validation.records_per_rank} held-out games")
             losses = imitation_losses(model, validation, batches=validation_batches, chunk_steps=chunk_steps)
             row.update({f"validation_{name}": value for name, value in losses.items()})
             if best is None or losses["total"] < best[0]:
@@ -152,6 +155,7 @@ def pretrain_new_parameters(
         evaluate(0, {})
         window: dict[str, float] = {}
         window_steps = 0
+        recent_loss, recent_steps, recent_started = 0.0, 0, time.perf_counter()
         for step in range(1, steps + 1):
             metrics = distributed_expert_bc_update_v4(
                 model,
@@ -165,6 +169,15 @@ def pretrain_new_parameters(
             for name in ("loss", *(f"{head}_loss" for head in HEADS), "gradient_norm"):
                 window[name] = window.get(name, 0.0) + metrics[f"bc_{name}"]
             window_steps += 1
+            recent_loss += metrics["bc_loss"]
+            recent_steps += 1
+            if step % progress_every == 0:
+                seconds = (time.perf_counter() - recent_started) / recent_steps
+                progress(
+                    f"step {step}/{steps}: {seconds:.1f} s/step, train loss {recent_loss / recent_steps:.4f}, "
+                    f"about {seconds * (steps - step) / 60:.0f} min left before evaluations"
+                )
+                recent_loss, recent_steps, recent_started = 0.0, 0, time.perf_counter()
             if step % eval_every == 0 or step == steps:
                 evaluate(step, {name: value / window_steps for name, value in window.items()})
                 window, window_steps = {}, 0
@@ -177,6 +190,31 @@ def pretrain_new_parameters(
     finally:
         model.requires_grad_(True)
     return {"chosen_step": chosen_step, "rows": rows}
+
+
+def _share_shard_cache(sampler, validation, *, cache_gb: float) -> None:
+    """Keep as many unpacked shards in memory as ``cache_gb`` holds, shared by training and validation.
+
+    Each record otherwise reads, verifies and unpacks its whole shard again, which is most of the time per step.
+    """
+
+    sizes: dict[str, int] = {}
+    for name, source in (("train", sampler), ("validation", validation)):
+        if source is None:
+            continue
+        paths = {row["summary_path"] for row in source.rows}
+        for path in paths - sizes.keys():
+            sizes[path] = int(json.loads(Path(path).read_text(encoding="utf-8"))["container_bytes"])
+        unpacked = sum(sizes[path] for path in paths) / 1e9
+        print(f"{name}: {len(source.rows)} sides in {len(paths)} shards, {unpacked:.1f} GB unpacked", flush=True)
+    largest = max(sizes.values())
+    count = min(len(sizes), max(1, int(cache_gb * 1e9 // largest)))
+    print(f"keeping up to {count} of {len(sizes)} shards in memory (--cache-gb {cache_gb:g})", flush=True)
+    cache = sampler._shards
+    for source in (sampler, validation):
+        if source is not None:
+            source.cached_shards = count
+            source._shards = cache
 
 
 def _describe(row: Mapping[str, object]) -> str:
@@ -210,6 +248,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--eval-every", type=int, default=250)
     parser.add_argument("--validation-batches", type=int, default=8, help="validation size, in batches of --records")
     parser.add_argument("--reset-new-parameters", action="store_true", help="zero the new layers before training")
+    parser.add_argument(
+        "--cache-gb", type=float, default=16, help="memory for unpacked cache shards, so each is read only once"
+    )
+    parser.add_argument("--progress-every", type=int, default=10, help="print a progress line every N steps")
     parser.add_argument("--seed", type=int, default=1, help="which training windows are drawn")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args(argv)
@@ -250,6 +292,7 @@ def main(argv: list[str] | None = None) -> None:
         )
     else:
         print(f"no validation manifest at {validation_path}; keeping the last step", flush=True)
+    _share_shard_cache(sampler, validation, cache_gb=args.cache_gb)
 
     log_path = args.output.with_suffix(".jsonl")
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -272,6 +315,8 @@ def main(argv: list[str] | None = None) -> None:
         validation_batches=args.validation_batches,
         eval_every=args.eval_every,
         log=log,
+        progress=lambda text: print(text, flush=True),
+        progress_every=args.progress_every,
     )
     rows = result["rows"]
     chosen = next(row for row in rows if row["step"] == result["chosen_step"])
