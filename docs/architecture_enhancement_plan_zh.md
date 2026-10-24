@@ -399,6 +399,8 @@ CUDA_VISIBLE_DEVICES=0,1 setsid nohup torchrun --standalone --nproc-per-node 2 \
   --reset-new-parameters --records 8 --cache-gb 32 --steps 1000 --eval-every 100 \
   --output runs/keep/v42-pretrained.pt > runs/keep/v42-pretrained.log 2>&1 < /dev/null &
 # 确认已脱离终端：ps -o pid,sid,tty,cmd -C torchrun 里 TTY 应为 ?
+# 中途停了（断线、重启、误杀）：同一条命令末尾加 --resume，日志改成 >> 追加，从最近一次评估接着跑，最多丢 --eval-every 步。
+# 进度存在 runs/keep/v42-pretrained.pt.progress.pt，跑完自动删除；接着跑时训练用的录像和不停的那次完全一样。
 
 # 5. 新运行 spar16-v42p：从预训练结果热启动，新层不再放大学习率（K=1）
 mkdir -p runs/spar16-v42p/logs
@@ -457,7 +459,7 @@ bash native_runner/training/v4/lab_ppo.sh watch spar16-v42p
 
 - 10-24 00:32 启动，00:37 SSH 断开时被停（日志末尾 `got signal: 1`，即 SIGHUP）。原因是 `nohup` 挡不住：torchrun 自己接管 SIGHUP 并停掉所有进程。只跑完了第 0 步评估，没有输出文件。
 - 第 0 步验证损失（新层为 0，128 场）：5.9148（gate 0.1447、candidate 0.9686、target 3.1873、delay 1.6027、continue_action 0.0115）。之后各步和它比。
-- 重跑用上面第 4 步的 `setsid` 命令。当时用的是 `--cache-gb 128`（每进程，两进程合计约 256 GB，装下 233/2498 个分片，预读 90 秒）。
+- 重跑用上面第 4 步的 `setsid` 命令。工具现在每次评估都存进度，再停可以用 `--resume` 接着跑（PR #96）。当时用的是 `--cache-gb 128`（每进程，两进程合计约 256 GB，装下 233/2498 个分片，预读 90 秒）。
 
 - 命令要点：两张卡（`torchrun --nproc-per-node 2`），`--reset-new-parameters --records 8 --cache-gb 32 --steps 2000 --eval-every 100`，起点 update-14，输出 `runs/keep/v42-pretrained.pt`，日志 `runs/keep/v42-pretrained.log` 和 `runs/keep/v42-pretrained.jsonl`。
 - 速度：拼批之前两卡各 4 场约 30 秒一步；拼批之后的速度看日志里的 `s/step`。

@@ -12,6 +12,12 @@ for checking in an evaluation whether the new layers help.
 
 Several GPUs: ``torchrun --nproc-per-node 2 -m native_runner.training.v4.pretrain_new_parameters ...``. Each GPU
 takes ``--records`` games per step and the gradients are averaged, as in the PPO trainer's imitation step.
+
+Every evaluation saves the progress so far (new layers, their optimizer, the best layers and the log) to
+``<output>.progress.pt``. If the run stops, the same command with ``--resume`` continues from the last evaluation;
+the games drawn depend only on the seed and the step, so it trains on exactly what an uninterrupted run would.
+Under torchrun, start it with ``setsid``: torchrun handles SIGHUP itself, so ``nohup`` alone does not survive
+an SSH disconnect.
 """
 
 from __future__ import annotations
@@ -256,10 +262,13 @@ def pretrain_new_parameters(
     log: Callable[[Mapping[str, object]], None] = lambda row: None,
     progress: Callable[[str], None] = lambda text: None,
     progress_every: int = 10,
+    resume: Mapping[str, object] | None = None,
+    save_progress: Callable[[dict[str, object]], None] = lambda state: None,
 ) -> dict[str, object]:
     """Imitation steps on the new parameters only; keeps the ones with the lowest validation loss.
 
     Without a validation sampler the last step is kept. Returns the evaluation rows and the chosen step.
+    After each evaluation ``save_progress`` gets the state from which ``resume`` continues at the next step.
     """
 
     if steps < 0 or min(eval_every, validation_batches, chunk_steps, progress_every) <= 0:
@@ -271,6 +280,41 @@ def pretrain_new_parameters(
     started = time.perf_counter()
     rows: list[dict[str, object]] = []
     best: tuple[float, int, dict[str, torch.Tensor]] | None = None
+    first_step = 1
+    if resume is not None:
+        first_step = int(resume["step"]) + 1
+        if first_step > steps + 1:
+            raise ValueError(f"the saved progress is at step {first_step - 1}, past --steps {steps}")
+        device = new[0][1].device
+        with torch.no_grad():
+            for name, parameter in new:
+                parameter.copy_(resume["parameters"][name])
+        optimizer.load_state_dict(resume["optimizer"])
+        saved_best = resume["best"]
+        if saved_best is not None:
+            best = (
+                float(saved_best["loss"]),
+                int(saved_best["step"]),
+                {name: value.to(device) for name, value in saved_best["parameters"].items()},
+            )
+        rows = [dict(row) for row in resume["rows"]]
+        started -= float(resume["seconds"])
+
+    def snapshot(step: int) -> dict[str, object]:
+        return {
+            "step": step,
+            "seconds": time.perf_counter() - started,
+            "parameters": {name: parameter.detach().cpu().clone() for name, parameter in new},
+            "optimizer": optimizer.state_dict(),
+            "best": None
+            if best is None
+            else {
+                "loss": best[0],
+                "step": best[1],
+                "parameters": {name: value.cpu() for name, value in best[2].items()},
+            },
+            "rows": [dict(row) for row in rows],
+        }
 
     def evaluate(step: int, train: Mapping[str, float]) -> None:
         nonlocal best
@@ -286,13 +330,17 @@ def pretrain_new_parameters(
         row.update({f"rms/{name}": value for name, value in new_parameter_rms(model).items()})
         rows.append(row)
         log(row)
+        save_progress(snapshot(step))
 
     try:
-        evaluate(0, {})
+        if resume is None:
+            evaluate(0, {})
+        else:
+            progress(f"resuming after step {first_step - 1}")
         window: dict[str, float] = {}
         window_steps = 0
         recent_loss, recent_steps, recent_started = 0.0, 0, time.perf_counter()
-        for step in range(1, steps + 1):
+        for step in range(first_step, steps + 1):
             metrics = imitation_step(
                 model,
                 optimizer,
@@ -395,6 +443,24 @@ def _describe(row: Mapping[str, object]) -> str:
     return "  ".join(parts)
 
 
+def _progress_path(output: Path) -> Path:
+    return output.with_name(output.name + ".progress.pt")
+
+
+# Settings a resumed run must share with the stopped one; --steps may grow, and the rest change no result.
+RESUME_SETTINGS = (
+    "manifest",
+    "records",
+    "window_steps",
+    "chunk_steps",
+    "learning_rate",
+    "max_grad_norm",
+    "validation_batches",
+    "reset_new_parameters",
+    "seed",
+)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("checkpoint", type=Path, help="PPO checkpoint to start from")
@@ -420,10 +486,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--load-workers", type=int, default=8, help="threads reading and unpacking shards")
     parser.add_argument("--progress-every", type=int, default=10, help="print a progress line every N steps")
     parser.add_argument("--seed", type=int, default=1, help="which training windows are drawn")
+    parser.add_argument(
+        "--resume", action="store_true", help="continue a stopped run from <output>.progress.pt (same command)"
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error(f"{args.output} already exists; pick another --output")
+    progress_path = _progress_path(args.output)
+    if args.resume and not progress_path.is_file():
+        parser.error(f"--resume: no saved progress at {progress_path}")
+    if not args.resume and progress_path.exists():
+        parser.error(f"{progress_path} holds a stopped run: add --resume to continue it, or delete it to start over")
     if args.output.resolve() == args.checkpoint.resolve():
         parser.error("--output must differ from the source checkpoint")
     validation_path = args.validation_manifest or args.manifest.parent / "validation.json"
@@ -496,10 +570,40 @@ def _run(args: argparse.Namespace, validation_path: Path, device: torch.device, 
         say=say,
     )
 
+    settings = {name: str(getattr(args, name)) for name in RESUME_SETTINGS}
+    settings.update(
+        manifest=str(args.manifest.resolve()),
+        source_checkpoint_id=str(payload["checkpoint_id"]),
+        validation_manifest=None if validation is None else str(validation_path.resolve()),
+        world_size=str(world_size),
+    )
+    progress_path = _progress_path(args.output)
+    resume = None
+    if args.resume:
+        resume = torch.load(progress_path, map_location="cpu", weights_only=False)
+        changed = sorted(
+            name
+            for name in settings.keys() | resume["settings"].keys()
+            if settings.get(name) != resume["settings"].get(name)
+        )
+        if changed:
+            raise SystemExit(f"--resume: these settings differ from the stopped run: {', '.join(changed)}")
+
     log_path = args.output.with_suffix(".jsonl")
     if lead:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         log_path.unlink(missing_ok=True)
+        # A resumed log starts from the saved rows, so it never holds a row twice.
+        for row in [] if resume is None else resume["rows"]:
+            with log_path.open("a", encoding="utf-8") as destination:
+                destination.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def save_progress(state: dict[str, object]) -> None:
+        if not lead:
+            return
+        partial = progress_path.with_name(progress_path.name + ".partial")
+        torch.save({**state, "settings": settings}, partial)
+        os.replace(partial, progress_path)
 
     def log(row: Mapping[str, object]) -> None:
         if not lead:
@@ -522,6 +626,8 @@ def _run(args: argparse.Namespace, validation_path: Path, device: torch.device, 
         log=log,
         progress=say,
         progress_every=args.progress_every,
+        resume=resume,
+        save_progress=save_progress,
     )
     if not lead:
         return
@@ -557,6 +663,7 @@ def _run(args: argparse.Namespace, validation_path: Path, device: torch.device, 
     )
     with log_path.open("a", encoding="utf-8") as destination:
         destination.write(json.dumps({"event": "saved", "path": str(args.output), **summary}, sort_keys=True) + "\n")
+    progress_path.unlink(missing_ok=True)
     print(
         f"saved {args.output}: kept step {result['chosen_step']}, validation loss "
         f"{summary['validation_loss_start']} -> {summary['validation_loss_chosen']}",

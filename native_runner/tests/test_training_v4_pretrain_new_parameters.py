@@ -302,3 +302,89 @@ def test_games_side_by_side_train_exactly_like_the_ppo_imitation_step(manifests)
     expected_parameters = dict(reference.named_parameters())
     for name, parameter in batched.named_parameters():
         torch.testing.assert_close(parameter, expected_parameters[name], rtol=1e-5, atol=1e-6)
+
+
+class _Stopped(Exception):
+    pass
+
+
+def test_a_stopped_run_resumes_from_its_last_evaluation_and_ends_where_an_uninterrupted_one_does(
+    tmp_path, manifests, monkeypatch
+) -> None:
+    from native_runner.training.v4 import pretrain_new_parameters as tool
+
+    monkeypatch.setattr(factory, "build_production_model_v4", lambda device=None: _model().to(device))
+    source = tmp_path / "update-00000014.pt"
+    _source_checkpoint(source)
+
+    def command(output, *extra):
+        return [
+            str(source),
+            "--output",
+            str(output),
+            "--manifest",
+            str(manifests / "train.json"),
+            "--steps",
+            "5",
+            "--eval-every",
+            "2",
+            "--learning-rate",
+            "1e-2",
+            "--records",
+            "1",
+            "--window-steps",
+            "4",
+            "--chunk-steps",
+            "4",
+            "--validation-batches",
+            "1",
+            "--device",
+            "cpu",
+            *extra,
+        ]
+
+    straight = tmp_path / "straight.pt"
+    main(command(straight))
+    assert not tool._progress_path(straight).exists()  # removed once the output is written
+
+    # Stop the second run partway through step 3, after the evaluation at step 2 saved its progress.
+    stopped = tmp_path / "stopped.pt"
+    real = tool.imitation_step
+    calls = []
+
+    def stop_at_third(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 3:
+            raise _Stopped
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tool, "imitation_step", stop_at_third)
+    with pytest.raises(_Stopped):
+        main(command(stopped))
+    monkeypatch.setattr(tool, "imitation_step", real)
+    progress = tool._progress_path(stopped)
+    assert torch.load(progress, weights_only=False)["step"] == 2 and not stopped.exists()
+
+    with pytest.raises(SystemExit):
+        main(command(stopped))  # an unfinished run is never overwritten by accident
+    with pytest.raises(SystemExit, match="learning_rate"):
+        main([*command(stopped, "--resume"), "--learning-rate", "1e-3"])
+    with pytest.raises(SystemExit):
+        main(command(tmp_path / "never-started.pt", "--resume"))
+
+    main(command(stopped, "--resume"))
+    assert not progress.exists()
+    log = [json.loads(line) for line in stopped.with_suffix(".jsonl").read_text().splitlines()]
+    assert [row["step"] for row in log if row["event"] == "eval"] == [0, 2, 4, 5]
+    straight_log = [json.loads(line) for line in straight.with_suffix(".jsonl").read_text().splitlines()]
+    for resumed_row, straight_row in zip(log[:-1], straight_log[:-1], strict=True):
+        assert resumed_row["validation_total"] == pytest.approx(straight_row["validation_total"], rel=1e-6)
+    expected, actual = _model(), _model()
+    straight_payload = load_actor_critic_checkpoint(straight, expected)
+    resumed_payload = load_actor_critic_checkpoint(stopped, actual)
+    summary = resumed_payload["extra"]["new_parameter_pretraining"]
+    assert summary["chosen_step"] == straight_payload["extra"]["new_parameter_pretraining"]["chosen_step"]
+    for (name, parameter), (_name, reference) in zip(
+        zero_start_parameters(actual), zero_start_parameters(expected), strict=True
+    ):
+        torch.testing.assert_close(parameter, reference, rtol=1e-5, atol=1e-7, msg=name)
