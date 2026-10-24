@@ -491,6 +491,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args(argv)
+    # An unset shell variable arrives as "", which would otherwise fail deep inside loading as directory ".".
+    for flag, path in (("checkpoint", args.checkpoint), ("--manifest", args.manifest)):
+        if not str(path).strip() or not path.is_file():
+            parser.error(f"{flag}: no file at {str(path)!r} (is the shell variable set?)")
     if args.output.exists():
         parser.error(f"{args.output} already exists; pick another --output")
     progress_path = _progress_path(args.output)
