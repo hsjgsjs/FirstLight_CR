@@ -367,6 +367,10 @@ bash native_runner/training/v4/lab_ppo.sh watch spar16-v42
 **服务器上的步骤**
 
 ```bash
+# 0. 每个新终端先进项目虚拟环境：系统自带的 python/torchrun 是 3.10，导入会报 cannot import name 'StrEnum'
+cd ~/FirstLight_CR && source .venv/bin/activate
+which torchrun   # 应是 ~/FirstLight_CR/.venv/bin/torchrun，不是 /usr/local/bin/torchrun
+
 # 1. 停掉 K=30 的运行（检查点都保留，之后可对比）
 bash native_runner/training/v4/lab_ppo.sh unwatch spar16-v42
 bash native_runner/training/v4/lab_ppo.sh stop spar16-v42
