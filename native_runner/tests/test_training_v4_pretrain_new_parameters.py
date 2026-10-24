@@ -177,6 +177,8 @@ def test_command_writes_a_warm_start_that_differs_only_in_the_new_layers(tmp_pat
 
     with pytest.raises(SystemExit):
         main([str(source), "--output", str(output), "--steps", "0", *common])  # refuses to overwrite
+    with pytest.raises(SystemExit):
+        main(["", "--output", str(tmp_path / "unset.pt"), "--steps", "0", *common])  # an unset $SRC
 
     ablation = tmp_path / "zeroed.pt"
     main([str(output), "--output", str(ablation), "--steps", "0", "--reset-new-parameters", *common])
