@@ -11,18 +11,27 @@
 - 现在加了一个只在出牌时生效的设置，只管选牌和落点；出不出牌（门控）、回合内延迟和是否继续出第二张都不受影响。训练从不设置它，也不存进检查点；PPO 和 BC 给已存动作打分时也不用它。
 - 用法：
   - 实战：`python -m native_runner.live_play run --checkpoint CK --gate-temperature 0.2 --card-tile-temperature 0.1`
-  - 循环赛：配置里加 `"card_tile_temperature": 0.1`（需要 `"sample": true`），所有模型共用。
-  - 同一个模型比两种温度（建议先跑这个确认）：
+  - 循环赛：配置里加 `"card_tile_temperature": 0.1`（需要 `"sample": true`）对所有模型生效；写成 `{"模型名": 0.1}` 只对列出的模型生效，其余不变。
+  - 同一个模型比两种温度（建议先跑这个确认）：用循环赛，同一个检查点起两个名字，只给其中一个设温度。Mac 上和以前跑循环赛一样，连 ADB 转发过来的空闲引擎。仓库根目录下建一份 `round_robin.temperature.json`：
 
-    ```bash
-    python -m native_runner.training.v4.evaluate_parallel --ports 28000-28007 --games 400 \
-      --output runs/card-tile-0.1 --devices cuda:0 \
-      --checkpoint-a CK --checkpoint-b CK --sample \
-      --gate-temperature-a 0.2 --gate-temperature-b 0.2 --card-tile-temperature-a 0.1 \
-      --deck-pool runs/deck-pool.json --battle-level 16 --delay-a-ticks 21 --delay-b-ticks 21
+    ```json
+    {
+      "models": {
+        "u80 低温": "runs/keep/bchist-u80.pt",
+        "u80": "runs/keep/bchist-u80.pt"
+      },
+      "anchor": "u80",
+      "sample": true,
+      "gate_temperature": 0.2,
+      "card_tile_temperature": {"u80 低温": 0.1}
+    }
     ```
 
-    A 方胜率明显高于 50% 再改实战默认值。0.05 和 0.25 也值得各跑一次。
+    ```bash
+    bash round_robin.sh --config round_robin.temperature.json --existing-engine 127.0.0.1:28000 --blocks 0-99
+    ```
+
+    只有一对模型，组号 0–99 正好 400 局（每组 4 局，双方换位、换卡组）；中断后重跑同一命令会跳过已完成的组，报告在 `evaluations/rr-*/report/report.md`。"u80 低温"对 "u80" 明显高于 50% 再改实战默认值。0.05 和 0.25 也值得各跑一次（改配置里的数字即可，不同温度的结果分开存放）。卡组池默认读 `.env` 的 `CR_PPO_DECK_POOL`，没有就加 `--deck-pool 路径`。
 
 ### 人类录像的落地时间和塔血核对
 

@@ -266,11 +266,14 @@ class PolicySessionV4:
         if self.device.type == "cuda" and not self.validate_tensors:
             by_device = _POLICY_CUDA_GRAPHS_V4.setdefault(model, {})
             # Temperatures are read when a graph is captured, so each setting gets its own graph.
-            temperatures = (
-                model.ppo_gate_temperature,
-                model.ppo_action_temperature,
-                model.ppo_continue_temperature,
-                model.inference_card_tile_temperature,
+            temperatures = tuple(
+                getattr(model, name, None)
+                for name in (
+                    "ppo_gate_temperature",
+                    "ppo_action_temperature",
+                    "ppo_continue_temperature",
+                    "inference_card_tile_temperature",
+                )
             )
             device_key = f"{self.device}:{'sample' if self.sample else 'argmax'}:{temperatures}"
             cached = by_device.get(device_key)
