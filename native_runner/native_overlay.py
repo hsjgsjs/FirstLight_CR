@@ -24,7 +24,13 @@ import os
 import time
 from typing import Any, Callable, Iterable, Mapping
 
-from .arena import OccupiedFootprintV1, card_placement_legal_world, native_building_footprint
+from .arena import (
+    OccupiedFootprintV1,
+    PlacementRule,
+    card_placement_legal_world,
+    card_placement_rule,
+    native_building_footprint,
+)
 from .building_placement_profiles import building_placement_profile
 from .card_specs import build_card_catalog
 from .cr_native_env import AbilityAction, COMMAND_CONSUMPTION_STEPS, HandAction, NativeClashEnv, RunnerError
@@ -358,7 +364,7 @@ def nearest_legal_placement(
     footprint = native_building_footprint(spec, form=form) if spec.kind.value == "building" else None
     offset_x, offset_y = footprint.model_subcell_offset if footprint is not None else (0.0, 0.0)
     sign = 1 if owner == 0 else -1
-    own_zone = spec.target_schema.placement_mask_key in {"own_deployment_zone", "own_territory", "own_territory_area"}
+    own_zone = card_placement_rule(spec) in {PlacementRule.OWN_TERRITORY, PlacementRule.OWN_TERRITORY_AREA}
     across_river = own_zone and (
         (owner == 0 and requested_y >= 17 * CELL_UNITS)
         or (owner == 1 and requested_y < 15 * CELL_UNITS)

@@ -155,6 +155,34 @@ def test_full_arena_non_spell_uses_terrain_guard_but_spell_does_not() -> None:
     assert spell_mask.accuracy == PlacementAccuracy.EXACT_COARSE_CENTERS
 
 
+@pytest.mark.parametrize("card_id", [28_000_011, 28_000_015, 28_000_018])
+def test_spells_deployed_like_troops_stay_on_their_own_side(cards: dict[int, Any], card_id: int) -> None:
+    # Log, Barbarian Barrel and Royal Delivery lack CanDeployOnEnemySide, so the game keeps them on the
+    # caster's side even though the compiled CardSpec says full_arena.
+    spec = cards[card_id]
+    assert spec.target_schema.placement_mask_key == "full_arena"
+    assert spec.attributes.get("CanDeployOnEnemySide") is not True
+    for owner, enemy_rows in ((0, range(17, GRID_HEIGHT)), (1, range(0, 15))):
+        mask = card_placement_mask(spec, owner, ruleset_id=RULESET_ID)
+        assert mask.rule in {PlacementRule.OWN_TERRITORY, PlacementRule.OWN_TERRITORY_AREA}
+        assert not any(mask.rows[y][x] for y in enemy_rows for x in range(GRID_WIDTH))
+    # Straight onto an enemy princess tower is refused; the bridge is accepted.
+    assert not card_placement_legal_world(spec, 0, (3_500, 25_500))
+    assert card_placement_legal_world(spec, 0, (3_500, 16_500))
+    # The pocket opens after a princess tower falls.
+    pocket = card_placement_mask(spec, 0, ruleset_id=RULESET_ID, destroyed_enemy_princess_lanes=("left",))
+    assert pocket.rows[20][3] and not pocket.rows[20][14]
+
+
+def test_rolling_spells_may_start_on_the_river(cards: dict[int, Any]) -> None:
+    for card_id in (28_000_011, 28_000_015):
+        mask = card_placement_mask(cards[card_id], 0, ruleset_id=RULESET_ID)
+        assert mask.rule == PlacementRule.OWN_TERRITORY_AREA
+        assert all(mask.rows[y][x] for y in (15, 16) for x in range(GRID_WIDTH))
+    fireball = card_placement_mask(cards[28_000_000], 0, ruleset_id=RULESET_ID)
+    assert fireball.rule == PlacementRule.ANYWHERE
+
+
 def test_spirit_empress_variants_avoid_live_tower_bodies(
     cards: dict[int, Any],
 ) -> None:
