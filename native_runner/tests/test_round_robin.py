@@ -151,6 +151,9 @@ class RoundRobinTests(unittest.TestCase):
             options(card_tile_temperature={"A": 0})
         with self.assertRaisesRegex(ValueError, "sample: true"):
             options(card_tile_temperature=0.1, sample=False)
+        # Unset: sampled play takes the default 0.1, deterministic play ignores it.
+        self.assertEqual(options()["card_tile_temperature"], 0.1)
+        self.assertIsNone(options(sample=False, gate_temperature=None)["card_tile_temperature"])
 
     def test_merge_checks_each_models_card_tile_temperature(self):
         self.identity["gameplay"]["card_tile_temperature"] = {"Update 48": 0.1}
