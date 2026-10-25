@@ -714,7 +714,8 @@ def evaluate(
         if temperature is not None:
             policy.model.set_ppo_gate_temperature(float(temperature))
     for policy, temperature in zip(policies, (card_tile_temperature_a, card_tile_temperature_b), strict=True):
-        policy.model.set_inference_card_tile_temperature(None if temperature is None else float(temperature))
+        if temperature is not None:
+            policy.model.set_inference_card_tile_temperature(float(temperature))
     identity = {
         "games": games,
         "sample": sample,
@@ -723,7 +724,9 @@ def evaluate(
         "min_play_gap_ticks": min_play_gap_ticks,
         "saved_gate_temperatures": saved_gate_temperatures,
         "gate_temperatures": [policy.model.ppo_gate_temperature for policy in policies],
-        "card_tile_temperatures": [policy.model.inference_card_tile_temperature for policy in policies],
+        "card_tile_temperatures": [
+            getattr(policy.model, "inference_card_tile_temperature", None) for policy in policies
+        ],
         "match": asdict(match),
         "deck_pool": None if deck_pool is None else {"decks": len(deck_pool.decks), "schema": deck_pool.schema},
         "battle_level": battle_level,
