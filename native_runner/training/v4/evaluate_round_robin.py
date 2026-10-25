@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import time
 
-from ...round_robin import base_match, digest, read_rows, write_json
+from ...round_robin import base_match, card_tile_temperature_for, digest, read_rows, write_json
 from .evaluation_protocol import complete_natural_blocks, natural_schedule
 
 
@@ -82,8 +82,8 @@ def main(argv=None):
                  delay_a_ticks=tuple(options["delay_ticks"]), delay_b_ticks=tuple(options["delay_ticks"]),
                  min_play_gap_ticks=tuple(options["min_play_gap_ticks"]),
                  gate_temperature_a=options["gate_temperature"], gate_temperature_b=options["gate_temperature"],
-                 card_tile_temperature_a=options.get("card_tile_temperature"),
-                 card_tile_temperature_b=options.get("card_tile_temperature"),
+                 card_tile_temperature_a=card_tile_temperature_for(options.get("card_tile_temperature"), pair[0]),
+                 card_tile_temperature_b=card_tile_temperature_for(options.get("card_tile_temperature"), pair[1]),
                  schedule=schedule, resident_lanes=options["lanes"],
                  trace_dir=destination / "traces" if options.get("trace") else None)
         elapsed = time.perf_counter() - started

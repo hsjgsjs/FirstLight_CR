@@ -393,7 +393,7 @@ def record(argv: list[str]) -> int:
 
     import torch
 
-    from ...round_robin import base_match, existing_endpoint, parse_blocks, read_options
+    from ...round_robin import base_match, card_tile_temperature_for, existing_endpoint, parse_blocks, read_options
     from .deck_pool import DeckPoolManifestV4
     from .evaluate import evaluate
     from .evaluation_protocol import natural_schedule
@@ -436,8 +436,8 @@ def record(argv: list[str]) -> int:
         min_play_gap_ticks=tuple(options["min_play_gap_ticks"]),
         gate_temperature_a=options["gate_temperature"],
         gate_temperature_b=options["gate_temperature"],
-        card_tile_temperature_a=options.get("card_tile_temperature"),
-        card_tile_temperature_b=options.get("card_tile_temperature"),
+        card_tile_temperature_a=card_tile_temperature_for(options.get("card_tile_temperature"), args.model_a),
+        card_tile_temperature_b=card_tile_temperature_for(options.get("card_tile_temperature"), args.model_b),
         schedule=schedule,
         resident_lanes=options["lanes"],
         trace_dir=traces,

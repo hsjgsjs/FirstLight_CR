@@ -125,6 +125,49 @@ class RoundRobinTests(unittest.TestCase):
         write_json(root / "study.json", identity)
         self.assertEqual(json.loads((root / "study.json").read_text(encoding="utf-8")), identity)
 
+    def test_card_tile_temperature_can_differ_per_model_name(self):
+        root = self.root / "repo"
+        (root / "native_runner").mkdir(parents=True)
+        (root / "round_robin.example.json").write_text(
+            (Path(__file__).resolve().parents[2] / "round_robin.example.json").read_text(encoding="utf-8"))
+        for name in ("a.pt", "pool.json"):
+            (root / name).write_bytes(name.encode())
+        import native_runner.round_robin as module
+
+        def options(**extra):
+            config = dict(models={"A sharp": str(root / "a.pt"), "A": str(root / "a.pt")}, anchor="A",
+                          deck_pool=str(root / "pool.json"), sample=True, gate_temperature=0.2)
+            write_json(root / "config.json", {**config, **extra})
+            with patch.object(module, "ROOT", root), patch.object(module, "load_env", lambda: None):
+                return module.read_options(SimpleNamespace(config=root / "config.json"))
+
+        loaded = options(card_tile_temperature={"A sharp": 0.1})
+        self.assertEqual(module.card_tile_temperature_for(loaded["card_tile_temperature"], "A sharp"), 0.1)
+        self.assertIsNone(module.card_tile_temperature_for(loaded["card_tile_temperature"], "A"))
+        self.assertEqual(module.card_tile_temperature_for(0.1, "A"), 0.1)
+        with self.assertRaisesRegex(ValueError, "not in models"):
+            options(card_tile_temperature={"B": 0.1})
+        with self.assertRaisesRegex(ValueError, "finite and positive"):
+            options(card_tile_temperature={"A": 0})
+        with self.assertRaisesRegex(ValueError, "sample: true"):
+            options(card_tile_temperature=0.1, sample=False)
+
+    def test_merge_checks_each_models_card_tile_temperature(self):
+        self.identity["gameplay"]["card_tile_temperature"] = {"Update 48": 0.1}
+        run = self.run_directory("rr-a")
+        for marker in run.rglob("identity.json"):
+            pair = json.loads((marker.parent / "pair.json").read_text(encoding="utf-8"))["models"]
+            saved = json.loads(marker.read_text(encoding="utf-8"))
+            saved["card_tile_temperatures"] = [0.1 if name == "Update 48" else None for name in pair]
+            write_json(marker, saved)
+        collect_runs([run])
+        marker = next(run.rglob("pair-00/identity.json"))
+        saved = json.loads(marker.read_text(encoding="utf-8"))
+        saved["card_tile_temperatures"] = [None, None]
+        write_json(marker, saved)
+        with self.assertRaisesRegex(ValueError, "card/tile temperatures mismatch"):
+            collect_runs([run])
+
     def test_resume_ignores_incomplete_attempt_and_recovers_full_retry(self):
         partial = self.run_directory("rr-partial")
         path = partial / "shard-00/pair-00/matches.jsonl"

@@ -113,18 +113,28 @@ def read_options(args):
     if temperature is not None and (not math.isfinite(float(temperature)) or float(temperature) <= 0):
         raise ValueError("gate_temperature must be finite and positive")
     card_tile = options["card_tile_temperature"]
-    if card_tile is not None and (
-        isinstance(card_tile, bool)
-        or not isinstance(card_tile, (int, float))
-        or not math.isfinite(float(card_tile))
-        or float(card_tile) <= 0
-    ):
-        raise ValueError("card_tile_temperature must be finite and positive, or null")
-    if card_tile is not None and not options["sample"]:
+    per_model = card_tile if isinstance(card_tile, dict) else {name: card_tile for name in options["models"]}
+    if isinstance(card_tile, dict) and card_tile.keys() - options["models"].keys():
+        raise ValueError("card_tile_temperature names a model that is not in models")
+    for value in per_model.values():
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            raise ValueError("card_tile_temperature must be finite and positive, null, or a map of model names to those")
+    if any(value is not None for value in per_model.values()) and not options["sample"]:
         raise ValueError("card_tile_temperature only applies with sample: true")
     for key in ("delay_ticks", "min_play_gap_ticks"):
         options[key] = tick_bounds(options[key])
     return options
+
+
+def card_tile_temperature_for(setting, name):
+    """A model's card/tile temperature: one value for every model, or a map of model names (others: None)."""
+
+    return setting.get(name) if isinstance(setting, dict) else setting
 
 
 def base_match(options):
@@ -221,7 +231,8 @@ def collect_runs(runs):
                 raise ValueError(f"actual evaluator settings mismatch: {marker}")
             if gameplay["sample"] and actual["gate_temperatures"] != [gameplay["gate_temperature"]] * 2:
                 raise ValueError(f"actual sampling temperatures mismatch: {marker}")
-            if actual.get("card_tile_temperatures", [None, None]) != [gameplay.get("card_tile_temperature")] * 2:
+            expected_card_tile = [card_tile_temperature_for(gameplay.get("card_tile_temperature"), name) for name in pair]
+            if actual.get("card_tile_temperatures", [None, None]) != expected_card_tile:
                 raise ValueError(f"actual card/tile temperatures mismatch: {marker}")
             groups = complete_natural_blocks(rows)
             planned = {(case["block"], case["variant"]): case for case in actual["schedule"]}
