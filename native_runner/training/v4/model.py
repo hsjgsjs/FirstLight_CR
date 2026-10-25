@@ -228,6 +228,9 @@ class UniversalCardPolicyV4(nn.Module):
         self._ppo_gate_temperature = 1.0
         self._ppo_action_temperature = 1.0
         self._ppo_continue_temperature = 1.0
+        # Deployment-only override for the card and tile choices (None: use the action temperature).
+        # Never saved in a checkpoint and never set by training.
+        self._inference_card_tile_temperature: float | None = None
         self._inference_delay_offset_max_ms: int | None = None
         self.register_buffer(
             "_inference_delay_offset_mask", torch.ones(len(config.delay_offset_ms), dtype=torch.bool), persistent=False
@@ -289,6 +292,23 @@ class UniversalCardPolicyV4(nn.Module):
         if not math.isfinite(temperature) or temperature <= 0.0:
             raise ValueError("PPO action temperature must be finite and positive")
         self._ppo_action_temperature = float(temperature)
+
+    @property
+    def inference_card_tile_temperature(self) -> float | None:
+        return self._inference_card_tile_temperature
+
+    def set_inference_card_tile_temperature(self, temperature: float | None) -> None:
+        """Sample the card and its tile at ``temperature`` when playing (not training).
+
+        When to play (gate), the in-turn delay and the continue choice keep their own temperatures. Sharpening
+        only these two choices plays the policy's preferred card and tile more consistently. Applies to sampled
+        decisions made without forced actions; set it before the first decision, since a captured CUDA Graph
+        keeps the value it was captured with.
+        """
+
+        if temperature is not None and (not math.isfinite(temperature) or temperature <= 0.0):
+            raise ValueError("card/tile temperature must be finite and positive, or None")
+        self._inference_card_tile_temperature = None if temperature is None else float(temperature)
 
     def set_ppo_continue_temperature(self, temperature: float) -> None:
         if not math.isfinite(temperature) or temperature <= 0.0:
@@ -623,6 +643,11 @@ class UniversalCardPolicyV4(nn.Module):
         else:
             resolved = None
 
+        card_tile_temperature = (
+            action_temperature
+            if forced_actions is not None or self._inference_card_tile_temperature is None
+            else self._inference_card_tile_temperature
+        )
         shadow = ShadowCandidateLegality(candidates, config)
         initial_legal = shadow.candidate_mask()
         gate_logits = self.gate_head(context.policy_context)
@@ -679,7 +704,7 @@ class UniversalCardPolicyV4(nn.Module):
             candidate_distribution = _distribution(
                 self.candidate_logits(decoder_context, context.encoded.candidate_memory),
                 mask=legal_candidates,
-                temperature=action_temperature,
+                temperature=card_tile_temperature,
                 validate=validate,
             )
             selected_candidate = (
@@ -696,7 +721,10 @@ class UniversalCardPolicyV4(nn.Module):
             )
             placement = shadow.selected_placement(selected_candidate)
             location_distribution = _distribution(
-                location_logits.flatten(1), mask=placement.flatten(1), temperature=action_temperature, validate=validate
+                location_logits.flatten(1),
+                mask=placement.flatten(1),
+                temperature=card_tile_temperature,
+                validate=validate,
             )
             grid = active & (selected_mode == TARGET_GRID)
             selected_target = (

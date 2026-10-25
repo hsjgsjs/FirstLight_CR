@@ -351,6 +351,46 @@ def test_prepare_replay_maps_source_command_ticks_to_native_observable_ticks() -
     assert tags["native_observable_tick_offset"] == 1
 
 
+def test_landing_delay_moves_only_the_native_landing() -> None:
+    payload = _payload()
+    prepared = prepare_collected_replay(payload, landing_delay_ticks=21)
+    landings = {
+        int(action.metadata["source_index"]): (
+            operation.start_native_tick + action.execute_offset_ticks,
+            action.metadata["source_command_tick"],
+        )
+        for operation in prepared.replay.operations
+        for action in operation.actions
+        if action.kind is ActionKind.PLAY_CARD
+    }
+    for event in payload["events"]:
+        source_tick = int(event["replay_tick_20hz"])
+        # The play lands 21 ticks after the tap; the expert label stays at the tap.
+        assert landings[int(event["source_index"])] == (source_tick + 21, source_tick)
+    assert prepared.replay.episode_config.tags["native_observable_tick_offset"] == 21
+    assert prepared.replay.end_native_tick >= max(native for native, _source in landings.values())
+    for invalid in (0, 41, 1.5):
+        with pytest.raises(ValueError, match="landing_delay_ticks"):
+            prepare_collected_replay(payload, landing_delay_ticks=invalid)
+
+
+def test_recorded_tower_hitpoints_reach_the_replay_terminal() -> None:
+    payload = _payload()
+    assert "towers" not in prepare_collected_replay(payload).replay.terminal
+    team = payload["battle"]["team"]["players"][0]
+    opponent = payload["battle"]["opponent"]["players"][0]
+    team["final_tower_hitpoints"] = {"king": 4824, "princess_left": 0, "princess_right": 3052}
+    opponent["final_tower_hitpoints"] = {"king": 0, "princess_left": 0, "princess_right": 0}
+    prepared = prepare_collected_replay(payload)
+    # _payload uses data_i=1: the opponent is the bottom player (native owner 1), the team native owner 0.
+    assert list(prepared.replay.terminal["towers"]) == [
+        {"owner": 0, "king": 4824, "princess": [0, 3052]},
+        {"owner": 1, "king": 0, "princess": [0, 0]},
+    ]
+    team["final_tower_hitpoints"]["king"] = None
+    assert "towers" not in prepare_collected_replay(payload).replay.terminal
+
+
 @pytest.mark.parametrize("card_key", ("elixir-collector", "mirror"))
 def test_native_card_index_exposes_omit_from_starting_hand(card_key: str) -> None:
     assert resolve_native_card(card_key).omit_from_starting_hand is True

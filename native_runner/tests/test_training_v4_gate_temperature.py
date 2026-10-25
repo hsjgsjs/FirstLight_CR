@@ -124,3 +124,51 @@ def test_rollout_behavior_metrics_report_gate_continue_and_delay_distributions()
     assert metrics["continue_eligible_second_rate"] == pytest.approx(0.4)
     assert metrics["delay_0ms_fraction"] == pytest.approx(0.25)
     assert metrics["delay_200ms_fraction"] == pytest.approx(0.225)
+
+
+def test_card_tile_temperature_sharpens_only_card_and_tile() -> None:
+    torch.manual_seed(5)
+    model = _model().eval()
+    batch = _batch(batch_size=1)
+    state = model.initial_state(1)
+    context = model.forward(batch, state, episode_start=torch.ones(1, dtype=torch.bool))
+    greedy = model.act_after_preselected_act(batch, context)
+
+    plain_choices = set()
+    for seed in range(20):
+        torch.manual_seed(seed)
+        sampled = model.sample_after_preselected_act(batch, context)
+        plain_choices.add((int(sampled.actions.candidate_index[0, 0]), int(sampled.actions.target_cell[0, 0])))
+    assert len(plain_choices) > 1  # at the action temperature the untrained fixture spreads its choices
+
+    model.set_inference_card_tile_temperature(1e-4)
+    for seed in range(20):
+        torch.manual_seed(seed)
+        sampled = model.sample_after_preselected_act(batch, context)
+        # Card and tile collapse to the model's preferred choice.
+        assert torch.equal(sampled.actions.candidate_index[:, 0], greedy.actions.candidate_index[:, 0])
+        assert torch.equal(sampled.actions.target_cell[:, 0], greedy.actions.target_cell[:, 0])
+
+    with pytest.raises(ValueError, match="card/tile temperature"):
+        model.set_inference_card_tile_temperature(0.0)
+
+
+def test_card_tile_temperature_leaves_the_gate_and_stored_action_scores_alone() -> None:
+    model = _model().eval()
+    batch = _batch(batch_size=3)
+    state = model.initial_state(3)
+    starts = torch.ones(3, dtype=torch.bool)
+    model.set_ppo_gate_temperature(0.5)
+    torch.manual_seed(11)
+    plain = model.sample_for_ppo_rollout(batch, state, episode_start=starts)
+    model.set_inference_card_tile_temperature(0.05)
+    torch.manual_seed(11)
+    sharpened = model.sample_for_ppo_rollout(batch, state, episode_start=starts)
+    # The gate is drawn first from the same numbers: when to play does not change.
+    assert torch.equal(plain.actions.gate, sharpened.actions.gate)
+
+    # Scoring stored actions (PPO's ratios, imitation losses) ignores the play-time override.
+    overridden = model.evaluate_actions(batch, state, plain.actions, episode_start=starts)
+    model.set_inference_card_tile_temperature(None)
+    unchanged = model.evaluate_actions(batch, state, plain.actions, episode_start=starts)
+    assert torch.equal(overridden.log_prob, unchanged.log_prob)

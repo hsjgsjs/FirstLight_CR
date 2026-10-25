@@ -112,6 +112,16 @@ def read_options(args):
     temperature = options["gate_temperature"]
     if temperature is not None and (not math.isfinite(float(temperature)) or float(temperature) <= 0):
         raise ValueError("gate_temperature must be finite and positive")
+    card_tile = options["card_tile_temperature"]
+    if card_tile is not None and (
+        isinstance(card_tile, bool)
+        or not isinstance(card_tile, (int, float))
+        or not math.isfinite(float(card_tile))
+        or float(card_tile) <= 0
+    ):
+        raise ValueError("card_tile_temperature must be finite and positive, or null")
+    if card_tile is not None and not options["sample"]:
+        raise ValueError("card_tile_temperature only applies with sample: true")
     for key in ("delay_ticks", "min_play_gap_ticks"):
         options[key] = tick_bounds(options[key])
     return options
@@ -128,7 +138,8 @@ def base_match(options):
 
 def study_identity(options):
     gameplay = {key: options[key] for key in ("battle_level", "delay_ticks", "min_play_gap_ticks", "sample",
-                                            "gate_temperature", "seed", "device", "lanes")}
+                                            "gate_temperature", "card_tile_temperature", "seed", "device",
+                                            "lanes")}
     # CPU threads and host paths describe resources, not match conditions.
     source = hashlib.sha256()
     for path in sorted((ROOT / "native_runner").rglob("*.py")):
@@ -210,6 +221,8 @@ def collect_runs(runs):
                 raise ValueError(f"actual evaluator settings mismatch: {marker}")
             if gameplay["sample"] and actual["gate_temperatures"] != [gameplay["gate_temperature"]] * 2:
                 raise ValueError(f"actual sampling temperatures mismatch: {marker}")
+            if actual.get("card_tile_temperatures", [None, None]) != [gameplay.get("card_tile_temperature")] * 2:
+                raise ValueError(f"actual card/tile temperatures mismatch: {marker}")
             groups = complete_natural_blocks(rows)
             planned = {(case["block"], case["variant"]): case for case in actual["schedule"]}
             for row in rows:
@@ -313,7 +326,7 @@ def _run(args):
     else:
         print(f"未找到 {config}，使用 round_robin.example.json 的默认设置。", flush=True)
     print(f"模型：{'、'.join(options['models'])}；采样 {options['sample']}，"
-          f"出牌温度 {options['gate_temperature']}。", flush=True)
+          f"出牌温度 {options['gate_temperature']}，选牌和落点温度 {options['card_tile_temperature']}。", flush=True)
     identity = study_identity(options)
     if args.engines < 1 or args.engines > 64:
         raise ValueError("engines must be in 1..64")

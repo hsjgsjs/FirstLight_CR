@@ -122,6 +122,7 @@ Copy-Item .env.example .env
 | [本轮陪练训练进度](docs/sparring_journey_zh.md) | General 接续、检查点血缘、人类 BC 200 轮、实战反馈、阶段小结与当前待办 |
 | [实力提升计划](docs/strength_plan_zh.md) | 像人阶段之后的输入改造、辅助预测、对手池与评测顺序 |
 | [固定条件循环赛](docs/round_robin_zh.md) | 多模型正常开局循环赛、多机合并与首轮结果解读 |
+| [从 daybreak-cr 借鉴的做法](docs/daybreak_takeaways_zh.md) | 选牌和落点低温出牌、人类录像落地时间与塔血核对、已证明不划算的方向 |
 | [训练指南](docs/training.md) | 回放缓存、IL、批量模拟、Linux guest 与 PPO |
 | [系统架构](docs/architecture.md) | 环境、策略、训练与回放的源码导览 |
 | [模型](checkpoints/README.md) | 模型选择、加载与评测指标 |

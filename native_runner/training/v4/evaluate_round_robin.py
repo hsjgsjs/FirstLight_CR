@@ -82,6 +82,8 @@ def main(argv=None):
                  delay_a_ticks=tuple(options["delay_ticks"]), delay_b_ticks=tuple(options["delay_ticks"]),
                  min_play_gap_ticks=tuple(options["min_play_gap_ticks"]),
                  gate_temperature_a=options["gate_temperature"], gate_temperature_b=options["gate_temperature"],
+                 card_tile_temperature_a=options.get("card_tile_temperature"),
+                 card_tile_temperature_b=options.get("card_tile_temperature"),
                  schedule=schedule, resident_lanes=options["lanes"],
                  trace_dir=destination / "traces" if options.get("trace") else None)
         elapsed = time.perf_counter() - started

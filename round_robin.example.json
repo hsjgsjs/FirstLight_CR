@@ -14,6 +14,7 @@
   "min_play_gap_ticks": "6-10",
   "sample": false,
   "gate_temperature": null,
+  "card_tile_temperature": null,
   "seed": 1001,
   "device": "cpu",
   "cpu_threads": 10,

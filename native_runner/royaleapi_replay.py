@@ -52,6 +52,10 @@ TRUE_SIDE_MAPPING_VERSION = "royaleapi-true-side-data-i.v1"
 # native engine consumes a command while advancing from boundary N to state
 # N + 1, so collected actions need this explicit one-tick conversion.
 ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS = 1
+# Live measurements elsewhere put a tap's landing 21 ticks after RoyaleAPI's ``data-t``. The cache builder's
+# ``--royaleapi-landing-ticks`` selects the offset so both readings can be rebuilt and compared on tower HP;
+# the default stays 1 until that comparison has been run on this engine.
+MAX_ROYALEAPI_LANDING_TICKS = 40
 POLICY_DEAL_INVARIANCE_VERSION = "royaleapi-policy-selected-deal.v2"
 POLICY_DEAL_COMMAND_BOUNDARY_SEMANTICS = "royaleapi-command-boundary.v1"
 POLICY_ACTION_STREAM_VERSION = "royaleapi-policy-action-stream.v1"
@@ -1780,10 +1784,32 @@ def _tower_troop(player: Mapping[str, Any], label: str) -> tuple[str, int, bool]
         raise RoyaleAPIReplayError(f"{label} 使用了尚未支持的塔兵 {key!r}；拒绝静默替换成公主塔") from error
 
 
+def _final_tower_hitpoints(player: Mapping[str, Any]) -> dict[str, Any] | None:
+    """RoyaleAPI's recorded end-of-battle tower HP: the king and the two princess towers as an unordered pair."""
+
+    value = player.get("final_tower_hitpoints")
+    if not isinstance(value, Mapping):
+        return None
+    numbers = [value.get(key) for key in ("king", "princess_left", "princess_right")]
+    if any(type(item) is not int or item < 0 for item in numbers):
+        return None
+    return {"king": numbers[0], "princess": sorted(numbers[1:])}
+
+
 def prepare_collected_replay(
-    payload: Mapping[str, Any], *, bottom_player_tag: str | None = None
+    payload: Mapping[str, Any],
+    *,
+    bottom_player_tag: str | None = None,
+    landing_delay_ticks: int = ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS,
 ) -> PreparedCollectedReplay:
-    """Convert one normalized collector payload into an in-memory replay."""
+    """Convert one normalized collector payload into an in-memory replay.
+
+    ``landing_delay_ticks`` is how many ticks after RoyaleAPI's command tick a play or press lands in the engine.
+    Expert labels stay at the command tick either way.
+    """
+
+    if type(landing_delay_ticks) is not int or not 1 <= landing_delay_ticks <= MAX_ROYALEAPI_LANDING_TICKS:
+        raise ValueError(f"landing_delay_ticks must be an integer in 1..{MAX_ROYALEAPI_LANDING_TICKS}")
 
     replay_tag = _source_replay_tag(payload)
     battle = payload.get("battle")
@@ -1851,7 +1877,7 @@ def prepare_collected_replay(
         source_tick = int(raw_event.get("replay_tick_20hz", -1))
         if source_tick < 1:
             raise RoyaleAPIReplayError(f"event {event_index} tick 无效")
-        native_tick = source_tick + ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS
+        native_tick = source_tick + landing_delay_ticks
         parsed = {
             "event_index": event_index,
             "source_index": int(raw_event.get("source_index", event_index)),
@@ -2134,7 +2160,7 @@ def prepare_collected_replay(
             "initial_order_policy": "random-single-compatible.v3",
             "reconstruction_mode": "royaleapi-public-actions.v3",
             "source_tick_semantics": POLICY_DEAL_COMMAND_BOUNDARY_SEMANTICS,
-            "native_observable_tick_offset": (ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS),
+            "native_observable_tick_offset": landing_delay_ticks,
             "policy_deal_invariance_version": (POLICY_DEAL_INVARIANCE_VERSION),
             "policy_deal_invariance_id": policy_deal_invariance_id,
             "policy_deal_invariance": tuple(item.binding() for item in policy_deal_invariance),
@@ -2148,6 +2174,12 @@ def prepare_collected_replay(
     episode, policy_episode_id = _bind_policy_episode_config(replay_tag, episode)
     source_winner = _winner(battle.get("result"))
     winner = owner_for_side["team" if source_winner == 0 else "opponent"] if source_winner is not None else None
+    tower_records = tuple(_final_tower_hitpoints(players[side_for_owner[owner]]) for owner in (0, 1))
+    recorded_towers = (
+        None
+        if any(record is None for record in tower_records)
+        else tuple({"owner": owner, **record} for owner, record in enumerate(tower_records))
+    )
     replay = TrainingReplayV1(
         completed_match_index=1,
         ruleset_id=NATIVE_RENDER_RULESET_ID,
@@ -2164,6 +2196,7 @@ def prepare_collected_replay(
             "players": tuple(
                 {"owner": owner, "crowns": int(sides[side_for_owner[owner]].get("crowns", 0))} for owner in (0, 1)
             ),
+            **({"towers": recorded_towers} if recorded_towers is not None else {}),
         },
         source={
             "site": "RoyaleAPI",
