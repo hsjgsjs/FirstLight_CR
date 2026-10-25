@@ -4,6 +4,10 @@
 * Whether a spell's area reaches air and ground units.
 * Each crown tower's full hitpoints.
 
+A spell limited to its caster's side (Log, Barbarian Barrel) only damages a tower its roll can reach: the
+Barbarian Barrel rolls 4.5 tiles, so from the river it stops short of the enemy princess towers and its tower
+damage is 0. The pocket that opens after a princess tower falls is not modelled.
+
 Every number is derived from the compiled game data (``card_logic``), the same tables the native engine
 executes. A balance change therefore reaches the policy through regenerated data, not through relearning a
 number memorized from experience.
@@ -25,6 +29,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from ...arena import CELL_UNITS, PlacementRule, deployment_mask, spell_deploys_on_own_side, standard_active_tower_footprints
 from ...competitive_data import load_competitive_data
 from .catalog import FIRST_REAL_CARD_VOCAB_ID
 
@@ -81,6 +86,8 @@ class _SpellResolver:
         self.damage_known = True
         self.air = False
         self.ground = False
+        # Farthest forward edge, in world units from the cast point, of a projectile that rolls on (Log).
+        self.rolling_reach: float | None = None
 
     def _reach(self, record: Mapping[str, Any], air_key: str, ground_key: str) -> None:
         self.air |= record.get(air_key) is True
@@ -95,6 +102,10 @@ class _SpellResolver:
         if damage:
             self.damage += damage * _crown_factor(record)
             self._reach(record, "AoeToAir", "AoeToGround")
+            roll = _number(record, "ProjectileRange")
+            if roll:
+                reach = roll + (_number(record, "ProjectileRadiusY") or _number(record, "ProjectileRadius") or 0.0)
+                self.rolling_reach = max(self.rolling_reach or 0.0, reach)
         spawned = record.get("SpawnProjectile")
         if isinstance(spawned, str) and spawned:
             self.projectile(spawned, depth=depth + 1)
@@ -139,6 +150,20 @@ class _SpellResolver:
                 self.damage += per_second * lifetime / 1000.0 * _crown_factor(buff)
 
 
+@lru_cache(maxsize=1)
+def _own_side_gap_to_enemy_towers() -> float:
+    """World units from the front of the caster's territory to the nearest enemy princess tower's front edge."""
+
+    rows = deployment_mask(0, PlacementRule.OWN_TERRITORY_AREA)
+    front = (max(y for y, row in enumerate(rows) if any(row)) + 1) * CELL_UNITS
+    enemy_front = min(
+        tower.center_y_units - tower.height_tiles * CELL_UNITS / 2
+        for tower in standard_active_tower_footprints(0)
+        if tower.source.startswith("tower:1:princess")
+    )
+    return enemy_front - front
+
+
 def resolve_spell_facts(nodes: Mapping[str, Any], card: Mapping[str, Any]) -> SpellFactsV1:
     root = _record(nodes, str(card["root_node_id"])) or {}
     resolver = _SpellResolver(nodes)
@@ -153,6 +178,13 @@ def resolve_spell_facts(nodes: Mapping[str, Any], card: Mapping[str, Any]) -> Sp
     else:
         # Spells that only summon (Rage, Heal Spirit, Mirror): no direct damage, reach unknown.
         return SpellFactsV1(0.0, True, False, False, False)
+    if (
+        resolver.rolling_reach is not None
+        and spell_deploys_on_own_side(root)
+        and resolver.rolling_reach < _own_side_gap_to_enemy_towers()
+    ):
+        # Cast from its own side, the roll ends before any enemy tower (Barbarian Barrel).
+        resolver.damage = 0.0
     return SpellFactsV1(
         crown_tower_damage=resolver.damage * _level_11_multiplier() if resolver.damage_known else 0.0,
         damage_known=resolver.damage_known,

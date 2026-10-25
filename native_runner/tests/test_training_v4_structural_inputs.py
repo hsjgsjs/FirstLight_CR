@@ -34,6 +34,7 @@ from native_runner.training.v4.structural_tables import (
 
 FIREBALL, ARROWS, ROCKET, LIGHTNING, ZAP, POISON = 28000000, 28000001, 28000003, 28000007, 28000008, 28000009
 LOG, EARTHQUAKE, SNOWBALL, ROYAL_DELIVERY, VOID = 28000011, 28000014, 28000017, 28000018, 28000023
+BARBARIAN_BARREL = 28000015
 CHILD = {name: index for index, name in enumerate(CHILD_FEATURE_NAMES)}
 PRINCESS_FULL = compiled_tower_hitpoints_level_11()[1][1]
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -74,6 +75,9 @@ def test_spells_missing_from_the_card_rows_are_resolved() -> None:
     # The card rows leave the Log's damage empty; its rolling projectile carries it.
     assert _card_row(LOG)["level_damage"] is None
     assert facts[LOG].crown_tower_damage == pytest.approx(105 * 2.56 * 0.13, abs=0.5)
+    # The Barbarian Barrel only rolls 4.5 tiles: cast from its own side it stops short of every enemy tower.
+    assert facts[BARBARIAN_BARREL].crown_tower_damage == 0.0 and facts[BARBARIAN_BARREL].damage_known
+    assert facts[BARBARIAN_BARREL].hits_ground and not facts[BARBARIAN_BARREL].hits_air
     # Royal Delivery's area ignores buildings, so it never reaches a tower.
     assert facts[ROYAL_DELIVERY].crown_tower_damage == 0.0 and facts[ROYAL_DELIVERY].damage_known
     # Scripted spells stay unknown rather than zero.

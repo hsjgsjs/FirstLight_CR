@@ -440,12 +440,46 @@ def uses_entity_deployment_center(card_spec: CardSpecV1 | Mapping[str, object]) 
     return _card_kind(card_spec) == CardKind.BUILDING or uses_unit_deployment_center(card_spec)
 
 
+def spell_deploys_on_own_side(record: Mapping[str, object]) -> bool:
+    """Whether a spell's game record limits it to the caster's territory (and pocket)."""
+
+    return record.get("SpellAsDeploy") is True and record.get("CanDeployOnEnemySide") is not True
+
+
+def _own_side_spell_rule(card_spec: CardSpecV1 | Mapping[str, object]) -> PlacementRule | None:
+    """Own-side rule for spells the game deploys like a troop (Log, Barbarian Barrel, Royal Delivery).
+
+    Every spell that may be cast on the enemy side carries ``CanDeployOnEnemySide``. These three have
+    ``SpellAsDeploy`` and lack it, so the game limits them to the caster's territory plus the pocket after a
+    princess tower falls. The compiled CardSpecs still mark them ``full_arena``; without this rule the policy
+    could drop a Barbarian Barrel straight onto an enemy tower, which a real client cannot do.
+    """
+
+    if _card_kind(card_spec) != CardKind.SPELL:
+        return None
+    attributes = _card_field(card_spec, "attributes")
+    if not isinstance(attributes, Mapping) or not spell_deploys_on_own_side(attributes):
+        return None
+    # The Log and the Barbarian Barrel may start on the river; Royal Delivery keeps the terrain guard.
+    return PlacementRule.OWN_TERRITORY_AREA if attributes.get("CanPlaceOnWater") is True else PlacementRule.OWN_TERRITORY
+
+
+def card_placement_rule(card_spec: CardSpecV1 | Mapping[str, object]) -> PlacementRule:
+    """Deployment-territory rule the game applies to a card."""
+
+    return _placement_rule_for_card(card_spec)
+
+
 def _placement_rule_for_card(card_spec: CardSpecV1 | Mapping[str, object]) -> PlacementRule:
     if isinstance(card_spec, CardSpecV1):
         key = card_spec.target_schema.placement_mask_key
     else:
         target_schema = card_spec.get("target_schema", {})
         key = target_schema.get("placement_mask_key", "unknown") if isinstance(target_schema, Mapping) else "unknown"
+    if key == "full_arena":
+        own_side = _own_side_spell_rule(card_spec)
+        if own_side is not None:
+            return own_side
     return {
         "full_arena": PlacementRule.ANYWHERE,
         "own_deployment_zone": PlacementRule.OWN_TERRITORY,
