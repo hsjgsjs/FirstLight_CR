@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 import struct
-from typing import TYPE_CHECKING, Mapping, Sequence, TypeVar, get_type_hints
+from typing import TYPE_CHECKING, Any, Mapping, Sequence, TypeVar, get_type_hints
 
 import torch
 from torch import Tensor
@@ -362,6 +362,21 @@ def _atomic_write_json(destination: Path, payload: Mapping[str, object]) -> None
     _atomic_write(destination, _canonical_json(payload) + b"\n")
 
 
+def replay_fidelity_record(result: Any) -> dict[str, object]:
+    """Per-replay rebuild checks, kept in shard summaries and failure files for later comparison."""
+
+    return {
+        "replay_tag": str(result.replay_tag),
+        "completed": bool(result.completed),
+        "failure_reason": result.failure_reason,
+        "winner_matches": result.winner_matches,
+        "crowns_match": result.crowns_match,
+        "towers_match": getattr(result, "towers_match", None),
+        "executed_expert_actions": int(result.executed_expert_action_count),
+        "expert_actions": int(result.expert_action_count),
+    }
+
+
 def write_il_cache_shard(
     destination: str | Path,
     results: Sequence[ReplayProductionResultV4],
@@ -513,6 +528,9 @@ def write_il_cache_shard(
         "winner_mismatches": sum(result.winner_matches is False for result in results),
         "crowns_comparable_replays": sum(result.crowns_match is not None for result in results),
         "crowns_mismatches": sum(result.crowns_match is False for result in results),
+        "towers_comparable_replays": sum(result.towers_match is not None for result in results),
+        "towers_mismatches": sum(result.towers_match is False for result in results),
+        "replay_fidelity": [replay_fidelity_record(result) for result in results],
         "expert_actions": sum(result.expert_action_count for result in results),
         "executed_expert_actions": sum(result.executed_expert_action_count for result in results),
         "decision_frames": sum(result.decision_frame_count for result in results),
@@ -853,6 +871,8 @@ def write_il_cache_index(
         "winner_mismatches",
         "crowns_comparable_replays",
         "crowns_mismatches",
+        "towers_comparable_replays",
+        "towers_mismatches",
         "expert_actions",
         "executed_expert_actions",
         "decision_frames",

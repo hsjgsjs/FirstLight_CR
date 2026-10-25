@@ -202,6 +202,8 @@ def _patch_lane_pipeline(monkeypatch: object, *, fail_lane: int | None = None) -
         environment: _FakeEnvironment,
         prepared: object,
         tensorizers: tuple[_FakeTensorizer, _FakeTensorizer],
+        *,
+        require_tower_fidelity: bool = False,
     ) -> _FakeLane:
         return _FakeLane(
             environment=environment,
@@ -405,6 +407,7 @@ def test_renderer_schedule_rejection_masks_only_its_owner() -> None:
         pending_gate_loss=(True, True),
         decision_ticks=[130],
         gate_loss_rows=[[True], [True]],
+        landing_delay_ticks=1,
         environment=SimpleNamespace(
             native=SimpleNamespace(replay_schedule_status=schedule_status)
         ),
@@ -478,6 +481,10 @@ def test_source_timeline_completion_keeps_observation_without_fake_terminal() ->
         failure_reason=None,
         first_untrusted_tick=None,
         environment=SimpleNamespace(native=object()),
+        prepared=SimpleNamespace(replay=SimpleNamespace(terminal={})),
+        towers_match=None,
+        require_tower_fidelity=False,
+        landing_delay_ticks=1,
     )
     next_observations = {
         0: SimpleNamespace(tick=135),
@@ -544,6 +551,7 @@ def test_early_native_terminal_still_records_result_fidelity(
         winner_matches=None,
         crowns_match=None,
         environment=SimpleNamespace(native=object()),
+        landing_delay_ticks=1,
     )
     next_observations = {
         0: SimpleNamespace(tick=135),
@@ -589,6 +597,7 @@ def test_partial_replay_gate_loss_is_limited_to_trusted_frames() -> None:
         executed_expert_action_count=0,
         winner_matches=None,
         crowns_match=None,
+        towers_match=None,
     )
 
     result = producer_module._finalize_il_lane(lane, gamma_per_decision=0.99)
@@ -597,3 +606,135 @@ def test_partial_replay_gate_loss_is_limited_to_trusted_frames() -> None:
     assert result.sequences[0].valid_mask[:, 0].tolist() == [True, True, False]
     assert result.sequences[0].gate_loss_mask[:, 0].tolist() == [True, True, False]
     assert result.sequences[1].gate_loss_mask[:, 0].tolist() == [True, False, False]
+
+
+def _tower(owner: int, kind: str, hitpoints: float) -> SimpleNamespace:
+    return SimpleNamespace(owner=owner, tower_kind=kind, hitpoints=hitpoints)
+
+
+def _tower_lane(expected: object, *, require: bool) -> SimpleNamespace:
+    towers = (
+        _tower(0, "king", 4824.0),
+        _tower(0, "princess_right", 3052.0),
+        _tower(1, "king", 6144.0),
+        _tower(1, "princess_left", 1.0),
+        _tower(1, "princess_right", 3584.0),
+    )
+    return SimpleNamespace(
+        prepared=SimpleNamespace(replay=SimpleNamespace(terminal={"towers": expected})),
+        observations={0: SimpleNamespace(towers=towers)},
+        towers_match=None,
+        require_tower_fidelity=require,
+        completed=True,
+        failure_reason=None,
+        first_untrusted_tick=None,
+        current_tick=3600,
+    )
+
+
+def test_tower_fidelity_compares_king_and_unordered_princess_pair() -> None:
+    expected = [
+        {"owner": 0, "king": 4824, "princess": [0, 3052]},
+        {"owner": 1, "king": 6144, "princess": [1, 3584]},
+    ]
+    lane = _tower_lane(expected, require=True)
+    producer_module._tower_fidelity(lane)
+    assert lane.towers_match is True and lane.completed is True
+
+    expected[1]["princess"] = [0, 3584]
+    recorded_only = _tower_lane(expected, require=False)
+    producer_module._tower_fidelity(recorded_only)
+    assert recorded_only.towers_match is False and recorded_only.completed is True
+
+    required = _tower_lane(expected, require=True)
+    producer_module._tower_fidelity(required)
+    assert required.completed is False
+    assert required.failure_reason == "terminal fidelity mismatch: towers"
+    assert required.first_untrusted_tick == 3600
+
+    unknown = _tower_lane(None, require=True)
+    producer_module._tower_fidelity(unknown)
+    assert unknown.towers_match is None and unknown.completed is True
+
+
+def test_rejection_masks_the_label_row_of_the_tap_not_the_landing() -> None:
+    lane = SimpleNamespace(
+        replay_schedule_index=1,
+        replay_schedule_reconciled_index=0,
+        # Tapped at 132 (row 130), landed 21 ticks later at 153 (row 150).
+        replay_commands=(SimpleNamespace(kind="play_card", owner=1, request_tick=100, target_tick=153),),
+        replay_schedule_sequences=(12,),
+        executed_expert_action_count=0,
+        decision_ticks=[130, 135, 140, 145, 150],
+        gate_loss_rows=[[True] * 5, [True] * 5],
+        landing_delay_ticks=21,
+        environment=SimpleNamespace(
+            native=SimpleNamespace(
+                replay_schedule_status=lambda _sequence: {"state": "failed", "queuedAtTick": 152}
+            )
+        ),
+    )
+    producer_module._reconcile_renderer_schedule(lane)
+    # Row 130 holds the label; the landing row 150 would have been masked before.
+    assert lane.gate_loss_rows == [[True] * 5, [False, True, True, True, True]]
+
+
+def _ending_lane(target_tick: int, landing_delay_ticks: int) -> SimpleNamespace:
+    class _Frame:
+        def to_storage(self, *_args: object, **_kwargs: object) -> "_Frame":
+            return self
+
+    return SimpleNamespace(
+        current_tick=130,
+        source_end_tick=300,
+        replay_schedule_index=0,
+        replay_commands=(SimpleNamespace(kind="play_card", owner=0, target_tick=target_tick),),
+        replay_schedule_sequences=(11,),
+        executed_expert_action_count=0,
+        pending_frame_batches=(_Frame(), _Frame()),
+        pending_frame_sequences=(object(), object()),
+        pending_gate_loss=(True, True),
+        observations_by_owner=[[], []],
+        actions_by_owner=[[], []],
+        rewards_by_owner=[[], []],
+        gate_loss_rows=[[], []],
+        terminated_rows=[],
+        truncated_rows=[],
+        decision_ticks=[],
+        observations=None,
+        active=True,
+        completed=False,
+        terminal_observed=False,
+        failure_reason=None,
+        first_untrusted_tick=None,
+        environment=SimpleNamespace(native=object()),
+        landing_delay_ticks=landing_delay_ticks,
+    )
+
+
+@pytest.mark.parametrize(
+    ("target_tick", "landing_delay_ticks", "completed"),
+    [
+        (150, 21, True),  # tapped at 129, before the end at 135: it would land after the battle, as in the game
+        (156, 21, False),  # tapped at 135, at the end: the rebuild ended early
+        (136, 1, False),  # the original one-tick reading keeps its rule
+    ],
+)
+def test_taps_landing_after_the_end_are_not_failures(
+    monkeypatch: object, target_tick: int, landing_delay_ticks: int, completed: bool
+) -> None:
+    monkeypatch.setattr(producer_module, "_terminal_fidelity", lambda _lane: None)
+    lane = _ending_lane(target_tick, landing_delay_ticks)
+    lane.completed = False
+    producer_module._accept_il_step(
+        lane,
+        (
+            {0: SimpleNamespace(tick=135), 1: SimpleNamespace(tick=135)},
+            {0: 0.0, 1: 0.0},
+            {0: True, 1: True},
+            {0: False, 1: False},
+            {},
+        ),
+        max_frames=None,
+    )
+    assert lane.completed is completed

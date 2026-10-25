@@ -550,7 +550,7 @@ def test_cache_worker_calibrates_before_observation_extraction(
     tensorizers = (object(), object())
     produced = SimpleNamespace(sequences=(object(),))
 
-    monkeypatch.setattr(cache_builder, "prepare_collected_replay", lambda _p: raw)
+    monkeypatch.setattr(cache_builder, "prepare_collected_replay", lambda _p, **_kw: raw)
     monkeypatch.setattr(cache_builder, "replay_expert_actions", lambda _replay: ())
 
     def calibrate(prepared: object, selected_native: object) -> object:

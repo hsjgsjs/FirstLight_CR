@@ -436,6 +436,8 @@ def record(argv: list[str]) -> int:
         min_play_gap_ticks=tuple(options["min_play_gap_ticks"]),
         gate_temperature_a=options["gate_temperature"],
         gate_temperature_b=options["gate_temperature"],
+        card_tile_temperature_a=options.get("card_tile_temperature"),
+        card_tile_temperature_b=options.get("card_tile_temperature"),
         schedule=schedule,
         resident_lanes=options["lanes"],
         trace_dir=traces,

@@ -44,6 +44,7 @@ class ReplayProductionResultV4:
     winner_matches: bool | None
     crowns_match: bool | None
     decision_frame_count: int = 0
+    towers_match: bool | None = None
 
     @property
     def retained_frame_count(self) -> int:
@@ -84,6 +85,10 @@ class _ILReplayLaneV4:
     replay_schedule_index: int = 0
     replay_schedule_reconciled_index: int = 0
     terminal_observed: bool = False
+    towers_match: bool | None = None
+    require_tower_fidelity: bool = False
+    # Ticks from a source command (where the expert label sits) to its native landing.
+    landing_delay_ticks: int = 1
 
     @property
     def env_id(self) -> int:
@@ -95,7 +100,11 @@ def _wait_group(ticks: int) -> dict[int, tuple[ActionV1, ...]]:
 
 
 def _build_il_lane(
-    environment: BattleEnvV1, prepared: PreparedCollectedReplay, tensorizers: Sequence[UniversalObservationTensorizerV4]
+    environment: BattleEnvV1,
+    prepared: PreparedCollectedReplay,
+    tensorizers: Sequence[UniversalObservationTensorizerV4],
+    *,
+    require_tower_fidelity: bool = False,
 ) -> _ILReplayLaneV4:
     if len(tensorizers) != 2 or tuple(item.actor_owner for item in tensorizers) != (0, 1):
         raise ValueError("online IL needs owner-0 and owner-1 tensorizers")
@@ -115,6 +124,8 @@ def _build_il_lane(
         windows=group_expert_action_windows(expert_actions),
         source_end_tick=int(prepared.replay.end_native_tick),
         replay_commands=replay_commands,
+        require_tower_fidelity=require_tower_fidelity,
+        landing_delay_ticks=int(prepared.replay.episode_config.tags.get("native_observable_tick_offset", 1)),
     )
 
 
@@ -251,11 +262,13 @@ def _reconcile_renderer_schedule(lane: _ILReplayLaneV4) -> None:
             # User-facing replay rendering keeps advancing after an exact
             # boundary-time semantic rejection.  Headless uses that same
             # scheduler contract; do not train a rejected source label.
+            # The label sits on the decision row of the source command tick, landing_delay_ticks earlier.
+            source_tick = int(command.target_tick) - lane.landing_delay_ticks
             row = next(
                 (
                     row_index
                     for row_index, decision_tick in enumerate(lane.decision_ticks)
-                    if int(decision_tick) < int(command.target_tick) <= int(decision_tick) + POLICY_DECISION_TICKS
+                    if int(decision_tick) <= source_tick < int(decision_tick) + POLICY_DECISION_TICKS
                 ),
                 None,
             )
@@ -265,6 +278,40 @@ def _reconcile_renderer_schedule(lane: _ILReplayLaneV4) -> None:
                 )
             lane.gate_loss_rows[int(command.owner)][row] = False
         lane.replay_schedule_reconciled_index += 1
+
+
+def _tower_hitpoints_by_owner(towers: Sequence[Any]) -> dict[int, dict[str, Any]]:
+    """End-state tower HP per owner as RoyaleAPI records it: the king, and the princess pair unordered (0 if down)."""
+
+    result: dict[int, dict[str, Any]] = {owner: {"king": 0, "princess": []} for owner in (0, 1)}
+    for tower in towers:
+        hitpoints = int(round(float(tower.hitpoints)))
+        if tower.tower_kind == "king":
+            result[int(tower.owner)]["king"] = hitpoints
+        else:
+            result[int(tower.owner)]["princess"].append(hitpoints)
+    for owner in (0, 1):
+        princess = result[owner]["princess"]
+        result[owner]["princess"] = sorted(princess + [0] * (2 - len(princess)))
+    return result
+
+
+def _tower_fidelity(lane: _ILReplayLaneV4) -> None:
+    """Compare the six towers' end HP with the recorded ones; a mismatch fails the lane only when required."""
+
+    assert lane.observations is not None
+    expected = lane.prepared.replay.terminal.get("towers")
+    if not isinstance(expected, Sequence) or len(expected) != 2:
+        return
+    actual = _tower_hitpoints_by_owner(lane.observations[0].towers)
+    lane.towers_match = all(
+        actual[int(record["owner"])] == {"king": int(record["king"]), "princess": sorted(record["princess"])}
+        for record in expected
+    )
+    if lane.towers_match is False and lane.require_tower_fidelity and lane.failure_reason is None:
+        lane.completed = False
+        lane.failure_reason = "terminal fidelity mismatch: towers"
+        lane.first_untrusted_tick = lane.current_tick
 
 
 def _terminal_fidelity(lane: _ILReplayLaneV4) -> None:
@@ -290,6 +337,7 @@ def _terminal_fidelity(lane: _ILReplayLaneV4) -> None:
         lane.completed = False
         lane.failure_reason = "terminal fidelity mismatch: " + ", ".join(fidelity_failures)
         lane.first_untrusted_tick = lane.current_tick
+    _tower_fidelity(lane)
 
 
 def _accept_il_step(
@@ -328,7 +376,12 @@ def _accept_il_step(
         lane.terminal_observed = True
         lane.completed = True
         _terminal_fidelity(lane)
-        if lane.replay_schedule_index < len(lane.replay_commands):
+        # A command tapped before the end may land after it (it never lands in the real battle either); one tapped
+        # at or after the end means the rebuild ended early.
+        if any(
+            command.target_tick - lane.landing_delay_ticks >= next_tick
+            for command in lane.replay_commands[lane.replay_schedule_index :]
+        ):
             lane.completed = False
             lane.failure_reason = "battle ended before all expert actions executed"
             lane.first_untrusted_tick = lane.current_tick
@@ -341,6 +394,7 @@ def _accept_il_step(
             lane.first_untrusted_tick = lane.source_end_tick
         else:
             lane.completed = True
+            _tower_fidelity(lane)
         return
     if truncated_flag:
         lane.active = False
@@ -377,6 +431,7 @@ def _finalize_il_lane(lane: _ILReplayLaneV4, *, gamma_per_decision: float) -> Re
             winner_matches=lane.winner_matches,
             crowns_match=lane.crowns_match,
             decision_frame_count=0,
+            towers_match=lane.towers_match,
         )
 
     decision_tensor = torch.tensor(lane.decision_ticks, dtype=torch.long)[:, None]
@@ -429,6 +484,7 @@ def _finalize_il_lane(lane: _ILReplayLaneV4, *, gamma_per_decision: float) -> Re
         winner_matches=lane.winner_matches,
         crowns_match=lane.crowns_match,
         decision_frame_count=time_steps,
+        towers_match=lane.towers_match,
     )
 
 
@@ -443,6 +499,7 @@ def produce_il_replay_batch(
     replacement_tensorizers_by_replay: Sequence[Sequence[UniversalObservationTensorizerV4]] = (),
     max_frames: int | None = None,
     validate_tensors: bool = False,
+    require_tower_fidelity: bool = False,
 ) -> tuple[ReplayProductionResultV4, ...]:
     """Replay independent matches on configurable slots of one native engine.
 
@@ -468,7 +525,12 @@ def produce_il_replay_batch(
         raise ValueError("IL batch coordinator must own every BattleEnv native proxy")
 
     lane_slots: list[_ILReplayLaneV4 | None] = [
-        _build_il_lane(environments[index], prepared_replays[index], tensorizers_by_lane[index])
+        _build_il_lane(
+            environments[index],
+            prepared_replays[index],
+            tensorizers_by_lane[index],
+            require_tower_fidelity=require_tower_fidelity,
+        )
         for index in range(lane_count)
     ]
     replacements = tuple(zip(replacement_prepared_replays, replacement_tensorizers_by_replay, strict=True))
@@ -530,7 +592,9 @@ def produce_il_replay_batch(
                 from .factory import build_collected_replay_environment_v4
 
                 environment = build_collected_replay_environment_v4(prepared, native=native)
-                replacement = _build_il_lane(environment, prepared, tensorizers)
+                replacement = _build_il_lane(
+                    environment, prepared, tensorizers, require_tower_fidelity=require_tower_fidelity
+                )
                 schedule_index_by_lane[id(replacement)] = schedule_index
                 try:
                     _initialize_il_lane(replacement)

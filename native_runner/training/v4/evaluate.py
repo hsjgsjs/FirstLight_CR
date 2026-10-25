@@ -418,6 +418,7 @@ def _share_identical_policies(policies):
             and first.model.ppo_gate_temperature == second.model.ppo_gate_temperature
             and first.model.ppo_action_temperature == second.model.ppo_action_temperature
             and first.model.ppo_continue_temperature == second.model.ppo_continue_temperature
+            and first.model.inference_card_tile_temperature == second.model.inference_card_tile_temperature
         )
     except AttributeError:
         return policies
@@ -681,6 +682,8 @@ def evaluate(
     min_play_gap_ticks=None,
     gate_temperature_a=None,
     gate_temperature_b=None,
+    card_tile_temperature_a=None,
+    card_tile_temperature_b=None,
     deck_pool=None,
     battle_level=None,
     schedule=None,
@@ -710,6 +713,8 @@ def evaluate(
     for policy, temperature in zip(policies, (gate_temperature_a, gate_temperature_b), strict=True):
         if temperature is not None:
             policy.model.set_ppo_gate_temperature(float(temperature))
+    for policy, temperature in zip(policies, (card_tile_temperature_a, card_tile_temperature_b), strict=True):
+        policy.model.set_inference_card_tile_temperature(None if temperature is None else float(temperature))
     identity = {
         "games": games,
         "sample": sample,
@@ -718,6 +723,7 @@ def evaluate(
         "min_play_gap_ticks": min_play_gap_ticks,
         "saved_gate_temperatures": saved_gate_temperatures,
         "gate_temperatures": [policy.model.ppo_gate_temperature for policy in policies],
+        "card_tile_temperatures": [policy.model.inference_card_tile_temperature for policy in policies],
         "match": asdict(match),
         "deck_pool": None if deck_pool is None else {"decks": len(deck_pool.decks), "schema": deck_pool.schema},
         "battle_level": battle_level,
@@ -932,6 +938,13 @@ def main(argv=None):
     )
     parser.add_argument("--gate-temperature-b", type=float, help="the same for model B")
     parser.add_argument(
+        "--card-tile-temperature-a",
+        type=float,
+        help="with --sample, model A's temperature for the card and tile only (e.g. 0.1; default: its action "
+        "temperature); when to play keeps the gate temperature",
+    )
+    parser.add_argument("--card-tile-temperature-b", type=float, help="the same for model B")
+    parser.add_argument(
         "--deck-pool",
         type=Path,
         help="deck-pool manifest (as for PPO): each pair of games draws two decks by sqrt(uses), one per side, "
@@ -964,6 +977,8 @@ def main(argv=None):
         min_play_gap_ticks=args.min_play_gap_ticks,
         gate_temperature_a=args.gate_temperature_a,
         gate_temperature_b=args.gate_temperature_b,
+        card_tile_temperature_a=args.card_tile_temperature_a,
+        card_tile_temperature_b=args.card_tile_temperature_b,
         deck_pool=None if args.deck_pool is None else DeckPoolManifestV4.load(args.deck_pool),
         battle_level=args.battle_level,
         trace_dir=args.trace_dir,

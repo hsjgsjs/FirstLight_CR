@@ -16,7 +16,12 @@ from typing import Any, Iterable, Mapping, Sequence
 import torch
 
 from ...cr_native_env import NativeClashEnv
-from ...royaleapi_replay import calibrate_collected_replay_deal, prepare_collected_replay
+from ...royaleapi_replay import (
+    MAX_ROYALEAPI_LANDING_TICKS,
+    ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS,
+    calibrate_collected_replay_deal,
+    prepare_collected_replay,
+)
 from .cache import (
     assert_il_sequences_exact,
     load_il_cache_index,
@@ -147,6 +152,9 @@ def _failure_payload(shard_id: str, results: Sequence[ReplayProductionResultV4])
                 "expert_action_count": result.expert_action_count,
                 "executed_expert_action_count": result.executed_expert_action_count,
                 "decision_frame_count": result.decision_frame_count,
+                "winner_matches": result.winner_matches,
+                "crowns_match": result.crowns_match,
+                "towers_match": result.towers_match,
             }
             for result in results
         ],
@@ -184,6 +192,8 @@ def _convert_batch(
     timeout: float,
     resident_slots: int,
     capture_mode: str,
+    landing_delay_ticks: int = ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS,
+    require_tower_fidelity: bool = False,
 ) -> tuple[ReplayProductionResultV4, ...]:
     # Deal calibration uses singleton commands. Restore that surface after a
     # previous shard's resident session before calibrating the next shard.
@@ -196,7 +206,7 @@ def _convert_batch(
         prepared = None
         phase = "prepare"
         try:
-            prepared = prepare_collected_replay(payload)
+            prepared = prepare_collected_replay(payload, landing_delay_ticks=landing_delay_ticks)
             phase = "calibrate"
             calibrated = calibrate_collected_replay_deal(prepared, calibration_probe)
             phase = "screen"
@@ -232,6 +242,7 @@ def _convert_batch(
                 replacement_tensorizers_by_replay=tuple(item[2] for item in replacements),
                 max_frames=max_frames,
                 validate_tensors=False,
+                require_tower_fidelity=require_tower_fidelity,
             )
             if len(produced) != len(prepared_rows):
                 raise RuntimeError(f"resident producer returned {len(produced)} of {len(prepared_rows)} replay results")
@@ -297,6 +308,8 @@ def _worker(
     capture_mode: str,
     infrastructure_retries: int,
     resume: bool,
+    landing_delay_ticks: int = ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS,
+    require_tower_fidelity: bool = False,
 ) -> tuple[dict[str, object], ...]:
     """Convert the pending shards assigned to one engine endpoint."""
 
@@ -335,6 +348,8 @@ def _worker(
                     timeout=timeout,
                     resident_slots=resident_slots,
                     capture_mode=capture_mode,
+                    landing_delay_ticks=landing_delay_ticks,
+                    require_tower_fidelity=require_tower_fidelity,
                 )
                 if any(result.sequences is not None for result in results):
                     break
@@ -502,6 +517,18 @@ def main() -> None:
     parser.add_argument("--runtime-report", type=Path, action="append", default=[])
     parser.add_argument("--verify-roundtrip", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--royaleapi-landing-ticks",
+        type=int,
+        default=ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS,
+        help="ticks from RoyaleAPI's command tick to the play landing in the engine (labels stay at the command tick)",
+    )
+    parser.add_argument(
+        "--require-tower-fidelity",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="reject a replay whose rebuilt end-of-battle tower HP differs from the recorded HP",
+    )
     args = parser.parse_args()
 
     source_count = args.source_count
@@ -515,6 +542,7 @@ def main() -> None:
         or not 0 <= args.partition_index < args.partition_count
         or not 1 <= args.resident_slots <= 16
         or args.infrastructure_retries < 0
+        or not 1 <= args.royaleapi_landing_ticks <= MAX_ROYALEAPI_LANDING_TICKS
     ):
         raise ValueError("cache builder arguments are invalid")
 
@@ -557,6 +585,8 @@ def main() -> None:
         "partition_rule": "zero_based_source_index_modulo_partition_count",
         "partition_replay_count": len(payloads),
         "partition_selection_sha256": _canonical_sha256(labels),
+        "royaleapi_landing_ticks": args.royaleapi_landing_ticks,
+        "require_tower_fidelity": args.require_tower_fidelity,
     }
     index_contract = dict(shard_contract)
     index_contract["selected_replays"] = labels
@@ -612,6 +642,8 @@ def main() -> None:
                     capture_mode=args.capture_mode,
                     infrastructure_retries=args.infrastructure_retries,
                     resume=args.resume,
+                    landing_delay_ticks=args.royaleapi_landing_ticks,
+                    require_tower_fidelity=args.require_tower_fidelity,
                 ): port
                 for index, port, batches in active
             }
@@ -650,6 +682,8 @@ def main() -> None:
                         "winner_mismatches",
                         "crowns_comparable_replays",
                         "crowns_mismatches",
+                        "towers_comparable_replays",
+                        "towers_mismatches",
                         "expert_actions",
                         "executed_expert_actions",
                     )
