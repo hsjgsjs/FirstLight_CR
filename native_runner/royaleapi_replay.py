@@ -52,9 +52,10 @@ TRUE_SIDE_MAPPING_VERSION = "royaleapi-true-side-data-i.v1"
 # native engine consumes a command while advancing from boundary N to state
 # N + 1, so collected actions need this explicit one-tick conversion.
 ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS = 1
-# Live measurements elsewhere put a tap's landing 21 ticks after RoyaleAPI's ``data-t``. The cache builder's
-# ``--royaleapi-landing-ticks`` selects the offset so both readings can be rebuilt and compared on tower HP;
-# the default stays 1 until that comparison has been run on this engine.
+# Live measurements elsewhere put a tap's landing 21 ticks after RoyaleAPI's ``data-t``. On 300 replays rebuilt
+# both ways in this engine, 21 matched all six towers' end HP in 197 replays against 144 for 1 (53 only with 21,
+# none only with 1), so 21 is the default. ``--royaleapi-landing-ticks`` still selects the offset.
+DEFAULT_ROYALEAPI_LANDING_TICKS = 21
 MAX_ROYALEAPI_LANDING_TICKS = 40
 POLICY_DEAL_INVARIANCE_VERSION = "royaleapi-policy-selected-deal.v2"
 POLICY_DEAL_COMMAND_BOUNDARY_SEMANTICS = "royaleapi-command-boundary.v1"
@@ -1800,7 +1801,7 @@ def prepare_collected_replay(
     payload: Mapping[str, Any],
     *,
     bottom_player_tag: str | None = None,
-    landing_delay_ticks: int = ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS,
+    landing_delay_ticks: int = DEFAULT_ROYALEAPI_LANDING_TICKS,
 ) -> PreparedCollectedReplay:
     """Convert one normalized collector payload into an in-memory replay.
 

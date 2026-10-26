@@ -326,7 +326,7 @@ def test_short_replay_still_uses_one_selected_deal_per_owner() -> None:
 def test_prepare_replay_maps_source_command_ticks_to_native_observable_ticks() -> None:
     payload = _payload()
 
-    prepared = prepare_collected_replay(payload)
+    prepared = prepare_collected_replay(payload, landing_delay_ticks=ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS)
     actions = {
         int(action.metadata["source_index"]): (operation, action)
         for operation in prepared.replay.operations
@@ -368,6 +368,7 @@ def test_landing_delay_moves_only_the_native_landing() -> None:
         # The play lands 21 ticks after the tap; the expert label stays at the tap.
         assert landings[int(event["source_index"])] == (source_tick + 21, source_tick)
     assert prepared.replay.episode_config.tags["native_observable_tick_offset"] == 21
+    assert prepare_collected_replay(payload).replay.episode_config.tags["native_observable_tick_offset"] == 21
     assert prepared.replay.end_native_tick >= max(native for native, _source in landings.values())
     for invalid in (0, 41, 1.5):
         with pytest.raises(ValueError, match="landing_delay_ticks"):
@@ -722,7 +723,7 @@ def test_prepare_replay_binds_hero_events_and_keeps_source_duration() -> None:
         }
     }
 
-    prepared = prepare_collected_replay(payload)
+    prepared = prepare_collected_replay(payload, landing_delay_ticks=1)
     abilities = [
         action
         for operation in prepared.replay.operations
