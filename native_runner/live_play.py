@@ -734,7 +734,7 @@ def run(args: argparse.Namespace) -> None:
     if getattr(args, "gate_temperature", None) is not None:
         model.set_ppo_gate_temperature(args.gate_temperature)
         print(f"门控温度已设定为: {model.ppo_gate_temperature}")
-    if getattr(args, "card_tile_temperature", None) is not None:
+    if getattr(args, "card_tile_temperature", None):
         model.set_inference_card_tile_temperature(args.card_tile_temperature)
         print(f"选牌和落点温度已设定为: {model.inference_card_tile_temperature}（出不出牌仍用门控温度）")
     control = NativeClashEnv(CONTROL_HOST, CONTROL_PORT, timeout=10.0)
@@ -896,9 +896,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                                  help="always take the most likely action (rarely plays; default samples)")
             command.add_argument("--gate-temperature", type=float, default=None,
                                  help="override model ppo_gate_temperature (e.g. 0.2)")
-            command.add_argument("--card-tile-temperature", type=float, default=None,
-                                 help="sample the card and tile at this temperature (e.g. 0.1); when to play "
-                                      "keeps the gate temperature (default: the model's action temperature)")
+            command.add_argument("--card-tile-temperature", type=float, default=0.1,
+                                 help="sample the card and tile at this temperature; when to play keeps the gate "
+                                      "temperature (default 0.1; 0 uses the model's action temperature, 1.0)")
             command.add_argument("--auto-queue", action="store_true",
                                  help="automatically return to lobby and queue for matches")
     args = parser.parse_args(None if argv is None else list(argv))

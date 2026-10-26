@@ -81,6 +81,8 @@ def read_options(args):
     if not isinstance(saved, dict) or saved.keys() - defaults.keys():
         raise ValueError("unknown round-robin config field")
     options = {**defaults, **saved}
+    if not options["sample"] and "card_tile_temperature" not in saved:
+        options["card_tile_temperature"] = None  # the default 0.1 only applies to sampled play
     for key in ("cpu_threads", "lanes", "deck_pool", "delay_ticks", "min_play_gap_ticks", "battle_level", "device"):
         if getattr(args, key, None) is not None:
             options[key] = getattr(args, key)

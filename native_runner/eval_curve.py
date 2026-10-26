@@ -81,6 +81,8 @@ def point_config(args, label, checkpoint):
         "anchor": args.opponent_name,
         "sample": args.gate_temperature is not None,
         "gate_temperature": args.gate_temperature,
+        # Kept at the model's own action temperature so points stay comparable with curves already run.
+        "card_tile_temperature": None,
     }
     # In the file rather than on the command line, so reading the result back sees the same study.
     for key in ("cpu_threads", "lanes"):
