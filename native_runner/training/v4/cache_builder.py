@@ -18,7 +18,7 @@ import torch
 from ...cr_native_env import NativeClashEnv
 from ...royaleapi_replay import (
     MAX_ROYALEAPI_LANDING_TICKS,
-    ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS,
+    DEFAULT_ROYALEAPI_LANDING_TICKS,
     calibrate_collected_replay_deal,
     prepare_collected_replay,
 )
@@ -192,7 +192,7 @@ def _convert_batch(
     timeout: float,
     resident_slots: int,
     capture_mode: str,
-    landing_delay_ticks: int = ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS,
+    landing_delay_ticks: int = DEFAULT_ROYALEAPI_LANDING_TICKS,
     require_tower_fidelity: bool = False,
 ) -> tuple[ReplayProductionResultV4, ...]:
     # Deal calibration uses singleton commands. Restore that surface after a
@@ -308,7 +308,7 @@ def _worker(
     capture_mode: str,
     infrastructure_retries: int,
     resume: bool,
-    landing_delay_ticks: int = ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS,
+    landing_delay_ticks: int = DEFAULT_ROYALEAPI_LANDING_TICKS,
     require_tower_fidelity: bool = False,
 ) -> tuple[dict[str, object], ...]:
     """Convert the pending shards assigned to one engine endpoint."""
@@ -520,7 +520,7 @@ def main() -> None:
     parser.add_argument(
         "--royaleapi-landing-ticks",
         type=int,
-        default=ROYALAPI_COMMAND_TO_NATIVE_OBSERVABLE_TICKS,
+        default=DEFAULT_ROYALEAPI_LANDING_TICKS,
         help="ticks from RoyaleAPI's command tick to the play landing in the engine (labels stay at the command tick)",
     )
     parser.add_argument(
