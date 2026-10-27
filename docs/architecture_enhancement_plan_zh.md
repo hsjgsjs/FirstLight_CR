@@ -1,6 +1,6 @@
 # 架构增强计划：把公开信息直接算给模型
 
-记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节（含两次训练检查、新层学习率、离线预训练新层、进展记录与交接和以后加新输入的做法）；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
+记录日期：2026-10-23。第 4 节第一批和第 5 节统计已实现，见第 11 节（含两次训练检查、新层学习率、离线预训练新层、进展记录与交接、10-27 第一次正式评估和以后加新输入的做法）；其余各节仍是规划。背景见 [PPO 退化排查现状](ppo_degradation_status_zh.md) 第 7 节；已有的输入改造方案见[实力提升计划](strength_plan_zh.md)和[时序架构计划](temporal_reasoning_plan_zh.md)。
 
 ## 1. 出发点
 
@@ -485,6 +485,87 @@ bash native_runner/training/v4/lab_ppo.sh watch spar16-v42p
 2. `spar16-v42p` 跑到约 20 次更新，对比 K=30 同期的 `trend`（K=30：对固定对手 57% → 54–55%，浪费圣水中间一段到过 6.2）。
 3. 可选：循环赛比较预训练结果和它的清零副本，确认新层在实战里有用。
 4. 60–100 次更新后做正式评估（同样卡组池与 bchist final 循环赛、`behavior_stats --trace`），之后才考虑第二批输入。
+
+### 第一次正式评估（10-27，`spar16-v42p` 第 74 次更新）：没有超过 u80
+
+**训练过程（`lab_ppo.sh trend spar16-v42p 4`）**
+
+- 第 1–74 次更新，对固定对手胜率每 4 次一段在 48%–56% 之间（每段约 600 局，95% 区间约 ±4 个点），合计约 52–53%，没有上升趋势。打自己的历史快照全程约 50%。
+- KL 从 0.0007 降到 0.0002–0.0003，clip 从 0.022 降到 0.010；`snr` 多在 0.1–0.2，`grad cos` 约 0.05，和 bchist 一样梯度以噪声为主。EV 0.87、熵 0.215 → 0.19，正常。
+- 浪费圣水（每局中位数）从 4.1 升到 5–6（第 15–30 次一度到 8–9.6），首牌从 13 秒推迟到 14–16 秒，都比起点差。
+- 约 26 小时里开了 13 个阶段，最近 3.5 小时只完成 4 次更新。重启原因还没查（`spar16-v42` 当时也有同样的问题）。
+
+**循环赛**：服务器 2 引擎，采样出牌，出牌温度 0.2，选牌和落点 0.1，16 级，18–24 tick 延迟，6–10 tick 间隔，`spar16-v42p` 训练用的卡组池，组号 0–49（每对 200 局），`--trace`。
+
+| A | B | A 胜 / B 胜 / 平 | A 得分率 | 95% 区间 |
+|---|---|---|---:|---|
+| General 460 | bchist u80 | 60 / 140 / 0 | 30.0% | [24.5%, 36.0%] |
+| General 460 | v42 pretrained | 86 / 114 / 0 | 43.0% | [37.0%, 49.5%] |
+| General 460 | v42p latest | 78 / 122 / 0 | 39.0% | [34.0%, 44.5%] |
+| bchist u80 | v42 pretrained | 92 / 108 / 0 | 46.0% | [40.5%, 52.0%] |
+| bchist u80 | v42p latest | 121 / 79 / 0 | 60.5% | [54.5%, 66.5%] |
+| v42 pretrained | v42p latest | 94 / 106 / 0 | 47.0% | [40.0%, 54.5%] |
+
+等级分（General 460 = 0）：bchist u80 114.2 [87.9, 142.8]，v42 pretrained 81.5 [50.0, 120.4]，v42p latest 73.6 [39.8, 108.1]。`v42 pretrained` 是 `runs/keep/v42-pretrained.pt`，`v42p latest` 是第 74 次更新的检查点。
+
+**结论**
+
+1. 74 次 PPO 更新没有测出提升：latest 对起点 53% [45.5%, 60%]。
+2. latest 对 u80 只有 39.5%，起点对 u80 是 54%。两个区间不重叠，差约 14 个点，大约 3 倍标准误，可以认为确实变差了。打 General 460 从 57% 到 61%，在误差内。训练的固定对手（checkpoint-30、General 460、速猪专家）里没有 u80，像是在往克制固定对手的方向漂。
+3. 最强的仍然是 bchist u80（打 General 460 70%）。
+
+**新层是不是负收益：还分不开**
+
+v42 pretrained 和 u80 之间隔了两步，两步都可能让它变弱：
+
+| 步骤 | 改了什么 |
+|---|---|
+| `spar16-v42` 第 1–14 次更新 | 全部参数跑 PPO；新层几乎为 0（均方根约 0.0002） |
+| 离线预训练 | 只改新层，老层逐位不变；按"预测人类动作的验证损失"选最好的一步 |
+
+- 训练里有一条支持"预训练后的新层有害"的线索。`spar16-v42` 第 1–12 次更新打固定对手约 59%（约 1700 局，±1.2 个点）。v42p 的起点只多了预训练过的新层，对手、卡组池和出牌温度都一样，但第 1–10 次只有约 54%（约 1500 局）。差了约 5 个点。
+- 可能的原因：预训练实际上是一次只通过新层做的人类 BC，按"最像人"选步，没有按"最强"选。以前 PPO 1208 打 BC 200 是 58%，人类 BC 有实力代价。所以出问题的可能不是新输入的信息，而是让新层模仿人类这个目标。
+- 用清零对照可以分开这两步。见下面的服务器步骤。
+
+**服务器上的步骤：清零对照**
+
+```bash
+cd ~/FirstLight_CR && source .venv/bin/activate
+# 0. 确认 spar16-v42 的起点（文档写的是 u80，以 config.json 为准）
+python - <<'PY'
+import glob, json
+for path in sorted(glob.glob("runs/spar16-v42*/train-*/config.json")):
+    print(path, json.load(open(path)).get("source_checkpoint"))
+PY
+# 1. v42 pretrained 的新层清零副本：老层和 v42 pretrained 逐位相同
+MANIFEST=$(python -c "import json; print(json.load(open('runs/spar16-v42/train-20261023-151001/config.json'))['arguments']['expert_bc_manifest'])")
+CUDA_VISIBLE_DEVICES=0 python -m native_runner.training.v4.pretrain_new_parameters runs/keep/v42-pretrained.pt \
+  --manifest "$MANIFEST" --steps 0 --reset-new-parameters --device cuda:0 --output runs/keep/v42-zero.pt
+# 2. 四模型循环赛，用组号 50-99（和上次的 0-49 是不同的卡组和种子）
+POOL=$(sed -n 's/^CR_PPO_DECK_POOL=//p' runs/spar16-v42p/launch-env); POOL=${POOL:-runs/deck-pool.json}
+cat > round_robin.v42-ablation.json <<JSON
+{
+  "models": {
+    "General 460": "checkpoints/General/checkpoint-step-00000460.pt",
+    "bchist u80": "runs/keep/bchist-u80.pt",
+    "v42 zero": "runs/keep/v42-zero.pt",
+    "v42 pretrained": "runs/keep/v42-pretrained.pt"
+  },
+  "anchor": "General 460",
+  "deck_pool": "$POOL",
+  "sample": true,
+  "gate_temperature": 0.2
+}
+JSON
+setsid nohup bash round_robin.sh --config round_robin.v42-ablation.json --engines 2 --blocks 50-99 --trace \
+  > evaluations/rr-v42-ablation.log 2>&1 < /dev/null &
+```
+
+| 结果 | 含义 | 下一步 |
+|---|---|---|
+| pretrained 对 zero 明显低于 50% | 预训练后的新层有害 | 新层清零（或直接用 u80）；不再用"模仿人类"预训练新层。以后要用新输入，按打 zero 副本的胜率选预训练步，或在损失里加对冻结起点的 KL 约束 |
+| pretrained 对 zero 约 50%，zero 对 u80 明显低于 50% | 新层没用也没害，变弱来自 `spar16-v42` 的 14 次 PPO 更新 | 瓶颈在 PPO：先加大每次更新的局数提高 `snr`，把 u80 放进固定对手，按打 u80 的循环赛胜率选检查点，不看训练胜率 |
+| 两对都约 50% | 每一步差距都在误差内，变弱是两步累积的 | 同上一行，并按每对 400 局补跑 |
 
 ### 以后加新输入的做法（第二批起）
 

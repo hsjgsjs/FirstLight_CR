@@ -14,6 +14,7 @@ from .deck_pool import (
     DeckPoolManifestV4,
     build_deck_pool_manifest_from_counts,
     deck_counts_from_payloads,
+    exclude_decks_with_cards,
     mark_focus_decks,
 )
 
@@ -65,16 +66,26 @@ def main() -> int:
     parser.add_argument(
         "--from-pool",
         type=Path,
-        help="re-mark the focus decks of an existing pool instead of scanning replays (needs --focus-decks)",
+        help=(
+            "start from an existing pool instead of scanning replays, to re-mark its focus decks "
+            "or drop decks (needs --focus-decks or --exclude-card-id)"
+        ),
+    )
+    parser.add_argument(
+        "--exclude-card-id",
+        type=int,
+        action="append",
+        default=[],
+        help="repeatable native card ID (e.g. 28000006 Mirror): drop every deck that holds it",
     )
     args = parser.parse_args()
 
     if args.from_pool is not None:
-        if args.focus_decks is None:
-            parser.error("--from-pool needs --focus-decks")
+        if args.focus_decks is None and not args.exclude_card_id:
+            parser.error("--from-pool needs --focus-decks or --exclude-card-id")
         if args.from_pool.resolve() == args.output.resolve():
             parser.error("--from-pool must not overwrite its own input")
-        # Same decks and usage counts; only the focus ranks change.
+        # Same decks and usage counts; only the focus ranks change, or excluded decks go.
         manifest = DeckPoolManifestV4.load(args.from_pool)
         scan_metadata = {"source_pool": str(args.from_pool.resolve())}
         manifest = DeckPoolManifestV4(
@@ -98,6 +109,8 @@ def main() -> int:
         )
     if args.focus_decks is not None:
         manifest = mark_focus_decks(manifest, _focus_identities(args.focus_decks))
+    if args.exclude_card_id:
+        manifest = exclude_decks_with_cards(manifest, args.exclude_card_id)
     if args.expected_pool_size is not None and len(manifest.decks) != args.expected_pool_size:
         raise RuntimeError(f"expected {args.expected_pool_size} decks, found {len(manifest.decks)}")
     manifest.save(args.output)
@@ -108,6 +121,11 @@ def main() -> int:
                 "pool_size": len(manifest.decks),
                 "focus_decks": len(manifest.focus_decks),
                 **scan_metadata,
+                **{
+                    key: manifest.metadata[key]
+                    for key in ("excluded_card_ids", "excluded_deck_count")
+                    if key in manifest.metadata
+                },
             },
             ensure_ascii=False,
             sort_keys=True,
