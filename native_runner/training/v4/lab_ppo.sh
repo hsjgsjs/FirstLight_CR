@@ -45,13 +45,15 @@
 # A start saves these launch settings to runs/NAME/launch-env and a resume restores them, unless the same
 # variable is given on the resume command line.
 # CR_PPO_DECK_POOL is one of them, so a run can train on its own deck pool while .env keeps the one
-# round_robin.sh evaluates on.
+# round_robin.sh evaluates on. CR_PPO_DECK_POOL_SIZE (the deck count the trainer checks the pool against)
+# is too, but unless given on the command line it is read from the run's pool file when the run first
+# uses that pool, so a filtered pool needs no .env edit; later restarts check against the saved count.
 set -euo pipefail
 
 launch_vars=(CR_PPO_ENGINE_COUNT CR_LAB_ENGINE_CPUS CR_LAB_WORKER_CPUS CR_LAB_CONTROL_CPUS CR_LAB_TRAIN_GPUS
   CR_PPO_INFERENCE_BATCH_WAIT_MS CR_PPO_SEGMENT_SECONDS CR_PPO_LANE_MICROBATCH_SIZE NCCL_P2P_DISABLE
   CR_PPO_CHECKPOINT CR_LAB_INSTANCE CR_PPO_TRAINER_CPUS CR_LAB_KEEP_CHECKPOINTS CR_LAB_CHECKPOINT_BUCKET
-  CR_PPO_DECK_POOL)
+  CR_PPO_DECK_POOL CR_PPO_DECK_POOL_SIZE)
 explicit_vars=" "
 for variable in "${launch_vars[@]}" CR_PPO_EXTRA_ARGS; do
   [[ ! -v $variable ]] || explicit_vars+="$variable "
@@ -390,6 +392,23 @@ save_launch_env() {
   done >"$1/launch-env"
 }
 
+# Unless CR_PPO_DECK_POOL_SIZE is on the command line, check the pool against the count saved with this
+# run's pool, or count the decks of a pool the run has not used before (.env's count belongs to .env's pool).
+choose_deck_pool_size() {
+  local run_dir=$1 pool=${CR_PPO_DECK_POOL:-} saved_pool saved_size
+  [[ $explicit_vars != *" CR_PPO_DECK_POOL_SIZE "* && -n $pool ]] || return 0
+  saved_pool=$(sed -n 's/^CR_PPO_DECK_POOL=//p' "$run_dir/launch-env" 2>/dev/null || true)
+  saved_size=$(sed -n 's/^CR_PPO_DECK_POOL_SIZE=//p' "$run_dir/launch-env" 2>/dev/null || true)
+  if [[ -n $saved_size && $saved_pool == "$pool" ]]; then
+    export CR_PPO_DECK_POOL_SIZE=$saved_size
+  else
+    CR_PPO_DECK_POOL_SIZE=$("$python" -c 'import json, sys; print(len(json.load(open(sys.argv[1]))["decks"]))' \
+      "$pool") || { echo "cannot count the decks in $pool" >&2; exit 1; }
+    export CR_PPO_DECK_POOL_SIZE
+    echo "deck pool $pool: $CR_PPO_DECK_POOL_SIZE decks"
+  fi
+}
+
 load_launch_env() {
   local key value
   [[ -f $1/launch-env ]] || return 0
@@ -431,6 +450,7 @@ start() {
   rm -f "$stop_marker"
   local run_dir=$runs/$name
   mkdir -p "$run_dir/logs"
+  choose_deck_pool_size "$run_dir"
   save_launch_env "$run_dir"
   setsid nohup bash "$script_dir/lab_ppo.sh" _run "$run_dir" "$updates" "$resume" "lab-instance=${instance:-0}" \
     >>"$run_dir/logs/supervisor.log" 2>&1 </dev/null &
