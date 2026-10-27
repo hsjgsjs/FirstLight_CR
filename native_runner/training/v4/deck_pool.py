@@ -352,6 +352,26 @@ def build_deck_pool_manifest_from_counts(
     return DeckPoolManifestV4(decks=decks, minimum_uses=minimum_uses, metadata=combined_metadata)
 
 
+def exclude_decks_with_cards(manifest: DeckPoolManifestV4, card_ids: Sequence[int]) -> DeckPoolManifestV4:
+    """Drop every deck holding one of ``card_ids`` (native base IDs); focus decks must not be among them."""
+
+    excluded = {int(item) for item in card_ids}
+    dropped = tuple(item for item in manifest.decks if excluded.intersection(item.card_ids))
+    focus = tuple(item for item in dropped if item.is_focus)
+    if focus:
+        ranks = ", ".join(str(item.focus_rank) for item in focus)
+        raise ValueError(f"excluded cards appear in focus decks (ranks {ranks}); change the focus list first")
+    decks = tuple(item for item in manifest.decks if not excluded.intersection(item.card_ids))
+    metadata = {
+        **dict(manifest.metadata),
+        "pool_size": len(decks),
+        "pool_player_uses": sum(item.uses for item in decks),
+        "excluded_card_ids": sorted(excluded | set(manifest.metadata.get("excluded_card_ids", ()))),
+        "excluded_deck_count": len(dropped) + int(manifest.metadata.get("excluded_deck_count", 0)),
+    }
+    return DeckPoolManifestV4(decks=decks, minimum_uses=manifest.minimum_uses, metadata=metadata)
+
+
 def mark_focus_decks(
     manifest: DeckPoolManifestV4, focus_identities: Sequence[tuple[Sequence[str], str]]
 ) -> DeckPoolManifestV4:

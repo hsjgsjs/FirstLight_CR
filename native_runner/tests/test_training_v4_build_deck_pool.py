@@ -72,10 +72,47 @@ def test_from_pool_refuses_a_focus_deck_missing_from_the_pool(tmp_path: Path) ->
         _run("--from-pool", source_path, "--focus-decks", FOCUS_V2, "--output", tmp_path / "out.json")
 
 
-def test_from_pool_needs_focus_decks_and_a_separate_output(tmp_path: Path) -> None:
+def test_from_pool_needs_focus_decks_or_exclusions_and_a_separate_output(tmp_path: Path) -> None:
     source_path = tmp_path / "pool.json"
     source_path.write_text(json.dumps({}))
     with pytest.raises(SystemExit):
         _run("--from-pool", source_path, "--output", tmp_path / "out.json")
     with pytest.raises(SystemExit):
         _run("--from-pool", source_path, "--focus-decks", FOCUS_V2, "--output", source_path)
+
+
+MIRROR = 28000006
+
+
+def _pool_with_mirror_tail(tmp_path: Path) -> tuple[Path, DeckPoolManifestV4, str]:
+    v2 = _rows(FOCUS_V2)
+    cards, tower = v2[0]
+    mirror_deck = deck_identity_from_keys(tuple(cards[:7]) + ("mirror",), tower, uses=7)
+    assert MIRROR in mirror_deck.card_ids
+    decks = tuple(deck_identity_from_keys(c, t, uses=10) for c, t in v2) + (mirror_deck,)
+    source = mark_focus_decks(DeckPoolManifestV4(decks=decks, minimum_uses=5, metadata={"pool_size": 21}), v2)
+    source_path = tmp_path / "pool.json"
+    source.save(source_path)
+    return source_path, source, mirror_deck.deck_id
+
+
+def test_from_pool_drops_decks_holding_an_excluded_card_and_keeps_focus_ranks(tmp_path: Path) -> None:
+    source_path, source, mirror_id = _pool_with_mirror_tail(tmp_path)
+    output_path = tmp_path / "no-mirror.json"
+
+    _run("--from-pool", source_path, "--exclude-card-id", MIRROR, "--output", output_path, "--expected-pool-size", 20)
+
+    result = DeckPoolManifestV4.load(output_path)
+    assert mirror_id not in {item.deck_id for item in result.decks}
+    assert [item.deck_id for item in result.focus_decks] == [item.deck_id for item in source.focus_decks]
+    assert result.metadata["pool_size"] == 20
+    assert result.metadata["pool_player_uses"] == 200
+    assert result.metadata["excluded_card_ids"] == [MIRROR]
+    assert result.metadata["excluded_deck_count"] == 1
+
+
+def test_exclusion_refuses_to_drop_a_focus_deck(tmp_path: Path) -> None:
+    source_path, source, _ = _pool_with_mirror_tail(tmp_path)
+    focus_card = source.focus_decks[0].card_ids[0]
+    with pytest.raises(ValueError, match="focus decks"):
+        _run("--from-pool", source_path, "--exclude-card-id", focus_card, "--output", tmp_path / "out.json")
